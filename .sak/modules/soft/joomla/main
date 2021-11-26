@@ -1,0 +1,189 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife -- Joomla Main Library
+#|
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash-JOS
+#- @subpackage Main
+##################################################################
+##################################################################
+#
+# Joomla Specific Init
+#
+
+declare -a SAK_JOS_CACHE_FILE # Array to store cache files
+declare -a SAK_JOS_CACHE_TYPE # Type lookup array
+
+SAK_JOS_INIT=-1       # Software array index (-1 for none)
+SAK_JOS_CONFIG=""     # Config location cache
+SAK_JOS_DB=""         # Database name
+SAK_JOS_HOST=""       # Database hostname
+SAK_JOS_PREFIX="jos_" # Table Prefix
+
+SAK_JOS_VER=""
+
+##################################################################
+##################################################################
+#
+# Joomla Specific Functions
+#
+
+#+ Returns the corresponding cache file for the specified type.
+#| sak_jos_cache_file TYPE
+#| @param string $type Cache type.
+#- @return string|bool Cache file path. False if type not found.
+sak_jos_cache_file() {
+  sak_log_ifdebug "sak_jos_cache_file $@ -- Caller = $(caller 0)"
+  local t="$1" type res ret
+
+  [[ "$SAK_JOS_INIT" -ge "0" ]] || return 1
+  for type in "${!SAK_JOS_CACHE_TYPE[@]}"; do
+    [[ "${SAK_JOS_CACHE_TYPE[$type]}" == "${t}" ]] &&
+      echo "${SAK_JOS_CACHE_FILE[$type]}" && return 0
+  done
+  return 1
+}
+
+#+ Cache config settings from an installation.
+#| sak_jos_cache_config INDEX [UPDATE]
+#| @param int $index    Software install index.
+#| @param bool $update  Force an update (ignore cache).
+#- @return bool True on success. False otherwise.
+sak_jos_cache_config() {
+  sak_log_ifdebug "sak_jos_cache_config $@ -- Caller = $(caller 0)"
+  local i="$1" re vuln soft path ver # l s n
+
+  if ! sak_version_req "$i" "1.5"; then
+    sak_wait_message 10 "Error" "Only Joomla 1.5 and higher is supported."
+    return 1
+  fi
+
+  # We don't bother doing this for the same ID unless an update is forced
+  [[ -z "$2" && "$SAK_JOS_INIT" -eq "$i" ]] && return 0
+
+  SAK_JOS_INIT=-1       # Software array index (-1 for none)
+  SAK_JOS_CONFIG=""
+  SAK_JOS_DB=""         # Database name
+  SAK_JOS_PREFIX="jos_" # Table Prefix
+
+  SAK_JOS_VER=""
+
+  SAK_JOS_CACHE_FILE=() # Array to store cache files
+  SAK_JOS_CACHE_TYPE=() # Lookup array
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  if [[ "$soft" != "joomla" ]]; then
+    sak_fatal_backtrace $SAK_ERR_UNK "Unexpectedly detected $soft instead of Joomla. Please file a bug report."
+  fi
+
+  SAK_JOS_VER="$ver"
+
+  if [[ ! -f "$path/configuration.php" ]]; then
+    sak_wait_message 10 "Error" "Could not find or parse config file for this installation."
+    return 1
+  else
+    SAK_JOS_CONFIG="$path/configuration.php"
+  fi
+
+  SAK_JOS_DB="$(sak_get_php_opt -v "$SAK_JOS_CONFIG" "db")"
+
+  # TODO: Check that DB exists locally?
+  # TODO: Support for remote hosts?
+  if [[ -z "$SAK_JOS_DB" ]]; then
+    if [[ "$SAK_CLI_MODE" -eq "0" ]]; then
+      sak_waitbox 5 "Error" "Could not determine database at $path"
+    else
+      sak_fatal_backtrace $SAK_ERR_INT_CNF "Could not determine database at $path"
+    fi
+    return 1
+  fi
+
+  SAK_JOS_HOST="$(sak_get_php_opt -v "$SAK_JOS_CONFIG" "host")"
+
+  re="^(localhost|127.0.0.1|)$"
+  if [[ "$SAK_JOS_HOST" =~ $re ]]; then
+    SAK_JOS_HOST=""
+  fi
+
+  SAK_JOS_PREFIX="$(sak_get_php_opt -v "$SAK_JOS_CONFIG" "dbprefix")"
+
+  SAK_JOS_INIT="$i"
+  return 0
+}
+
+#+ Write a new configuration file.
+#| @param int $index    Software install index.
+#| @param string $data  Keys and values, one per line, delimited by 0x1E.
+#- @return bool True on success. False otherwise.
+sak_jos_write_config() {
+  local i="$1" data="$2" owner script \
+        vuln soft path ver
+
+  [[ -z "${SAK_SOFTWARE[$i]}" ]] &&
+    sak_fatal_backtrace $SAK_ERR_UNK "Invalid software installation!"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  owner="$(stat -c %U "$path")" ||
+    sak_fatal $SAK_ERR_UNK "Could not determine owner of directory."
+  script="$(sak_mktmp "$owner")" &&
+  ifile="$(sak_mktmp "$owner")" &&
+  ofile="$(sak_mktmp "$owner")" ||
+    sak_fatal $SAK_ERR_UNK "Could not create temporary files."
+
+  printf '%s' "$data" > "$ifile" &&
+  cat "$SAK_MOD_DIR/soft/joomla/gateway.php" > "$script" ||
+    sak_fatal $SAK_ERR_UNK "Could not write to temporary file(s)."
+  ((SAK_QUIET+=2))  # Silence you!
+  /usr/bin/sudo -u "$owner" \
+    "$SAK_PHP" -q "$script" "$path" writeconfig "$ifile" "$ofile" &&
+    sak_file_backup "$path" "joomla-config" 1 1 "configuration.php" &&
+    /bin/mv -f "$ofile" "${path}/configuration.php" &&
+    chmod 0644 "${path}/configuration.php"
+  ret="$?"
+  ((SAK_QUIET-=2))
+
+  rm -f "$script" #
+  rm -f "$ifile"  # These are removed regardless of errors
+  rm -f "$ofile"  #
+
+  [[ "$ret" -ne "0" ]] &&
+    sak_fatal_backtrace $SAK_ERR_SUB_ERR "Unexpected error running sub-command to update configuration."
+  return 0
+}
+
+#+ Cache Joomla data.
+#| @param int $index    Software install index.
+#| @param int $type     Data type.
+#- @return string|bool  Cache file path. False on failure.
+sak_jos_cache_data() {
+  local i="$1" type="$2" n t vuln soft path ver err cfile new=0
+
+  case "$type" in
+    basics) t="BASICS";;  counts)   t="COUNTS";;
+    users)  t="USERS" ;;  addons)   t="ADDONS";;  themes) t="THEMES";;
+    *) sak_fatal_backtrace $SAK_ERR_UNK "Invalid cache type: $type" ;;
+  esac
+
+  sak_jos_cache_config "$i" || return 1
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  cfile="$(sak_jos_cache_file "$t")"
+  [[ "$?" -ne "0" ]] && cfile="$(sak_mkcache)" && new=1
+
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/joomla/main.php" -o "$cfile" --root \
+    --db "$SAK_JOS_DB" --prefix "$SAK_JOS_PREFIX" --path "$path" --version "$ver" \
+    --get "$type")"
+
+  if [[ -n "$err" ]]; then
+    sak_wait_message 5 "Error" "$err" 5 35
+    return 1
+  fi
+
+  if [[ "$new" -eq "1" ]]; then
+    n="${#SAK_JOS_CACHE_FILE[@]}"
+    SAK_JOS_CACHE_FILE[$n]="$cfile"
+    SAK_JOS_CACHE_TYPE[$n]="$t"
+  fi
+  return 0
+}

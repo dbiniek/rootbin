@@ -1,0 +1,731 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+#################################################################
+# removedomain.pl - Eric Erkens
+# Small utility to remove addon and subdomains not removed properly via cPanel.
+#
+# Please submit all bug reports at https://jira.endurance.com/servicedesk/customer/portal/147/create/1926
+#
+# (c) 2017 - HostGator.com, LLC.
+#################################################################
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Path qw(make_path);
+use File::Copy;
+use DateTime;
+
+my ($usage, $verify, $search, $clean, $file, @files, $domain, @results, @filtered_results, $cpanelacct, @cpanelacct, @filtered_cpanelacct, $subdomain, $primarydomain, $maindomain, $fullsubdomain, $script, $time, $backup_dir, $srcfile, $dstfile, $regex1, $regex2);
+
+$script = "removedomain";
+$time = time;
+
+GetOptions (
+    'usage|help|z|?' => \$usage,
+    'verify|v' => \$verify,
+    'search|s' => \$search,
+    'clean|c' => \$clean,
+);
+
+if ($usage) {
+  usage();
+} elsif (!exists $ARGV[0]) { #quick check to make sure we have an argument
+  print "No arguments provided!\n\n";
+  usage();
+} elsif ($verify) {
+  if ( $ARGV[0] eq "addon" ) {
+    $domain = lc($ARGV[1]);
+    check_arg();
+    is_notdomain();
+    $cpanelacct = search_cpanel();
+    if ($cpanelacct eq "NA") {
+      print "There is no cPanel account associated to the addon domain \"$domain\".\n\n";
+    } else {
+      maindomain_check();
+      parkdomain_check();
+      my $output_string = `cpapi2 --user=$cpanelacct AddonDomain listaddondomains regex=$domain`;
+      if ($output_string =~ m/.*data: \[\].*/) {
+        print "The domain \"$domain\" is not an addon domain for cPanel acccount \"$cpanelacct\". It should be safe to clean.\n\n";
+        print "$output_string\n";
+      } else {
+        print "The domain \"$domain\" does exist and should be removed using the normal process.\n";
+        print "$output_string\n";
+      }
+    }
+  } elsif ($ARGV[0] eq "subdomain" ) {
+    $domain = lc($ARGV[1]);
+    check_arg();
+    is_notdomain();
+    is_addondomain();
+    $cpanelacct = search_cpanel();
+    if ($cpanelacct eq "NA") {
+      print "There is no cPanel account associated to the subdomain \"$domain\".\n\n";
+    } else {
+      maindomain_check();
+      parkdomain_check();
+      my $output_string = `cpapi2 --user=$cpanelacct SubDomain listsubdomains regex=$domain`;
+      if ($output_string =~ m/.*data: \[\].*/) {
+        print "The subdomain \"$domain\" is not associated to cPanel acccount \"$cpanelacct\". It should be safe to clean.\n\n";
+        print "$output_string\n";
+      } else {
+        print "The subdomain \"$domain\" does exist and should be removed using the normal process.\n";
+        print "$output_string\n";
+      }
+    }
+  } else {
+    print "Please specify either addon or subdomain.\n";
+    usage();
+  }
+} elsif ($search) {
+  if ( $ARGV[0] eq "addon" ) {
+    $domain = lc($ARGV[1]);
+    check_arg();
+    is_notdomain();
+    @files = search_files();
+    my $count_results = @files;
+    if ($count_results > 0) {
+      print "The search \"$domain\" has been found in the following files:\n";
+      print join("", @files);
+    } else {
+      print "There were no search results for \"$domain\".\n";
+    }
+
+  } elsif ($ARGV[0] eq "subdomain" ) {
+    $domain = lc($ARGV[1]);
+    check_arg();
+    is_notdomain();
+    is_addondomain();
+    @files = search_files();
+    my $named_file = search_named($domain);
+    push @files, $named_file;
+    my $count_results = @files;
+    if ($count_results > 0) {
+      print "The search \"$domain\" has been found in the following files:\n";
+      print join("", @files);
+    } else {
+      print "There were no search results for \"$domain\".\n";
+    }
+    } else {
+    print "Please specify either addon or subdomain.\n";
+    usage();
+  }
+} elsif ($clean) {
+  if ( $ARGV[0] eq "addon" ) {
+    $domain = lc($ARGV[1]);
+    check_arg();
+    is_notdomain();
+    $cpanelacct = search_cpanel();
+    if ($cpanelacct eq "NA") {
+      print "There is no cPanel account associated to the domain \"$domain\". It will have to be removed manually.\n\n";
+    } else {
+      maindomain_check();
+      parkdomain_check();
+        $backup_dir = make_backup($domain);
+        $subdomain = sub_from_domain($domain);
+        $fullsubdomain = "${subdomain}.${primarydomain}";
+        logging_stats();
+        clean_v_directories();
+        clean_dns();
+        clean_cpanel_files();
+        clean_cache_files();
+        addon_logs();
+    }
+  } elsif ($ARGV[0] eq "subdomain" ) {
+    $domain = lc($ARGV[1]);
+    check_arg();
+    is_notdomain();
+    is_addondomain();
+    $cpanelacct = search_cpanel();
+    if ($cpanelacct eq "NA") {
+      print "There is no cPanel account associated to the domain \"$domain\". It will have to be removed manually.\n\n";
+    } else {
+      maindomain_check();
+      parkdomain_check();
+        $backup_dir = make_backup($domain);
+        $subdomain = sub_from_domain($domain);
+        $fullsubdomain = "${subdomain}.${primarydomain}";
+        logging_stats();
+        clean_v_directories();
+        clean_dns();
+        clean_cpanel_files();
+        clean_cache_files();
+        subdomain_logs();
+    }
+  } else {
+    print "Please specify either addon or subdomain.\n";
+    usage();
+  }
+
+} else {
+  print "Unknown argument provided or file does not exist.\n\n";
+  usage();
+}
+
+sub usage {
+    print "Usage:\n\n";
+    print "--help, -? : Display this help message.\n";
+    print "--verify, -v : verify a addon or subdomain was removed via cPanel. (--verify addon <domain> or --verify subdomain <domain>)\n";
+    print "--search, -s : find location(s) for all stale or cached entries associated with the domain. (--search addon <domain> or --search subdomain <domain>)\n";
+    print "--clean, -c : remove the needed stale or cached entries associated with the addon or subdomain to allow it to be recreated on the server. (--clean addon <domain> or --clean subdomain <domain>)\n";
+}
+
+sub check_arg {
+  if ($domain =~ m/.*(apthost|arvixe|asoshared|account(server|support)group|accountsupport|apollohosting|appmachine|bluefur|backupgenie|bigrock|bizland|blueboxinternet|bluedomino|bluehost|buydomains|cirtexhosting|cloudhosted|digitalcoud|directdomains|directi|dotster|ehost(s)?|easycgi|emailbrain|endurance|entryhost|fastdomain|fatcow|fortunecity|freeyellow|gteinterlink|globat|hostgator|hostclear|homestead|hostcentric|hostfinity|hostmonster|hostnine|hostv|hypermart|ideahost|ipage|ipower
+justhost|mysitehosted|myserverhosts|netfirms|networkshosting|prodns|powweb|purehost|rhost(bh|hm|jh)|readyhosting|resellerclub|seoboxes|seowebhosting|sistemsunucu|siteshostedhere|speedhost|spry|usanethosting|verio|vitualave|weblimitsiz|webserversystems|webeasyserve|websitewelcome|websitedns|webhostsunucusu|webhost4life|webhostbox|xeran).*/) {
+    print "This script will not work with domain \"$domain\". If it needs to be removed, it should be done manually.\n";
+    exit;
+  }
+}
+
+sub maindomain {
+  my $cpanelacct = shift;
+  my $output_string = `cpapi2 --user=$cpanelacct DomainLookup getmaindomain`;
+  if ($output_string =~ m/main_domain: (\S+)/){
+    return $1;
+  }  else {
+    return "NA";
+  }
+}
+
+sub maindomain_check {
+  my $output_string = `cpapi2 --user=$cpanelacct DomainLookup getmaindomain`;
+  if ($output_string =~ m/main_domain: (\S+)/){
+    $primarydomain = $1;
+    if ($domain eq $primarydomain) {
+      print "This is the primary domain of the cPanel account $cpanelacct. Do not try to clean this domain.\n";
+      exit;
+    }
+  }
+}
+
+sub parkdomain_check {
+  chomp( my $output_string = `cpapi2 --user=$cpanelacct Park listparkeddomains | grep domain: | cut -d: -f2 | cut -d" " -f2` );
+  my @parkdomains = split("\n",$output_string);
+  foreach my $parkdomain (@parkdomains) {
+    if ($domain eq $parkdomain) {
+      print "This is the parked domain of the cPanel account $cpanelacct. Do not try to clean this domain.\n";
+      exit;
+    }
+  }
+}
+
+sub is_addondomain {
+  my @count = ($domain =~ /\./g);
+  if ( @count == 1 ) {
+    if ( $domain =~ m/\S+\.\S+/) {
+      print "This is an addon domain. Please use the --addon option.\n";
+      exit;
+    }
+  }
+}
+
+sub is_notdomain {
+  my @count = ($domain =~ /\./g);
+  if ( @count == 0 ) {
+    print "This is not a domain.\n";
+    exit;
+  }
+}
+                                                                                                                      
+sub search_cpanel {
+  @files = glob("{/var/cpanel/userdata/*/*,/var/cpanel/users/*}");
+
+  foreach $file (@files) {
+    if ( -e $file ) {
+      open (FILE, "<", "$file") or die "Couldn't open $file for reading: $!";
+      foreach my $line (<FILE>) {
+        if ( $line =~ m/\Q$domain\E/i ) {
+          push @results, "$file\n";
+        }
+      }
+      close FILE or die "Couldn't close $file: $!";
+    }
+  }
+
+  @filtered_results = uniq(@results);
+  my $count_results = @filtered_results;
+  if ($count_results > 0) {
+    foreach my $result (@filtered_results) {
+      if ($result =~ m/\/var\/cpanel\/userdata\/(\S+)\/.*/) {
+        push @cpanelacct, $1;
+      } elsif ($result =~ m/\/var\/cpanel\/users\/(\S+).*/) {
+        push @cpanelacct, $1;
+      }
+    }
+    @filtered_cpanelacct = uniq(@cpanelacct);
+    return $filtered_cpanelacct[0];
+  } else {
+    return "NA";
+  }
+}
+
+sub search_files {
+  @files = glob("{/etc/domainusers,/etc/httpd/conf/httpd.conf,/etc/localdomains,/etc/named.conf,/etc/remotedomains,/usr/local/apache/conf/*/*,/var/cpanel/userdata/*/*,/var/cpanel/users/*}");
+
+  foreach $file (@files) {
+    if ( -e $file ) {
+      open (FILE, "<", "$file") or die "Couldn't open $file for reading: $!";
+      foreach my $line (<FILE>) {
+        if ( $line =~ m/\Q$domain\E/i ) {
+          push @results, "$file\n";
+        }
+      }
+      close FILE or die "Couldn't close $file: $!";
+    }
+  }
+
+  @files = glob("{/etc/valiases/$domain,/etc/vdomainaliases/$domain,/etc/vfilters/$domain,/var/named/$domain.db}");
+
+  foreach $file (@files) {
+    if ( -e $file ) {
+      push @results, "$file\n";
+    }
+  }
+
+  @filtered_results = uniq(@results);
+  my @sfiltered_results = sort @filtered_results;
+  return @sfiltered_results;
+}
+
+sub search_named {
+  $domain = shift;
+  $primarydomain = primary_from_fullsubdomain($domain);
+  $file = "/var/named/${primarydomain}.db";
+  my $result = "False";
+  $subdomain = sub_from_domain($domain);
+
+  if (-e $file) {
+    open (FILE, "<", "$file") or die "Couldn't open $file for reading: $!";
+    foreach my $line (<FILE>) {
+      $regex1 = '(^|www|cpcontacts|cpanel|webmail|autoconfig|autodiscover|_caldav|_carddav|whm|webdisk|cpcalendars|default._domainkey).*?(^|\.)'.${subdomain}.'\s+(IN|\d+).*';
+      if ( $line =~ m/$regex1/) {
+        $result = "True";
+      }
+    }
+  }
+  if ($result eq "True") {
+    return "$file\n";
+  }
+}
+
+sub uniq {
+    my %items;
+    grep !$items{$_}++, @_;
+}
+
+sub make_backup {
+  $domain = shift;
+  $backup_dir = '/home/hgbackupdir/'.$script.'/'.$domain.'.'.$time;
+  make_path($backup_dir);
+  return $backup_dir;
+}
+
+sub sub_from_domain {
+  my $dom = shift;
+  $dom=~m/\..+$/;
+  return $`;
+}
+
+sub primary_from_fullsubdomain {
+  my $subdomain = shift;
+  $subdomain=~m/^.+?\./;
+  return $';
+}
+
+sub path_of_file {
+  $file = shift;
+  $file=~m/^.+\//;
+  return $&;
+}
+
+sub clean_v_directories {
+  my @array = (${domain}, ${fullsubdomain});
+  my @paths = ("/etc/vdomainaliases/", "/etc/valiases/", "/etc/vfilters/");
+
+  foreach my $path (@paths) {
+    foreach my $item (@array) {
+      $srcfile = ${path}.${item};
+      make_path(${backup_dir}.${path});
+      $dstfile = ${backup_dir}.${path}.${item};
+      if ( -e $srcfile ) {
+        move ($srcfile, $dstfile) || die "could not move $srcfile to $dstfile: $!\n";
+      }
+    }
+  }
+}
+
+sub clean_dns {
+  my @array = (${domain}, ${fullsubdomain});
+
+  for my $item (@array) {
+    #Use killdns first to remove the entry.
+    system("/scripts/killdns ${item}");
+
+    #Search and remove anything killdns missed.
+    my $srcfile = "/var/named/${item}.db";
+    make_path("${backup_dir}/var/named");
+    my $dstfile = "${backup_dir}/var/named/${item}.db";
+    if ( -e $srcfile ) {
+      move ($srcfile, $dstfile) || die "could not move $srcfile to $dstfile: $!\n";
+    }
+  }
+
+  $srcfile = "/etc/named.conf";
+  make_path("${backup_dir}/etc");
+  $dstfile = "${backup_dir}/etc/named.conf";
+  if ( -e $srcfile ) {
+    copy ($srcfile, $dstfile) || die "could not move $srcfile to $dstfile: $!\n";
+    open( FILE, ">$srcfile" );
+    open(NAMED, $dstfile) or die "Can't open '$dstfile': $!";
+    while( <NAMED> ) {
+      print FILE unless (/^zone "\Q${domain}\E" \{$/ .. /^\n$/);
+    }
+    close(NAMED);
+    close( FILE );
+  }
+
+  #Remove subdomain from the main domain.
+  $maindomain = maindomain($cpanelacct);
+  $file = "/var/named/${maindomain}.db";
+  $regex1 = '(^|www|cpcontacts|cpanel|webmail|autoconfig|autodiscover|_caldav|_carddav|whm|webdisk|cpcalendars|default._domainkey).*?(^|\.)'.$subdomain.'\s+(IN|\d+).*';
+  $regex2 = "none";
+  clean_file($file, $regex1, $regex2);
+}
+
+sub clean_cpanel_files {
+  my ($file, $regex1, $regex2);
+
+  $file = "/var/cpanel/users/${cpanelacct}";
+  $regex1 = '^(|X)DNS[0-9]*?='.${domain}.'\n$';
+  $regex2 = '^(|X)DNS[0-9]*?='.${fullsubdomain}.'\n$';
+  clean_file($file, $regex1, $regex2);
+
+  $file = "/var/cpanel/userdata/${cpanelacct}/main";
+  $regex1 = '^  '.${domain}.': '.${fullsubdomain}.'\n$';
+  $regex2 = '^  - '.${fullsubdomain}.'\n$';
+  clean_file($file, $regex1, $regex2);
+
+  clean_http_files();
+}
+
+sub clean_file {
+  $file = shift;
+  $regex1 = shift;
+  $regex2 = shift;
+
+  my $path = path_of_file($file);
+
+  if ($regex2 eq "none") {
+    $srcfile = ${file};
+    make_path(${backup_dir}.${path});
+    $dstfile = ${backup_dir}.${file};
+    if ( -e $srcfile ) {
+      copy ($srcfile, $dstfile) || die "could not move $srcfile to $dstfile: $!\n";
+      open( FILE, "<$srcfile" );
+      my @lines = <FILE>;
+      close( FILE );
+      open( FILE, ">$srcfile" );
+      foreach my $line ( @lines ) {
+          print FILE $line unless ( $line =~ m/$regex1/ );
+      }
+      close( FILE );
+    }
+  } else {
+    $srcfile = ${file};
+    make_path(${backup_dir}.${path});
+    $dstfile = ${backup_dir}.${file};
+    if ( -e $srcfile ) {
+      copy ($srcfile, $dstfile) || die "could not move $srcfile to $dstfile: $!\n";
+      open( FILE, "<$srcfile" );
+      my @lines = <FILE>;
+      close( FILE );
+      open( FILE, ">$srcfile" );
+      foreach my $line ( @lines ) {
+        print FILE $line unless ( $line =~ m/$regex1/ ) || ( $line =~ m/$regex2/ );
+      }
+      close( FILE );
+    }
+  }
+}
+
+sub clean_http_files {
+  $file = "/var/cpanel/userdata/${cpanelacct}/${fullsubdomain}*";
+
+  @files = glob($file);
+  foreach $file (@files) {
+    my $path = path_of_file($file);
+
+    $srcfile = $file;
+    make_path(${backup_dir}.${path});
+    $dstfile = ${backup_dir}.${file};
+    if ( -e $srcfile ) {
+      move ($srcfile, $dstfile) || die "could not move $srcfile to $dstfile: $!\n";
+    }
+  }
+}
+
+sub clean_cache_files {
+  my @files = ("/var/cpanel/userdata/${cpanelacct}/cache", "/var/cpanel/userdata/${cpanelacct}/cache.json", "/var/cpanel/userdata/${cpanelacct}/main.cache");
+
+  foreach my $file (@files) {
+    my $path = path_of_file($file);
+    $srcfile = $file;
+    make_path(${backup_dir}.${path});
+    $dstfile = ${backup_dir}.${file};
+    if ( -e $srcfile ) {
+      move ($srcfile, $dstfile) || die "could not move $srcfile to $dstfile: $!\n";
+    }
+  }
+  system("/scripts/updateuserdatacache");
+  system("/scripts/updateuserdomains");
+  system("/scripts/rebuildhttpdconf");
+  system("/etc/init.d/httpd graceful");
+}
+
+sub logging_stats {
+  my $log_file = "/var/log/${script}.stat.log";
+
+  @files = glob("{/etc/domainusers,/etc/httpd/conf/httpd.conf,/etc/localdomains,/etc/named.conf,/etc/remotedomains,/usr/local/apache/conf/*/*,/var/cpanel/userdata/*/*,/var/cpanel/users/*}");
+
+  foreach $file (@files) {
+    if ( -e $file ) {
+      open (FILE, "<", "$file") or die "Couldn't open $file for reading: $!";
+      foreach my $line (<FILE>) {
+        if ( $line =~ m/\Q$domain\E/i ) {
+          push @results, "$file\n";
+        }
+      }
+      close FILE or die "Couldn't close $file: $!";
+    }
+  }
+
+  @files = glob("{/etc/valiases/$domain,/etc/vdomainaliases/$domain,/etc/vfilters/$domain,/var/named/$domain.db}");
+
+  foreach $file (@files) {
+    if ( -e $file ) {
+      push @results, "$file\n";
+    }
+  }
+
+  @filtered_results = uniq(@results);
+
+  my $named_file = search_named($domain);
+  push @filtered_results, $named_file;
+
+  open( FILE, ">> $log_file" );
+  foreach $file (@filtered_results) {
+    chomp $file;
+    if ( -e $file ) {
+      my $file_mtime = (stat($file))[9];
+      my $file_ctime = (stat($file))[10];
+      print FILE "$time:$domain:$file:$file_mtime:$file_ctime\n";
+    }
+  }
+  close( FILE );
+}
+
+sub addon_logs {
+  print "Domain removed! Now logging removal. This can take ten minutes or more...\n";
+  my $addon_regex1 = '\[(([0-9]{4})\-([0-9]{2})\-([0-9]{2}) ([0-9]{2})\:([0-9]{2})\:([0-9]{2}) \-[0-9]{4})\] info \[park\] Creating Addon domain \'.*'.$domain.'\' on .*';
+  my $addon_regex2 = '([0-9]{4})\-([0-9]{2})\-([0-9]{2}) ([0-9]{2})\:([0-9]{2})\:([0-9]{2}) \-[0-9]{4}';
+  my $addon_log = "/usr/local/cpanel/logs/error_log";
+  my $addon_epoch = epoch_from_error_log($addon_regex1,$addon_regex2,$addon_log);
+
+  my $del_regex1 = '(([0-9]{1,3}\.){3}[0-9]{1,3}) - \w+ \[(([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2})\:([0-9]{2})\:([0-9]{2}) \-[0-9]{4})\].*POST.*dodeldomain.html.*confirmdodeldomain.html.*domain='.quotemeta(${domain}).'&subdomain=.*';
+  my $del_regex2 = '([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2})\:([0-9]{2})\:([0-9]{2}) \-[0-9]{4}';
+  my $del_log = "/usr/local/cpanel/logs/access_log";
+  my $del_epoch = epoch_from_access_log($del_regex1,$del_regex2,$del_log);
+
+  my $log_file = "/var/log/${script}.log";
+  open( FILE, ">> $log_file" );
+  print FILE "${time}:${domain}:${addon_epoch}:${del_epoch}\n";
+  close( FILE );
+
+}
+
+sub subdomain_logs {
+  print "Domain removed! Now logging removal. This can take ten minutes or more...\n";
+  my $add_regex1 = '(([0-9]{1,3}\.){3}[0-9]{1,3}) - \w+ \[(([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2})\:([0-9]{2})\:([0-9]{2}) \-[0-9]{4})\].*POST.*doadddomain.html.*dir='.quotemeta(${domain}).'&go=Create.*';
+  my $add_regex2 = '([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2})\:([0-9]{2})\:([0-9]{2}) \-[0-9]{4}';
+  my $add_log = "/usr/local/cpanel/logs/access_log";
+  my $addon_epoch = epoch_from_access_log($add_regex1,$add_regex2,$add_log);
+
+  my $del_regex1 = '(([0-9]{1,3}\.){3}[0-9]{1,3}) - \w+ \[(([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2})\:([0-9]{2})\:([0-9]{2}) \-[0-9]{4})\].*POST.*dodeldomain.html\?domain='.quotemeta(${domain}).'\".*';
+  my $del_regex2 = '([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2})\:([0-9]{2})\:([0-9]{2}) \-[0-9]{4}';
+  my $del_log = "/usr/local/cpanel/logs/access_log";
+  my $del_epoch = epoch_from_access_log($del_regex1,$del_regex2,$del_log);
+
+  my $log_file = "/var/log/${script}.log";
+  open( FILE, ">> $log_file" );
+  print FILE "${time}:${domain}:${addon_epoch}:${del_epoch}\n";
+  close( FILE );
+
+}
+
+sub epoch_from_access_log {
+  my $regex1 = shift;
+  my $regex2 = shift;
+  my $log = shift;
+  my $epoch = 0;
+
+  my (@dates);
+
+  my $archive_log = archive_log($log);
+  my @access_logs = glob($archive_log);
+  my @sorted_access_logs = map  { $_->[0] }
+               sort { $a->[1] <=> $b->[1] }
+             map  { [$_, $_=~/(\d+).gz/] }
+                   @access_logs;
+  my @access_log = ($log);
+  push @sorted_access_logs, @access_log;
+  my $sorted_access_logs = @sorted_access_logs;
+
+  my $dates = 0;
+  while ($sorted_access_logs > 0) {
+    if ($dates == 0) {
+      my $file = pop @sorted_access_logs;
+      if ($file =~ m/.*\.gz/) {
+        open(IN, "gunzip -c $file |") or die "gunzip $file: $!";
+        my $content = do { local $/; <IN> }; # entire file in scalar
+        close(IN);
+        if ($content =~ m/$regex1/) {
+          push @dates, $3;
+        }
+        $dates = @dates;
+        if ($dates > 0) {
+          my $last_date = pop @dates;
+
+          my ($month, $day, $year, $hour, $minute, $second) = $last_date =~ m/$regex2/;
+          my $dt = DateTime->new(
+          year       => $year,
+          month      => $month,
+          day        => $day,
+          hour       => $hour,
+          minute     => $minute,
+          second     => $second,
+          time_zone  => 'GMT',
+          );
+          $epoch = $dt->epoch;
+        }
+
+      } else {
+        open (FILE, "<", "$file") or die "Couldn't open $file for reading: $!";
+        foreach my $line (<FILE>) {
+          if ( $line =~ m/$regex1/ ) {
+            push @dates, $3;
+          }
+        }
+        close FILE or die "Couldn't close $file: $!";
+
+        $dates = @dates;
+        if ($dates > 0) {
+          my $last_date = pop @dates;
+
+          my ($month, $day, $year, $hour, $minute, $second) = $last_date =~ m/$regex2/;
+          my $dt = DateTime->new(
+          year       => $year,
+          month      => $month,
+          day        => $day,
+          hour       => $hour,
+          minute     => $minute,
+          second     => $second,
+          time_zone  => 'GMT',
+          );
+          $epoch = $dt->epoch;
+        }
+      }
+      $sorted_access_logs = $sorted_access_logs -1;
+    } else {
+      $sorted_access_logs = 0;
+    }
+  }
+  return $epoch;
+}
+
+sub epoch_from_error_log {
+  my $regex1 = shift;
+  my $regex2 = shift;
+  my $log = shift;
+  my $epoch = 0;
+
+  my (@dates);
+
+  my $archive_log = archive_log($log);
+  my @error_logs = glob($archive_log);
+  my @sorted_error_logs = map  { $_->[0] }
+                          sort { $a->[1] <=> $b->[1] }
+                          map  { [$_, $_=~/(\d+).gz/] }
+                          @error_logs;
+  my @error_log = ($log);
+  push @sorted_error_logs, @error_log;
+  my $sorted_error_logs = @sorted_error_logs;
+
+  my $dates = 0;
+  while ($sorted_error_logs > 0) {
+    if ($dates == 0) {
+      my $file = pop @sorted_error_logs;
+      #Searching archived logs
+      if ($file =~ m/.*\.gz/) {
+        open(IN, "gunzip -c $file |") or die "gunzip $file: $!";
+        my $content = do { local $/; <IN> }; # entire file in scalar
+        close(IN);
+        if ($content =~ m/$regex1/) {
+          push @dates, $1;
+        }
+        $dates = @dates;
+        if ($dates > 0) {
+          my $last_date = pop @dates;
+          my ($year, $month, $day, $hour, $minute, $second) = $last_date =~ m/$regex2/;
+          my $dt = DateTime->new(
+          year       => $year,
+          month      => $month,
+          day        => $day,
+          hour       => $hour,
+          minute     => $minute,
+          second     => $second,
+          time_zone  => 'local',
+          );
+          $epoch = $dt->epoch;
+        }
+
+
+      } else {
+        open (FILE, "<", "$file") or die "Couldn't open $file for reading: $!";
+        foreach my $line (<FILE>) {
+          if ( $line =~ m/$regex1/ ) {
+            push @dates, $1;
+          }
+        }
+        close FILE or die "Couldn't close $file: $!";
+
+        $dates = @dates;
+        if ($dates > 0) {
+          my $last_date = pop @dates;
+          my ($year, $month, $day, $hour, $minute, $second) = $last_date =~ m/$regex2/;
+          my $dt = DateTime->new(
+          year       => $year,
+          month      => $month,
+          day        => $day,
+          hour       => $hour,
+          minute     => $minute,
+          second     => $second,
+          time_zone  => 'local',
+          );
+          $epoch = $dt->epoch;
+        }
+
+      }
+      $sorted_error_logs = $sorted_error_logs -1;
+    } else {
+      $sorted_error_logs = 0;
+    }
+  }
+  return $epoch;
+}
+
+sub archive_log {
+  my $log = shift;
+  my ($dir, $file) = $log =~ m/(\/\S+\/)(\w+)/;
+  my $archive_log = "${dir}archive/${file}-\*";
+  return $archive_log;
+}

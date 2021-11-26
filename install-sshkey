@@ -1,0 +1,40 @@
+#!/bin/bash
+##################################
+## install-sshkey
+## Wizard SSH key installer
+## Please submit all bug reports at bugs.hostgator.com
+## 
+## (C) 2012 - HostGator.com, LLC
+##################################
+
+if grep -qE '((tr|br|gator|vps|br|bra|in|gibo)[0-9]*)\.hostgator|websitewelcome|prodns|minidedicated' /proc/sys/kernel/hostname
+then
+    echo "[!!] This is for dedicated/vps ONLY not shared/reseller/SEO"
+    exit 1
+fi
+
+sshkey="ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAvatGle9+LkGfgZt5Qr8Wo/Gsvhs44XLalDE7sL47K5p7BmO8QlohBVXVdiiPxrqIZHLdWDgGi6Hrs5eZHiH1yDaxsqukKBISiyn291Rq0qfCy1URv+m18GQwM4aqotyaaKqWfgonZ4/5qqqgEHmMfSFcok2/zMMEDH35ZfysMmqgG2v3KGIDKb9msj3AXnBRsfjunoLgoc+W+0bNgw5d4/IXdOWVxI5HD9hpQIetZAvZ/MZcnBf5WIQ9ZjHAe8BkiuqD+tFkWcvQCYbHyiOIWGpz9+mUa+CHWFqr5SmCId8EFsT5LPCTtnCKYjE52XKnBWysn+oVEFxZGHrC+S+CcQ=="
+
+# Already installed?
+if [[ -f /root/.ssh/authorized_keys ]]; then
+    if grep "$sshkey" /root/.ssh/authorized_keys >/dev/null; then
+        echo "[*] The Wizard SSH key is already installed."
+        exit 0
+    fi
+fi
+
+# Do the needful and append key
+echo "[-] Adding ssh key to /root/.ssh/authorized_keys"
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+echo "$sshkey" >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+#Check our work and exit
+if grep "$sshkey" /root/.ssh/authorized_keys >/dev/null; then
+    echo "[*] The Wizard SSH key has been installed successfully."
+    exit 0
+else
+    echo "[!!] The Wizard SSH key install has failed! Check for reasons the file cannot be created or written to."
+    exit 1
+fi

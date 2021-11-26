@@ -1,0 +1,141 @@
+#!/usr/bin/perl
+# $Date: 2015-06-12 $
+# $Revision: 2.5.1 $
+# $Source: /root/bin/submitsh $
+# $Author: Matthew Harris $
+# Submit shells to David Naraghi for Updating Scan
+# http://git.toolbox.hostgator.com/submitsh
+# Please submit all bug reports at jira.endurance.com
+# (C) 2014 - HostGator.com, LLC
+use strict;
+use warnings;
+use version; our $VERSION = qv('2.5');
+use Carp;
+use CPAN;
+use Getopt::Long;
+use Digest::MD5;
+use Socket;
+use Sys::Hostname;
+use File::Copy;
+use File::Basename;
+use File::Path qw{ make_path }; 
+use English qw{ -no_match_vars };
+use Mail::Mailer qw{sendmail};
+
+my ( $host, $sample, $user, $false, $name, $path);
+
+GetOptions( 'false|f' => \$false, );
+
+my $input = $ARGV[0];
+($name,$path) = fileparse($input);
+if ( !defined $input ) {
+    usage();
+}
+else {
+    do_submit($input);
+}
+
+sub do_submit {
+    my $md5   = md5sum($input);
+    my @stats = stat $input;
+    $user = getpwuid $stats['4'];
+    my $size = $stats['7'];
+    $host = hostname;
+    my $ip = inet_ntoa(scalar(gethostbyname(hostname())));
+    getsample($input);
+    my $ruser;
+
+    if ( defined $ENV{'RUSER'} ) {
+        $ruser = $ENV{'RUSER'};
+    } elsif ( defined $ENV{'SYSADMIN'} ) {
+        $ruser = $ENV{'SYSADMIN'};
+    } else {
+        $ruser = 'clam-sample';
+    }
+
+    my $output = <<"EOF";
+Submitter: $ruser
+User: $user
+Server: $host IP: $ip
+Hash: $md5:$size:$input
+
+$sample
+EOF
+    sendmail($output);
+    if ( -d "/home/$user/.security/shells" ) {
+        copy($path.$name, "/home/$user/.security/shells/$name");
+    } else {
+        make_path "/home/$user/.security/shells";
+        copy($path.$name, "/home/$user/.security/shells/$name");
+    }
+    return;
+}
+
+sub md5sum {
+    my $file = shift;
+    my $digest;
+    open my $fh, '<', $file or croak "[!] Could not find file: $file\n";
+    my $fmd5 = Digest::MD5->new;
+    $fmd5->addfile($fh);
+    $digest = $fmd5->hexdigest;
+    close $fh or croak 'Cannot close file handle';
+    return $digest;
+}
+
+sub getsample {
+    my $file = shift;
+    my $shell;
+    open my $fh, '<', $file or croak "[!] Could not find file: $file\n";
+    my @contents = <$fh>;
+    close $fh or croak 'Cannot close file handle';
+    foreach (@contents) {
+        $shell .= $_;
+    }
+    if ( !defined $shell ) {
+        print "[!] Empty File\n" or croak 'Cannot print';
+        exit;
+    }
+    $sample = substr $shell, 0, '3000';
+    return;
+}
+
+sub sendmail {
+    my $body     = shift;
+    my $username = 'clam-sample';
+    my $smtp     = Mail::Mailer->new;
+    my %headers;
+    $headers{From} = "$username\@hostgator.com";
+    $headers{To} = [ qw {
+        dnaraghi@hostgator.com
+        pmarcotte@hostgator.com
+        dbarker@hostgator.com
+        securitymanagers@hostgator.com
+	james.colloca@endurance.com
+    } ];
+
+    if ($false) {
+        $headers{Subject} = "ClamAV Sample - $host - $user - *False Positive*";
+    }
+    else {
+        $headers{Subject} = "ClamAV Sample - $host - $user";
+    }
+    $smtp->open(\%headers);
+    print $smtp "$body";
+    $smtp->close;
+
+    print "\n[+] Shell sample sent.\n\n" or croak 'Cannot print';
+    return;
+}
+
+sub usage {
+    my $usage = <<'END_USAGE';
+ 
+  Usage: submitsh FILENAME
+  Options:
+    --false, -f     Mark as false positive
+    --help, -h      Show this usage
+
+END_USAGE
+    print $usage or croak 'Cannot print usage';
+    exit;
+}

@@ -1,0 +1,622 @@
+#! /usr/bin/perl
+###########
+# cPchuser
+# cPanel backup username changer
+# Wiki: https://gatorwiki.hostgator.com/Migrations/CpChUser
+# Git: http://git.toolbox.hostgator.com/cpchuser
+# Please submit all bug reports at:
+# https://projects.hostgator.com/projects/hg_cpchuser
+#
+# (C) 2013 - HostGator.com, LLC
+###########
+
+use strict;
+use Getopt::Long qw (:config pass_through);
+use File::Find ();
+use Cwd;
+use Tie::File;
+use Data::Dumper;
+
+my $help;
+my $verbose;
+GetOptions(
+	'help' => \$help,
+	'verbose' => \$verbose,
+);
+print "[#] cPanel backup username changer 1.6a\n";
+print "[#] By Rish - please report bugs at https://projects.hostgator.com/projects/hg_cpchuser\n\n";
+
+if ($help) {
+	help();
+}
+
+if (scalar(@ARGV) != 2) {
+	print "[!] Unknown arguments passed. Please see --help.\n";
+	exit 1;
+}
+
+sub help {
+
+	print "Usage: cpchuser <oldusername> <newusername>\n\n";
+	print "Additional switches:\n";
+	print "\t--verbose            More output!\n";
+	print "\t--help               Help?\n\n";
+	print "This script processes a backup file for the provided <oldusername> and replicates it so that it restores as the <newusername>.\n";
+	print "To avoid issues with database modifications, this does not alter the databases themselves. But it does update the files for the following:\n";
+	print "- <oldusername>_<mysql_stuff> -> <newusername>_<mysql_stuff>\n";
+	print "- /home/<oldusername> -> /home/<newusername>\n";
+
+	exit 1;
+}
+
+my ($olduser, $newuser) = @ARGV;
+$newuser = lc($newuser);
+
+#log to file
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+my $logfile = "cpchuser-" . sprintf("%4d%02d%02d",$year+1900,$mon+1,$mday). ".log";
+my $logfile_fh;
+	eval {
+		unless (-d "/var/log/hgtransfer") {
+			mkdir "/var/log/hgtransfer";
+		}
+		open $logfile_fh, ">>", "/var/log/hgtransfer/$logfile";
+	} or do {
+		print "Error opening the log file: /var/log/hgtransfer/$logfile";
+		return 1;
+	};
+
+sub logg {
+	#printonly = 0 -> print to stdout and log
+	#printonly = 1 -> print to stdout only
+	#printonly = 2 -> print only to log
+
+	my $msg = shift;
+	my $printonly = shift;
+	if ($printonly != 2) {
+		print $msg;
+	}
+	if ($printonly != 1) {
+		print $logfile_fh $msg;
+	}
+	return 0;
+}
+
+logg("[*] Logging to /var/log/hgtransfer/$logfile\n", 1);
+
+main();
+
+sub main {
+
+	my $workingdir = cwd;
+
+	if (!validate_user($newuser)) {
+		exit 1;
+	}
+
+	my $backup  = find_backupfiles($olduser, $newuser, $workingdir);
+	my $taropts = ($backup =~ m/\.gz$/i) ? "tzf" : "tf";
+	my $testdir = `tar -$taropts \"$backup\" |head -n 1`;
+	chomp $testdir;
+	if (!($testdir =~ m/^backup\-.*/) && !($testdir =~ m/^cpmove\-.*/)) {
+		logg("[!] Backup file found does not appear to have the proper cpanel backup file structure. Not proceeding.\n", 1);
+		exit 1;
+	}
+	my $testdir2 = $testdir;
+	$testdir2 =~ s/$olduser/$newuser/gi;
+
+	if (-d "$testdir") {
+		logg("[!] It appears that the extracted content '$olduser' ('$testdir') already exists in '$workingdir' - Not moving forward.\n", 1);
+		exit 1;
+	}
+	if (-d "$testdir2") {
+		logg("[!] It appears that the extracted content for '$newuser' ('$testdir2') already exists in '$workingdir' - Not moving forward.\n", 1);
+		exit 1;
+	}
+
+	if (-s "$backup") {
+		logg("[+] Start time: $hour:$min:$sec\n", 2);
+		logg("[+] Found '$backup' for '$olduser'.\n\n", 0);
+
+		logg("[*] Extracting the content out... ", 0);
+		my ($test, $folder) = extract_backup($backup, $workingdir);
+		if ($test) {
+			logg("Done!\n", 0);
+		} else {
+			logg("Failed.\n", 0);
+			exit 1;
+		}
+
+		logg("[*] Validating extracted content... ", 0);
+		my $backupfolder = "$workingdir/$folder";
+		if (-d "$backupfolder") {
+			if (-s "$backupfolder/cp/$olduser") {
+				logg("Done!\n\n", 0);
+			} else {
+				logg("Failed. No user file within the extracted folder!\n", 0);
+				cleanup($backupfolder);
+			}
+		} else {
+			logg("Failed. $backupfolder not found.\n", 0);
+		}
+
+		logg("[*] Gathering information ...\n", 0);
+		my %infovars = parse_info($backupfolder);
+
+		logg("[*] Updating cPanel files - ", 0);
+		$test = update_cpanel($backupfolder);
+		if ($test) { 
+			logg("[+] Updated cPanel files successfully!\n\n", 0);
+		} else {
+			logg("[!] Failed to update cPanel files. Aborting.\n", 0); 
+			cleanup($backupfolder);
+		}
+
+		logg("[*] Renaming cPanel files as needed now - ", 0);
+		$test = rename_cpfiles($backupfolder);
+		if ($test) {
+			logg("[+] Renamed cPanel files successfully!\n\n", 0);
+		} else {
+			logg("Failed.\n", 0);
+			cleanup($backupfolder);
+		}
+
+		if (-d $backupfolder."homedir") {
+			logg("[*] Extracting homedir now... ", 0);
+			my $test = extract_homedir($backupfolder);
+			if ($test) {
+				logg("Done!\n\n", 0);
+			} else {
+				logg("Failed.\n", 0);
+				cleanup($backupfolder);
+			}
+
+			logg("[*] Updating homedir files - ", 0);
+			$test = update_homedir($backupfolder, \%infovars);
+			if ($test) {
+				logg("[+] Updated homedir files successfully!\n\n", 0);
+			} else {
+				logg("[!] Failed to update homedir files. Aborting\n", 0);
+			}
+
+			logg("[*] Cleaning up and repacking homedir now... ", 0);
+			my $logs = $backupfolder."homedir/access-logs";
+			unlink($logs);
+			symlink("/usr/local/apache/domlogs/$newuser/", "$logs");
+			my $homedirtar = $backupfolder."homedir.tar";
+			my $homedir = $backupfolder."homedir/";
+			unlink("$homedirtar");
+			my $output = `tar -cvf \"$homedirtar\" -C \"$homedir\" . 2>/dev/null`;
+			if (($? >> 8) > 0) {
+				logg ("Failed to repackage homedir! Aborting.\n", 0);
+				cleanup ($backupfolder);
+			} else {
+				logg("Done!\n", 0);
+				logg("\t[*] Blanking the homedir folder that we were working with: $homedir\n\n", 0);
+				system("rm -rf \"$homedir\"");
+				system("mkdir -p \"$homedir\"");
+			}
+		} else {
+			logg("[+] No Homedir found. Skipping\n\n", 0);
+		}
+
+		logg ("[*] Repacking the backup file now... ", 0);
+		my $newbackupfolder = $backupfolder;
+		$newbackupfolder =~ s/$olduser\/$/$newuser\//;
+		rename ($backupfolder, $newbackupfolder);
+		$newbackupfolder =~ s/\/$//;
+		my $basefolder = $newbackupfolder;
+		$basefolder =~ s/$workingdir\///g;
+
+		my $output = `tar -czvf \"$newbackupfolder.tar.gz\" -C \"$workingdir\" \"$basefolder\" 2>/dev/null`;
+		if (($? >> 8) > 0) {
+			logg ("Failed to repackage the backup file! Aborting...\n", 0);
+		} else {
+			logg ("Done!\n", 0);
+			logg ("[+] Successfully duplicated the backup file '$backup' for user '$olduser' to '$newbackupfolder.tar.gz' for user '$newuser'.\n", 0);
+			logg ("[####]IMPORTANT[####]\n", 1);
+			logg ("      Please make sure to check the restored content for issues as this script does not alter the paths and such within the databases.\n", 1);
+			logg ("[####]IMPORTANT[####]\n", 1);
+			cleanup($newbackupfolder);
+		}
+	} else {
+		logg ("[!] '$backup' found but appears to be an empty file... Aborting.\n", 1);
+		exit 1;
+	}	
+}
+
+# Determine whether or not the given cPanel user is valid.
+# Input: cPanel user
+# Output (return value): 1=Valid, 0=Invalid
+sub validate_user {
+	my $user = shift;
+	# Check length (2-8 characters)
+        if (length($user) < 2 || length($user) > 16) {
+		logg("[!] Please make the new username 2-16 characters long.\n", 1);
+		return undef;
+        }
+	# Cannot start with a number.
+	if ($user =~ /^[0-9]/) {
+		logg("[!] The new username cannot start with a number.\n", 1);
+		return undef;
+	}
+	# No special characters allowed.
+	if ($user =~ /[^a-z0-9]/) {
+		logg("[!] The new username cannot contain special characters.\n", 1);
+		return undef;
+	}
+	# Cannat start with "test"
+	if ($user =~ /^test/) {
+		logg("[!] The new username cannot start with \"test\".\n", 1);
+		return undef;
+	}
+	# Cannat start with "cpmydns"
+	if ($user =~ /^cpmydns/) {
+		logg("[!] The new username cannot start with \"cpmydns\".\n", 1);
+		return undef;
+	}
+	# Cannat start with "cpanel"
+	if ($user =~ /^cpanel/) {
+		logg("[!] The new username cannot start with \"cpanel\".\n", 1);
+		return undef;
+	}
+	# Cannat end with "assword"
+	if ($user =~ /assword$/) {
+		logg("[!] The new username cannot end with \"assword\".\n", 1);
+		return undef;
+	}
+	if ($user =~ /(^all$|^cpbackup$|^cphulkd$|^cpses$|^dirs$|^dovecot$|^eximstats$|^files$|^horde$|
+                       ^logaholic$|^mailman$|^modsec$|^munin$|^mydns$|^postgres$|^proftpd$|^root$|
+                       ^roundcube$|^spamassassin$|^system$|^tmp$|^tomcat$|^toor$|^virtfs$|^shadow$)/) {
+		logg("[!] The username $user is reserved\n", 1);
+		return undef;	
+	}
+	return 1;
+}
+
+sub update_homedir {
+
+	my $directory = shift;
+	my $infovars  = shift;
+	my %infovars  = %{$infovars};
+
+	if (!-d "$directory") {
+		return 0;
+	}
+
+	my $homedir = $directory."homedir";
+	if (!-d "$homedir") {
+		logg("[!] Homedir files not found. Aborting...\n", 0);
+		return 0;
+	}
+
+	my @changehomes;
+	File::Find::find( sub { homefiles(\@changehomes); }, $homedir);
+
+	logg(scalar(@changehomes)." file(s) have references to the old username. Checking these files to replace the ".scalar(keys %infovars)." variable(s) we care about:\n", 0);
+	foreach my $key (keys %infovars) {
+		logg("\t".$key." => ". $infovars{$key}."\n");
+	}
+
+	foreach my $file (@changehomes) {
+		logg("\t[*] Processing $file\n", ($verbose)? 0 : 2);
+		tie my @lines, 'Tie::File', $file;
+		foreach my $line (@lines) {
+			foreach my $key (keys %infovars) {
+				$line =~ s/$key/$infovars{$key}/g;
+			}
+		}
+		untie @lines;
+	}
+	return 1;
+}
+
+sub homefiles {
+
+	my $changehomes = shift;
+	my $file        = $File::Find::name;
+	return unless -f $file;
+
+	my $oldprefix = database_prefix($olduser);
+	my $filesize = -s $file;
+	if ( $filesize < 20971520 &&
+		not ($file =~ m/\.zip$|\.tar$|\.tar\.gz$|\.bzip2$/i) &&
+		not ($file =~ m/error_log$|\.sql$|\.listing$|\.log$/i) &&
+		not ($file =~ m/\.jpg$|\.gif$|\.png|\.bmp$/i)
+	) {
+		open my $file_fh, "<", $file or logg ("\n* Couldn't open ${file}\n\n", 2) && return 0;
+		foreach my $line (<$file_fh>) {
+			if ($line =~ m/$oldprefix/o) {
+				push (@{$changehomes}, $file);
+				last;
+			}
+		}
+		close $file_fh;
+	}
+}
+
+sub extract_homedir {
+
+	my $directory = shift;
+	if (!-d "$directory") {
+		return 0;
+	}
+
+	my $homedir = $directory.'homedir';
+	my $homedirtar = $directory.'homedir.tar';
+
+	if (not -e $homedirtar) {
+		# Since 11.37 cPanel doesn't use a homedir.tar
+		# it just has the homedir extracted out into 'homedir'
+		return 1;
+	}
+
+	my @output = `/bin/tar -C \"$homedir\" -xvf \"$homedirtar\" 2>/dev/null`;
+
+	# Check the return code, and exit if the external call failed.
+	if (($? >> 8) > 0) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+sub parse_info {
+
+	my $oldprefix = database_prefix($olduser);
+	my $newprefix = database_prefix($newuser);
+	my $directory = shift;
+	if (!-d "$directory") {
+		return 0;
+	}
+
+	my $mysqlfile = $directory."mysql.sql";
+	my %infovars;
+	open my $mysql_fh, "<", $mysqlfile or logg("\n* Couldn't open ${mysqlfile}\n\n", 2) && return 0;
+	foreach my $line (<$mysql_fh>) {
+		chomp $line;
+		$line =~ s/\\//g;
+		$line =~ s/[\`\']/ /g;
+
+		if ($line =~ m/(_\w+)\s+/) {
+			my $newo = $1;
+			my $key  = $oldprefix.$newo;
+			$newo    =~ s/$oldprefix/$newprefix/g;
+			my $value = $newuser.$newo;
+			$infovars{$key} = $value;
+		}
+	}
+	close $mysql_fh;
+
+	my $homedirpath = $directory."homedir_paths";
+	my $homedir;
+	if (!-s "$homedirpath") {
+		open my $homedir_fh, "<", $homedirpath or logg("\n* Couldn't open ${homedirpath}\n\n", 2) && return 0;
+		chomp ($homedir = do { local $/; <$homedir_fh> });
+		close $homedir_fh;
+		$homedir .= "/";
+	} else {
+		$homedir = "/home/$olduser/";
+	}
+
+	my $newhome = $homedir;
+	$newhome =~ s/$olduser/$newuser/g;
+	$infovars{$homedir} = $newhome;
+
+	return %infovars;
+}
+
+sub rename_cpfiles {
+
+	my $directory = shift;
+	if (!-d "$directory") {
+		logg ("[!] $directory does not exist - call failed in rename_cpfiles().\n", 2);
+		return 0;
+	}
+	my %filenamechange;
+
+	File::Find::find( sub { refiles(\%filenamechange, $directory); }, $directory);
+
+	logg(scalar(keys %filenamechange)." file(s) to be renamed ...\n", 0);
+	for my $key ( keys %filenamechange ) {
+		my $newname = $filenamechange{$key};
+		logg("\t[*] Renaming '$key' to '$newname'\n", ($verbose)? 0 : 2);
+		rename ($key, $newname) or logg("\n* Couldn't rename ${key} to ${newname}\n\n", 2) && return 0;
+	}
+	return 1;
+}
+
+sub refiles {
+
+	my $filenamechange = shift;
+	my $directory      = shift;
+	my $fullname       = $File::Find::name;
+	my $oldprefix      = database_prefix($olduser);
+	my $newprefix      = database_prefix($newuser);
+	
+	if ( not -f $fullname or ($fullname =~ m/logs\// or $fullname =~ m/vad\// or
+							  $fullname =~ m/vf\//   or $fullname =~ m/bandwidth\// or
+							  $fullname =~ m/va\//   or $fullname =~ m/userdata\//)
+	) {
+		return;
+	}
+
+	(my $file = $fullname) =~ s/^$directory//;
+	# Rename files in mysql and mysql-timestamps dirs based on short usernames.  Rename everything else on full username.
+	if ($file =~ /^mysql\// || $file =~ /^mysql-timestamps\//) {
+		if ( ($file =~ m/$oldprefix$/)  or ($file =~ m/$oldprefix\_/) or ($file =~ m/$oldprefix\-/)) {
+			$file =~ s/$oldprefix/$newuser/;
+			$filenamechange->{$fullname} = $directory.$file;
+		}
+	}else { 
+		if ( ($file =~ m/$olduser$/)  or ($file =~ m/$olduser\_/) or ($file =~ m/$olduser\-/)) {
+			$file =~ s/$olduser/$newuser/;
+			$filenamechange->{$fullname} = $directory.$file;
+		}
+	}
+}
+
+sub update_cpanel {
+
+	my $oldprefix = database_prefix($olduser);
+	my $newprefix = database_prefix($newuser);
+	my $directory = shift;
+	if (!-d "$directory") {
+		logg ("[!] $directory does not exist - call failed in update_cpanel().\n", 2);
+		return 0;
+	}
+	my @usernamefiles;
+
+	# http://www.adp-gmbh.ch/perl/find.html
+	File::Find::find( sub { findfiles (\@usernamefiles, $_) }, $directory);
+
+	logg(scalar(@usernamefiles)." file(s) to be processed ...\n", 0);
+	foreach my $file (@usernamefiles) {
+		logg("\t[*] Processing $file\n", ($verbose)? 0 : 2);
+		if ($file =~ /mysql\.sql$/ || $file =~ /meta\/dbmap\.yaml$/) {
+			update_single_file($file, $olduser, $newuser);
+			update_single_file($file, $oldprefix, $newprefix);
+		}else {
+			update_single_file($file, $olduser, $newuser);
+		}
+	}
+	return 1;
+}
+
+sub update_single_file {
+	my $file    = shift;
+	my $olduser = shift;
+	my $newuser = shift;
+	tie my @lines, 'Tie::File', $file;
+
+	foreach my $line (@lines) {
+		$line =~ s/$olduser([\\:\_\`'])/$newuser$1/g;
+		$line =~ s/(\/home.?\/)$olduser/$1$newuser/g;
+		if ($line =~ m/(?:
+					^\s*documentroot | # lines starting with documentroot
+					^\s*group        | # lines starting with group
+					^\s*homedir      | # lines starting with homedir
+					^\s*path         | # lines starting with path 
+					^\s*user         | # lines starting with user
+					^\s*dbowner      | # lines starting with dbowner
+					^\s*owner          # lines starting with owner
+					)/xi)
+		{
+			$line =~ s/$olduser/$newuser/g;
+		}
+	}
+	untie @lines;
+}
+
+sub cleanup {
+
+	my $directory = shift;
+	logg ("\n\n[*] Cleaning up $directory\n", 0);
+	system ("rm -rf \"$directory\"");
+	exit 1;
+}
+
+sub findfiles {
+
+	my $usernamefiles = shift;
+	my $file          = $File::Find::name;
+	return unless -f $file;
+
+	if (not ($file =~ m/homedir\.tar$/ || $file =~ m/mysql\// ||
+			 $file =~ m/mm\// || $file =~ m/logs\// ||
+			 $file =~ m/sds/
+			)
+	) {
+		open my $file_fh, "<", $file or logg("\n* Couldn't open ${file}\n\n", 2) && return 0;
+		while (<$file_fh>) {
+			if (m/$olduser/o) {
+				push (@{$usernamefiles}, $file);
+				last;
+			}
+		}
+		close $file_fh;
+	}
+}
+
+sub find_backupfiles {
+
+	my $olduser    = shift;
+	my $newuser    = shift;
+	my $workingdir = shift;
+	my @ofilesfound;
+	my @nfilesfound;
+
+	File::Find::find( { preprocess => \&limit_depth, wanted => sub { wanted( \@ofilesfound, \@nfilesfound, $_ ); } }, $workingdir );
+
+	if ( not scalar(@ofilesfound) ) {
+		logg("[!] No backup/cpmove file found for '$olduser' in '$workingdir'\n", 1);
+		exit 1;
+	}
+
+	if (scalar(@ofilesfound) > 1) {
+		logg("[!] Multiple backup/cpmove files found for '$olduser' in '$workingdir'. Move them out or initiate this script in a clean working directory please:\n", 1);
+		foreach (@ofilesfound) {
+			logg("$_\n", 1);
+		}
+		exit 1;
+	}
+	if (@nfilesfound){
+		logg("[!] cPanel backup files for '$newuser' already exist in '$workingdir'. Move them out or initiate this script in a clean working directory pleasse.\n", 1);
+		exit 1;
+	}
+
+	return $ofilesfound[0];
+}
+
+sub limit_depth {
+
+	my $depth = $File::Find::dir =~ tr[/][];
+	if ($depth == 0) {
+		return @_;
+	} else {
+		return grep { not -d } @_;
+	}
+}
+
+sub wanted {
+
+	my ($ofilesfound, $nfilesfound, $filename) = @_;
+	if (($filename =~ m/(backup-[\d.\_\-]*_|cpmove-)$olduser\.tar(\.gz)?/i)) {
+		push (@{$ofilesfound}, $File::Find::name);
+	}
+	if (($filename =~ m/(backup-[\d.\_\-]*_|cpmove-)$newuser\.tar(\.gz)?/i)) {
+		push (@{$nfilesfound}, $File::Find::name);
+	}
+	return;
+}
+
+sub extract_backup {
+
+	my $backup = shift;
+	my $workdir = shift;
+
+	my $taropts = ($backup =~ m/\.gz$/i) ? "xvzf" : "xvf";
+	my @output = `/bin/tar -C \"$workdir\" -$taropts \"$backup\" 2>/dev/null`;
+	my $folder = $output[0];
+	chomp $folder;
+
+	if (($? >> 8) > 0) {     #Check the return code, and exit if the external call failed.
+		my $ret = ($? >> 8);
+		return (0, $folder);
+	} else {
+		return (1, $folder);
+	}
+}
+
+
+# Limit the length of the username to 8 and return it as the database prefix.
+# Input:  Full length username.
+# Output: Database prefix, which is the username limited to 8 characters.
+sub database_prefix {
+	my $prefix = shift;
+	if (length($prefix) > 8) {
+		$prefix = substr($prefix, 0, 8);
+	}
+	return $prefix;
+}
+

@@ -1,0 +1,1276 @@
+#!/bin/bash
+
+###########
+# install-opt-php
+# attempt to install a php version along-side a standard php installation on cPanel
+# no wiki yet
+# Please submit all bug reports at jira.endurance.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+# original: jlavoy
+# maintained by :jmczeal, ablair, dbarker, mbounds
+
+# Note: Old php downloads here http://museum.php.net/php5/php-5.3.6.tar.bz2
+
+PHP_VERSION_2="5.2.17";
+PHP_VERSION_3="5.3.29";
+PHP_VERSION_4="5.4.45";
+PHP_VERSION_5="5.5.30";
+PHP_VERSION_6="5.6.16";
+PHP_VERSION_70="7.0.0";
+PHP_VERSION_NG="ng-20150707.tar.gz";
+PHP_DOWNLOAD_MIRRORLIST=(   http://us1.php.net/distributions \
+                            http://museum.php.net/php5 \
+                            http://us2.php.net/distributions \
+                            http://www.php.net/distributions \
+                            http://repo.gatorsec.net/install-opt-php/ \
+                            https://downloads.php.net/~ab \
+                            http://downloads.php.net/tyrael \
+                            http://dustenbarker.com/php-src );
+
+#######################################  DON'T change anything below this unless you know what you're doing  ###########################################
+
+PHP_INSTALLATION_FOLDER="/opt";
+LOGPATH="/root/log/install-opt-php";
+SCRIPT_VERSION="v9(20170920)";
+_buildVer="53"; # Build PHP 5.3 by default.
+#_useFastCGI=1;
+_useSuPHP=1;
+_ramlimit=320;
+_nice="nice -n18"
+_installIoncube=1;
+_installZendGuard=1;
+_installSourceGuardian=1;
+_optimise=1;
+_optFlag="-O2"; # -march=native is added automatically in buildCfg() if gcc supports it
+_52backports=0;
+_stripSymbols=1;
+_prelink=1;
+_chrpath=1;
+_autoVersion=1;
+
+#Initialize stuffs
+initCfg(){
+    echo;
+
+    # Setup core configure flags, assign internal variables
+    _phpPrefix="${PHP_INSTALLATION_FOLDER}/php${_buildVer}"
+
+    if [[ ${_buildVer} && ${_forceVersion} ]]; then 
+        r="^${_buildVer:0:1}\.${_buildVer:1:1}\.[0-9]+$";
+        if [[  ${_forceVersion} =~ ${r} || ${_force} ]]; then
+            case "${_buildVer}" in
+                52) PHP_VERSION_2="${_forceVersion}";;
+                53) PHP_VERSION_3="${_forceVersion}";;
+                54) PHP_VERSION_4="${_forceVersion}";;
+                55) PHP_VERSION_5="${_forceVersion}";;
+                56) PHP_VERSION_6="${_forceVersion}";;
+                70) PHP_VERSION_70="${_forceVersion}";;
+            esac;
+        else
+            showFail "The specified forced version must match the appropriate standard version switch. ex: \"-6 -v 5.6.3\"."
+        fi;
+    elif [[ ${_buildVer} && ${_autoVersion} == 1 && ! ${_uninstall} ]]; then
+        echo "Attempting to automatically detect latest PHP version...";
+        case "${_buildVer}" in
+            52) PHP_VERSION_2="$(_tver="5.2";GET http://us3.php.net/releases/index.php\?serialize=1\&version=5\&max=1000|grep -oP "(?<=php-)${_tver}\.[0-9]+(?=\.tar\.gz)"|head -1)";
+                if [[ ! ${PHP_VERSION_2} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then showFail "Unable to auto-detect latest version. Please force version instead";fi;;
+            53) PHP_VERSION_3="$(_tver="5.3";GET http://us3.php.net/releases/index.php\?serialize=1\&version=5\&max=1000|grep -oP "(?<=php-)${_tver}\.[0-9]+(?=\.tar\.gz)"|head -1)";
+                if [[ ! ${PHP_VERSION_3} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then showFail "Unable to auto-detect latest version. Please force version instead";fi;;
+            54) PHP_VERSION_4="$(_tver="5.4";GET http://us3.php.net/releases/index.php\?serialize=1\&version=5\&max=1000|grep -oP "(?<=php-)${_tver}\.[0-9]+(?=\.tar\.gz)"|head -1)";
+                if [[ ! ${PHP_VERSION_4} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then showFail "Unable to auto-detect latest version. Please force version instead";fi;;
+            55) PHP_VERSION_5="$(_tver="5.5";GET http://us3.php.net/releases/index.php\?serialize=1\&version=5\&max=1000|grep -oP "(?<=php-)${_tver}\.[0-9]+(?=\.tar\.gz)"|head -1)";
+                if [[ ! ${PHP_VERSION_5} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then showFail "Unable to auto-detect latest version. Please force version instead";fi;;
+            56) PHP_VERSION_6="$(_tver="5.6";GET http://us3.php.net/releases/index.php\?serialize=1\&version=5\&max=1000|grep -oP "(?<=php-)${_tver}\.[0-9]+(?=\.tar\.gz)"|head -1)";
+                if [[ ! ${PHP_VERSION_6} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then showFail "Unable to auto-detect latest version. Please force version instead";fi;;
+            70) PHP_VERSION_70="$(_tver="7.0";GET http://us3.php.net/releases/index.php\?serialize=1\&version=7\&max=1000|grep -oP "(?<=php-)${_tver}\.[0-9]+(?=\.tar\.gz)"|head -1)";
+                if [[ ! ${PHP_VERSION_70} =~ [0-9]+\.[0-9]+\.[0-9]+ ]]; then showFail "Unale to auto-detect latest version. Please force version instead";fi;;
+        esac;
+    fi;
+
+
+    if [[ $_buildVer == "53" ]]; then
+        _cfgLine="--disable-fileinfo --enable-bcmath --enable-calendar --enable-exif --enable-ftp --enable-magic-quotes --enable-mbstring --enable-pdo=shared --enable-sockets --enable-sqlite-utf8 --enable-libxml --with-pcre-regex --enable-wddx --prefix=${_phpPrefix} --with-gd --with-gettext --with-pdo-mysql=shared --with-pdo-sqlite=shared --with-pic --with-sqlite=shared --enable-soap";
+        _phpVersion="$PHP_VERSION_3";
+        _phpDownload=$(getDownload php-${_phpVersion}.tar.gz)
+
+    elif [[ $_buildVer == "54" ]]; then
+        _cfgLine="--disable-fileinfo --enable-bcmath --enable-calendar --enable-exif --enable-ftp --enable-mbstring --with-sqlite3=shared --enable-pdo=shared --enable-sockets --enable-libxml --with-pcre-regex --enable-wddx --prefix=${_phpPrefix} --with-gd --with-gettext --with-pdo-mysql=shared --with-pdo-sqlite=shared,/usr --with-pic --enable-soap";
+        _phpVersion="$PHP_VERSION_4";
+        _phpDownload=$(getDownload php-${_phpVersion}.tar.gz)
+
+    elif [[ $_buildVer == "52" ]]; then
+        _cfgLine="--enable-bcmath --enable-calendar --enable-exif --enable-ftp --enable-magic-quotes --enable-mbstring --enable-pdo=shared --enable-sockets --enable-sqlite-utf8 --enable-libxml --with-pcre-regex --enable-wddx --prefix=${_phpPrefix} --with-gd --with-gettext --with-pdo-mysql=shared --with-pdo-sqlite=shared --with-pic --with-sqlite=shared --enable-soap"
+	    _phpVersion="$PHP_VERSION_2";
+        _phpDownload=$(getDownload php-${_phpVersion}.tar.gz)
+
+    elif [[ $_buildVer == "55" ]]; then
+        _cfgLine="--disable-fileinfo --enable-bcmath --enable-calendar --enable-exif --enable-ftp --enable-mbstring --without-sqlite --with-sqlite3=shared --enable-pdo --enable-sockets --enable-libxml --with-pcre-regex --enable-wddx --prefix=${_phpPrefix} --with-gd --with-gettext --with-pdo-mysql=/usr --with-pdo-sqlite=shared,/usr --with-pic --enable-soap";
+        _phpVersion="$PHP_VERSION_5";
+        _phpDownload=$(getDownload php-${_phpVersion}.tar.gz)
+
+    elif [[ $_buildVer == "56" ]]; then
+        _cfgLine="--disable-fileinfo --enable-bcmath --enable-calendar --enable-exif --enable-ftp --enable-mbstring --with-sqlite3=shared --enable-pdo --enable-sockets --enable-libxml --with-pcre-regex --enable-wddx --prefix=${_phpPrefix} --with-gd --with-gettext --with-pdo-mysql=/usr --with-pdo-sqlite=shared,/usr --with-pic --disable-zip --enable-soap";
+        _phpVersion="$PHP_VERSION_6";
+        _phpDownload=$(getDownload php-${_phpVersion}.tar.gz)
+    elif [[ $_buildVer == "70" ]]; then
+        _cfgLine="--disable-fileinfo --enable-bcmath --enable-calendar --enable-exif --enable-ftp --enable-mbstring --with-sqlite3=shared --enable-pdo --enable-sockets --enable-libxml --with-pcre-regex --enable-wddx --prefix=${_phpPrefix} --with-gd --with-gettext --with-pdo-mysql=/usr --with-pdo-sqlite=shared --with-pic --disable-zip --enable-soap";
+        _phpVersion="$PHP_VERSION_70";
+        _phpDownload=$(getDownload php-${_phpVersion}.tar.gz)
+    fi;
+
+    if [[ ! ${_phpDownload} ]]; then
+        showFail "Failed to find viable download location."
+    fi;
+
+
+    if [[ ${HOSTTYPE} == "x86_64" ]]; then
+        _cfgLine="${_cfgLine} --with-libdir=lib64";
+        _usrLib="/usr/lib64";
+    else
+        _usrLib="/usr/lib";
+    fi;
+
+    if [[ ${controlPanel} == "plesk" ]]; then
+        _cfgLine="--with-libdir=lib64 --cache-file=../config.cache --prefix=${_phpPrefix} --with-config-file-path=${_phpPrefix}/etc --disable-debug --with-pic --disable-rpath --with-bz2 --with-curl --with-freetype-dir=${_phpPrefix} --with-png-dir=${_phpPrefix} --enable-gd-native-ttf --without-gdbm --with-gettext --with-gmp --with-iconv --with-jpeg-dir=${_phpPrefix} --with-openssl --with-pspell --with-pcre-regex --with-zlib --enable-exif --enable-ftp --enable-sockets --enable-sysvsem --enable-sysvshm --enable-sysvmsg --enable-wddx --with-kerberos --with-unixODBC=/usr --enable-shmop --enable-calendar --without-sqlite3 --with-libxml-dir=${_phpPrefix} --enable-pcntl --with-imap --with-imap-ssl --enable-mbstring --enable-mbregex --with-gd --enable-bcmath --with-xmlrpc --with-ldap --with-ldap-sasl --with-mysql --with-mysqli --enable-soap --with-xsl --enable-xmlreader --enable-xmlwriter --enable-pdo --with-pdo-mysql --with-pear=${_phpPrefix}/pear --with-mcrypt --enable-intl --without-pdo-sqlite --with-config-file-scan-dir=${_phpPrefix}/php.d";
+    fi;
+
+}
+
+getDownload(){
+    if [[ ${_uninstall} ]]; then
+        echo "uninstall";
+    else
+        echo -n "Testing for download tools...">&2;
+        if [[ ! -e /usr/bin/HEAD ]];then
+            rpm -e --nodeps perl-libwww-perl >&2;
+            yum install --disableexcludes=all -y perl-libwww-perl >&2;
+        fi;
+        echo "Done">&2;
+        for _test in ${PHP_DOWNLOAD_MIRRORLIST[@]}; do 
+            echo -n "Testing mirror ${_test}...">&2;
+            if [[ $(HEAD -dt2 ${_test}/${1}) == "200 OK" ]]; then 
+                echo " OK">&2
+                echo "${_test}/${1}";
+                break;
+            else
+                echo " Fail">&2
+            fi;
+        done;
+    fi;
+};
+
+checkRAM(){
+    _freeram=$(free -m|awk 'NR==3{print $4}');
+    echo "Available RAM: ${_freeram} MB";
+    if [[ ${_freeram} -lt ${_ramlimit} ]]; then
+        echo;
+        echo "WARNING: You have less than ${_ramlimit} MB of RAM available. The build may fail.";
+        if [[ ${_fastBuild} ]]; then
+            unset _fastBuild;
+            echo "The Fast-build option will be disabled while low on memory.";
+        fi;
+        echo "Consider temporarily shutting down services (Apache, MySQL, Exim, &c...)";
+        echo;
+        echo "Press any key to continue, or ^C to quit now. Continuing in 10 seconds.";
+        read -st10 -n1;
+    fi;
+    echo -n "Checking if can allocate 128 MB...";
+    if [[ ! $_force ]]; then
+        ${_nice} perl -e'$mb = "a" x 1048576;$str = "";$|=1;$str .= $mb x 128;sleep 3;exit 0;' || showFail "Unable to allocate 128 MB of RAM";
+        echo "Yes";
+     else
+        echo "Forced";
+     fi;
+}
+
+checkSpace(){
+    _freespace=$(df -Pm ${PHP_INSTALLATION_FOLDER}|awk 'NR==2{print $4}');
+    echo "Available disk space: ${_freespace} MB";
+    if [[ ${_freespace} -lt 450 ]]; then
+        echo;
+        echo "WARNING: You have less than 450 MB of space available on ${PHP_INSTALLATION_FOLDER}.";
+        echo "Please free some space and try again.";
+        echo;
+        showFail "Not enough disk space";
+    fi;
+}
+
+checkCPHandler(){
+    if [[ ${controlPanel} == "cpanel" ]]; then 
+        echo "Checking current cPanel PHP5 handler";
+        _cpHandler=$(/usr/local/cpanel/bin/rebuild_phpconf --current|awk '/^PHP5/{print $NF}');
+        if [[ ${_cpHandler} == "fcgi" ]]; then
+            unset _useSuPHP;
+            _useFastCGI=1;
+        fi;
+    fi;
+}
+
+makePatch(){
+    if [[ ${_buildVer} == "53" ]]; then
+        cat <<'STOP' >"$@"
+--- php-5.3.28/configure        2013-07-10 18:47:16.000000000 +0100
++++ php-5.3.28.orig/configure   2013-07-23 18:25:44.111217059 +0100
+@@ -75565,6 +75565,12 @@
+ 
+   else
+       # use bundled libs
++
++      # This change is anchored here to avoid patch being misapplied.  This really only needs to be added
++      # when pdo_sqlite is compiled shared and using the bundled sqlite3.  It shouldn't hurt so long as the
++      # bundled sqlite3 is used though.
++      shared_objects_pdo_sqlite="$shared_objects_pdo_sqlite ext/sqlite3/libsqlite/sqlite3.lo"
++
+       if test "$enable_maintainer_zts" = "yes"; then
+         threadsafe_flags="-DSQLITE_THREADSAFE=1"
+       else
+STOP
+    elif [[ ${_buildVer} == "70" ]]; then
+        cat <<'STOP' >"$@"
+--- php-7.0.*.orig/configure      2016-03-29 09:44:11.000000000 -0500
++++ php-7.0.*/configure   2016-04-20 08:30:07.757000000 -0500
+@@ -20480,6 +20480,11 @@
+ 
+ 
+   else
++    # This change is anchored here to avoid patch being misapplied.  This really only needs to be added
++    # when pdo_sqlite is compiled shared and using the bundled sqlite3.  It shouldn't hurt so long as the
++    # bundled sqlite3 is used though.
++    shared_objects_pdo_sqlite="$shared_objects_pdo_sqlite ext/sqlite3/libsqlite/sqlite3.lo"
++
+     { $as_echo "$as_me:${as_lineno-$LINENO}: checking bundled sqlite3 library" >&5
+ $as_echo_n "checking bundled sqlite3 library... " >&6; }
+     { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+STOP
+    fi;
+}
+
+#Detect libs and contruct configure flag line.
+buildCfg(){
+    # Detect components, dynamically assemble configure flags
+    echo;
+    echo "Detecting components:";
+    local _checkList=( \
+        "FreeType2:${_usrLib}/libfreetype.so:--enable-gd-native-ttf --with-freetype-dir=/usr" \
+        "Tidy:/opt/tidy/lib/libtidy:--with-tidy=/opt/tidy/" \
+        "PCRE:/opt/pcre/lib/libpcre.so: --with-pcre-dir=/opt/pcre" \
+        "PNG:${_usrLib}/libpng.so:--with-png-dir=/usr" \
+        "JPG:${_usrLib}/libjpeg.so:--with-jpeg-dir=/usr" \
+        "Kerberos:${_usrLib}/libkrb5support.so:--with-kerberos" \
+        "OpenSSL:${_usrLib}/libssl.so:--with-openssl=/usr --with-openssl-dir=/usr --with-imap-ssl=/usr" \
+        #"XML2:/opt/xml2/lib/libxml2.so:--with-libxml-dir=/opt/xml2 --with-xmlrpc --enable-soap" \
+        "XSLT:/opt/xslt/lib/libxslt.so:--with-xsl=/opt/xslt/" \
+        "cURL:/opt/curlssl/lib/libcurl.so:--with-curl=/opt/curlssl/" \
+        "IMAP:/opt/php_with_imap_client/lib/libc-client.a:--with-imap=/opt/php_with_imap_client/" \
+        "Expat:${_usrLib}/libexpat.so:--with-libexpat-dir=/usr" \
+        "Xpm:${_usrLib}/libXpm.so:--with-xpm-dir=/usr" \
+        "ZLib:${_usrLib}/libz.so:--enable-zip --with-zlib --with-zlib-dir=/usr" \
+        "mCrypt:/opt/libmcrypt/lib/libmcrypt.so:--with-mcrypt=/opt/libmcrypt/" \
+        "MySQL:${_usrLib}/libmysqlclient.so:--with-mysql --with-mysql-sock=/var/lib/mysql/mysql.sock --with-mysqli=/usr/bin/mysql_config" \
+        "pspell:${_usrLib}/libpspell.so:--with-pspell" \
+        "bZip2:${_usrLib}/libbz2.so:--with-bz2" \
+        "unixODBC:${_usrLib}/libodbc.so:--with-unixODBC=/usr" \
+        "mhash:/opt/mhash/lib/libmhash.so:--with-mhash=/opt/mhash/" );
+    local _headerList=( \
+        "OpenSSL:/usr/include/openssl/ssl.h" \
+        "Expat:/usr/include/expat.h" \
+        "Xpm:/usr/include/X11/xpm.h" \
+        "pspell:/usr/include/pspell/pspell.h" \
+        "bZip2:/usr/include/bzlib.h" \
+        "unixODBC:/usr/include/sql.h" );
+
+    if [[ ${controlPanel} == "cpanel" ]]; then
+        for _lib in "${_checkList[@]}"; do
+            _libName="${_lib%%:*}";
+            _lib="${_lib#*:}";
+            [[ $(\ls -U ${_lib%:*}* 2>/dev/null) ]] && {
+                if [[ ${_headerList[@]} =~ $_libName ]]; then {
+                    for _header in "${_headerList[@]}"; do
+                        [[ ${_header%%:*} == ${_libName} && -e "${_header##*:}" ]] && {
+                            _cfgLine="${_cfgLine} ${_lib#*:}";
+                            echo "$_libName headers found.";
+                        }
+                    done;
+                } else { 
+                    _cfgLine="${_cfgLine} ${_lib#*:}";
+                    echo "$_libName library found.";
+                } fi;
+            } 
+        done;
+    elif [[ ${controloPanel} == "plesk" ]]; then
+        echo "Using predefined configuration";
+    fi;
+    #Check if "native" is support arch type in GCC by testing for gcc 4.2+
+    echo "Checking GCC version"
+    if [[ ${_optimise} && $(gcc --version|awk '$3~/[0-9]+\.[0-9]+\.[0-9]+/{split($3,ver,".");verd=(ver[1]*10^8)+(ver[2]*10^4)+ver[3];print verd}') -ge 400020000 ]]; then
+        _optFlag="${_optFlag} -march=native";
+    fi;
+    # Auto-enable fastbuild based on load.
+    echo "Checking load for fastbuild"
+    if [[ $(awk -v cc=$(grep -c proc /proc/cpuinfo) '$1<(cc/2)&&$2<=(cc*2)' /proc/loadavg) ]]; then
+        _fastBuild="-j$(($(grep -c proc /proc/cpuinfo)*3/2))"
+    fi;
+}
+
+
+# Show configuration flags
+showCfg(){
+    echo;
+    if [[ ${RUSER} ]]; then
+        echo "Build by ${RUSER}";
+    fi;
+    if [[ ${_ticket} ]]; then
+        echo "Ticket: ${_ticket}";
+    fi;
+    if [[ ${_st} ]]; then
+        echo "Start time: $(date -d@${_st})";
+    fi;
+    if [[ ${_forceVersion} ]]; then
+        echo "Forced version";
+    elif [[ ${_autoVersion} == 1 ]]; then
+        echo "Version auto-detect enabled";
+    fi;
+    echo "Building PHP version $_phpVersion.";
+    echo "Installing to ${_phpPrefix}/php${__buildVer}.";
+    if [[ ${_nice} ]]; then
+        echo "Using ${_nice}";
+    fi;
+    if [[ ${_optimise} ]]; then
+        echo "With compiler optimisation ${_optFlag}";
+    fi;
+    if [[ ${controlPanel} ]]; then
+        echo "For control panel \"${controlPanel}\"";
+    fi;
+    if [[ $_fastBuild ]]; then
+        echo "Fastbuild enabled. Will build with ${_fastBuild#\-j} jobs"
+    fi;
+    if [[ ${_fastBuildForce} ]]; then
+        echo "Fastbuild forced by option. Not using  memory saving CFLAGS";
+    fi;
+    if [[ ${__buildVer} == "52" && ${_52backports} == 1 ]]; then
+        echo "Using PHP 5.2 Backports";
+    fi;
+    if [[ ${controlPanel} == "cpanel" ]]; then      
+        echo "cPanel PHP5 handler: ${_cpHandler}";
+    fi;
+    if [[ ${controlPanel} == "cpanel" ]]; then
+        if [[ $_useFastCGI ]]; then
+            echo "Using FastCGI configuration.";
+        elif [[ $_useSuPHP ]]; then
+            echo "Using SuPHP configuration.";
+        fi;
+    fi;
+    if [[ ${_stripSymbols} -eq 1 ]]; then echo "Will strip extraneous syymbols"; fi;
+    if [[ ${_installIoncube} ]]; then echo "Will install IonCube Loader"; fi;
+    if [[ ${_installZendGuard} ]]; then echo "Will install ZendGuard/Optimizer"; fi;
+    if [[ ${_installSourceGuardian} ]]; then echo "Will install SourceGuardian"; fi;
+
+    echo;
+    echo "Will use these primary configure flags:"; 
+    echo $_cfgLine $_extraCfgFlags; 
+    if [[ $_doFPM ]]; then
+        echo;
+        echo "Will use these for FPM build:";
+        echo $_cfgLine_FPM $_extraCfgFlags;
+    fi;
+    echo;
+}
+
+
+# Show experimental warning.
+showWarning(){
+cat <<- THEEND
+
+	 WARNING!  WARNING!  WARNING!  WARNING!  WARNING!
+	 ------------------------------------------------
+
+	 Do to the wide differences of installed packages
+	 on various VZ and Dedicated servers, this script
+	 may fail. If this script fails and you're unsure
+	 of  how  to  sort  and  repair  compilation  and 
+	 linker issues,  get help from somebody that does
+	 right away!  Report the specifics  of any issues
+	 to the script maintainer,  as well as the server
+	 IP or hostname so  that the  environment of that
+	 server may be inspected. 
+	
+	 Consider  this script  perpetually experimental.
+
+
+THEEND
+echo "Script will continue in 15 seconds...";
+echo "Or, press any key to continue now...";
+read -st15 -n1;
+}
+
+
+# Configure server to use php53 handler via SuPHP - 
+mkSuPHPCfg(){
+cat << EOF > /usr/local/apache/conf/opt-php${_buildVer}.conf
+AddType application/x-httpd-php${_buildVer} .php${_buildVer}
+<IfModule mod_suphp.c>
+    <Directory />
+        suPHP_AddHandler application/x-httpd-php${_buildVer}
+    </Directory>
+</IfModule>
+EOF
+
+    # SuPHP config must use php cgi binary; php cli binary will not work.
+    if [[ ! $(grep "^application/x-httpd-php${_buildVer}=\"php:${_phpPrefix}/bin/php-cgi\"" /opt/suphp/etc/suphp.conf) ]]; then
+        echo "Adding suPHP handler configuration...";
+        sed -i "/\[handlers\]/aapplication/x-httpd-php${_buildVer}=\"php:${_phpPrefix}/bin/php-cgi\"" /opt/suphp/etc/suphp.conf;
+    else
+        echo "suPHP handler configuration already exists. Skipping.";
+    fi;
+    if [[ ! $(grep "^Include \"/usr/local/apache/conf/opt-php${_buildVer}\.conf\"" /usr/local/apache/conf/includes/pre_virtualhost_global.conf) ]]; then
+        echo "Adding Apache handler configuration...";
+        echo -e "\nInclude \"/usr/local/apache/conf/opt-php${_buildVer}.conf\"" >> /usr/local/apache/conf/includes/pre_virtualhost_global.conf;
+    else
+        echo "Apache handler configuration already exists. Skipping.";
+    fi;
+
+    # Needed to prevent being prompted to download php script - loads new httpd.conf
+    /scripts/rebuildhttpdconf || showFail "Failed to rebuild httpd.conf";
+    if [[ $(grep graceful /etc/init.d/httpd) ]]; then
+       service httpd graceful || showFail "Failed to reload Apache configuration";
+    else
+       service httpd restart || showFail "Failed to restart Apache";
+    fi;
+}
+
+# Configure server to use php53 handler via FastCGI wrapper script
+mkFastCGICfg(){
+cat << EOF > /usr/local/cpanel/cgi-sys/php${_buildVer}
+#!/bin/bash
+dir=\$(/usr/bin/dirname \$PATH_TRANSLATED)
+user=\$(echo \$dir | cut -d '/' -f 3)
+
+config="\${dir}/php.ini"
+
+if [ -f \$config ] ; then
+    /opt/php${_buildVer}/bin/php-cgi -c \$config
+elif [ -n \$user ] && [ -f /home/\$user/php.ini ]; then
+    /opt/php${_buildVer}/bin/php-cgi -c /home/\$user/php.ini
+else
+    /opt/php${_buildVer}/bin/php-cgi
+fi
+EOF
+    
+    chown root.wheel /usr/local/cpanel/cgi-sys/php${_buildVer};
+    chmod 0755 /usr/local/cpanel/cgi-sys/php${_buildVer};
+
+    # Needed to prevent a config collision under certain circumstances where conf changed from suphp to fastcgi
+    /scripts/rebuildhttpdconf || showFail "Failed to rebuild httpd.conf";
+    if [[ $(grep graceful /etc/init.d/httpd) ]]; then
+        service httpd graceful || showFail "Failed to reload Apache configuration";
+    else
+        service httpd restart || showFail "Failed to restart Apache";
+    fi;
+}
+
+# Parse command line options
+getOpts(){
+    while true; do
+        case "$1" in
+            --debug) set -x;_debug=1;shift;;
+            -d|--dryrun|--dry-run) _dryrun=1; shift;;
+            -S|--skipwarn|--skip-warn) _skipwarn=1; shift;;
+            -s|--suphp) _useSuPHP=1; unset _useFastCGI; shift;;
+            -f|--fcgi|--fastcgi|--fast-cgi) _useFastCGI=1; unset _useSuPHP; shift;;
+            -c|--config|--configure) _switchHandler="$2"; shift 2;;
+            -C|--configflags|--config-flags) _extraCfgFlags="$2"; shift 2;;
+            -F|--fastbuild|--fast-build) _fastBuild="-j$(($(grep -c proc /proc/cpuinfo)*3/2))";_fastBuildForce=1; shift;;
+            -N|--nice) _nice="nice -n$2"; shift 2;;
+            -p|--use-fpm|--usefpm|--fpm) _doFPM=1; shift;;
+            -4|--php54|--php5.4) _buildVer="54"; shift;;
+            -3|--php53|--php5.3) _buildVer="53"; shift;; #default
+            -2|--php52|--php5.2) _buildVer="52"; shift;;
+            -5|--php55|--php5.5) _buildVer="55"; shift;;
+            -6|--php56|--php5.6) _buildVer="56"; shift;;
+            -NG|--phpng|--php-ng) _buildVer="70"; shift;;
+            -70|--php70|--php7.0)  _buildVer="70"; shift;;
+            -v|--forceversion|--force-version) _forceVersion="${2}"; shift 2;;
+            -a|--auto|--auto-version|--autoversion) _autoVersion=1; shift;;
+            -O|--optimise|--optimize) _optimise=1;_optFlag="-O3";shift;;
+            -h|--help) displayHelp;;
+            -H|--handler|--showhandler|--show-handler) _showHandler=1; shift;;
+            -t|--ticket) _ticket="$2"; shift 2;;
+            -u|--uninstall) _uninstall=1; shift;;
+            --52backports|--52-backports) _52backports=1; shift;;
+            --strip-symbols|--stripsymbols|--strip) _stripSymbols=1; shift;;
+            --no-strip-symbols|--nostripsymbols|--nostrip) _stripSymbols=0; shift;;
+            --no-clean|--noclean) _noclean=1;shift;;
+            --squirrel) _supersecretsquirrel=1;shift;;
+            --no-nice|--nonice) unset _nice; shift;;
+            --force) _force=1; shift;;
+            --) shift; break;;
+            *) break;;
+        esac;
+    done;
+    if [[ $@ ]]; then
+        echo "Unknown option: $1";
+        echo;
+        exit;
+    fi;
+}
+
+
+# Uninstall the stuff we installed
+uninstall(){
+    # Get confirmation
+    if [[ -d ${_phpPrefix} ]]; then
+        echo -n "Are you sure you wish to remove PHP${_buildVer}? [yes/NO]: ";
+    else
+        echo -n "PHP${_buildVer} not detected. Run uninstaller anyway? [yes/NO]: ";
+    fi;
+
+    read _confirmRm;
+    [[ ! $_confirmRm == "yes" && ! $_confirmRm == "y" ]] && exit;
+    echo "Uninstalling PHP...";
+
+    # Remove binaries
+    echo "Removing ${_phpPrefix}...";
+    [[ -d ${_phpPrefix} ]] && rm -rf ${_phpPrefix};
+
+    # Remove SuPHP and FastCGI configs
+    echo "Removing configuration...";
+    if [[ ${controlPanel} == "cpanel" ]]; then
+        rmSuPHPCfg;
+        rmFastCGICfg;
+    fi;
+
+    # Rebuild httpd conf and pull into running config
+    if [[ ${controlPanel} == "cpanel" ]]; then   
+        echo "Rebuliding httpd.conf...";
+        /scripts/rebuildhttpdconf >/dev/null || showFail "Failed to rebuild httpd.conf";
+    fi;
+    echo "Loading new configuration...";
+    if [[ $(grep graceful /etc/init.d/httpd) ]]; then
+        service httpd graceful || showFail "Failed to reload Apache configuration";
+    else
+        service httpd restart || showFail "Failed to restart Apache";
+    fi;
+    echo "DONE";
+    echo;
+    exit;
+}
+
+
+# Remove SuPHP configs
+rmSuPHPCfg(){
+    # Remove SuPHP configs
+    [[ -e /usr/local/apache/conf/opt-php${_buildVer}.conf ]] && rm -f /usr/local/apache/conf/opt-php${_buildVer}.conf;
+    [[ -e /opt/suphp/etc/suphp.conf ]] && sed -i "s|application/x-httpd-php${_buildVer}=\"php:${_phpPrefix}/bin/php-cgi\"||" /opt/suphp/etc/suphp.conf;
+    [[ -e /usr/local/apache/conf/includes/pre_main_global.conf ]] && sed -i "s|Include \"/usr/local/apache/conf/opt-php${_buildVer}.conf\"||" /usr/local/apache/conf/includes/pre_main_global.conf;
+    [[ -e /usr/local/apache/conf/includes/pre_virtualhost_global.conf ]] && sed -i "s|Include \"/usr/local/apache/conf/opt-php${_buildVer}.conf\"||" /usr/local/apache/conf/includes/pre_virtualhost_global.conf;
+}
+
+
+# Remove FastCGI configs
+rmFastCGICfg(){
+    [[ -e /usr/local/cpanel/cgi-sys/php${_buildVer} ]] && rm -f /usr/local/cpanel/cgi-sys/php${_buildVer};
+}    
+
+
+# Check for VPS/Dedi, cPanel, and proper evocation
+checkEnv(){
+    local regex='(hostgator|websitewelcome|minidedicated)\.(com|in)(\.br|\.tr)?';
+    if [[ ${HOSTNAME} =~ $regex ]]; then
+        echo "This installer is for dedicated servers/VPS's ONLY.";
+    	echo;
+        exit 1;
+    fi;
+
+    if [[ -f /usr/local/cpanel/version ]]; then 
+        controlPanel="cpanel";
+        #echo "cPanel is not installed on this server. Please check the environment.";
+    	#echo;
+        #exit 1;
+    elif [[ -f /usr/local/psa/version ]]; then
+        if [[ ! $(awk -F\. '$1==11&&$2>=5' /usr/local/psa/version) ]]; then
+            echo;
+            echo "This script requires Plesk 11.5. Consider offering a cPanel migration to the client instead.";
+            echo;
+            exit 1;
+        else
+            controlPanel="plesk";
+        fi;
+    else
+        controlPanel="none";
+    fi;
+
+    if [[ ! -t 0 ]]; then
+    	echo "This script cannot be piped. You must run it locally.";
+	    echo "    /root/bin/install-opt-php";
+    	echo;
+    	exit 1;
+    fi;
+}
+
+
+#Show help and usage
+displayHelp(){
+cat << WHATEVER
+
+This script attempts to detect the available build environment and contructs a viable side-by-side PHP installation
+configured for the current environment. This scripts builds PHP 5.3 by default with a SuPHP configuration.
+
+USAGE:
+    /root/bin/install-opt-php [OPTIONS...]
+
+OPTIONS:
+    -2, --php5.2
+	Build PHP 5.2
+
+    -3, --php5.3
+        Build PHP 5.3. This is enabled by default.
+
+    -4, --php5.4
+        Build PHP 5.4
+
+    -5, --php5.5
+        Build PHP 5.5
+
+    -6, --php5.6
+        Build PHP 5.6 
+
+    -70, --php7.0
+        Build PHP 7.0
+
+    -v, --force-version <version>
+        Force a specified version. Must still use matching build version flag.
+
+    -a, --auto
+        Automatically detect latest minor version of specified major version type. This is enabled by default..
+
+    -c, --config, --configure [ARG]
+        Configure PHP handler
+        
+        ARGs:
+        suphp   - Switch handler to SuPHP
+        fcgi - Switch handler to FastCGI
+
+    -C, --config-flags "<flags>"
+        Specify additional flags to configure with. Take one argument, encapsulate in quotes for multiple additional flags.
+
+    -d, --dry-run
+        Do not download, configure, make, install, or configure SuPHP. This is a safe way to see how PHP would be configured.
+
+    -f, --fast-cgi
+        Configure for FastCGI use.
+
+    -F, --fast-build
+        Enable asynchronous concurrent make jobs, at 1.5 timee the amount of available CPU cores. This is enabled by default.
+
+    -h, --help
+        This help and usage screen.
+
+    -H, --show-handler
+        Display the current handler.
+    
+    -N, --nice [ARG]
+        Set build niceness to ARG. Default 18.
+
+    -O, --optimize
+        Enable higher -O3 ompiler optimisations. Uses more memory during compile. Uses -O2 by default.
+
+    -p, --use-fpm
+        Use FPM. WARNING: This option is not compatible with SuPHP.
+
+    -s, --suphp
+        Configure for SuPHP use. This is enabled by default.
+
+    -S, --skip-warn
+        Skip the interactive warning message. Using this option means you're aware of the nature of this script.
+
+    -t, --ticket [ARG]
+        Add ticket ID to build log and root motd to avoid prompt. Otherwise, will prompt for ticket ID.
+
+    -u, --uninstall
+        Attempt to uninstall a side-by-side installation of PHP made by this script.
+
+EXAMPLES:
+    /root/bin/install-opt-php
+        Compile and install PHP along-side default installation using default options.
+
+    /root/bin/install-opt-php --dry-run --skip-warn --php5.4
+        To see what the script detected and how it will configure PHP, without an interactive warning, for PHP 5.4.
+
+
+WHATEVER
+exit;
+}
+
+
+# Show script title.
+title(){
+    echo;
+    echo "Side-by-side PHP installer : ${SCRIPT_VERSION} : dbarker@hostgator.com";
+    echo "Report bugs at https://jira.endurance.com/projects/HL"
+    echo;
+}
+
+
+# Simple arch detection
+archDetect(){
+    if [[ ${HOSTTYPE} == "x86_64" ]]; then
+        _cfgLine="${_cfgLine} --with-libdir=lib64";
+        _usrLib="/usr/lib64";
+    else
+        _usrLib="/usr/lib";
+    fi;
+}
+
+# Increase FD_SETSIZE
+increaseFD_SETSIZE() {
+    awk '$1=="#define"&&$2=="__FD_SETSIZE"&&$3~/[0-9]+/&&$NF<16384{print FILENAME}' /usr/include/linux/posix_types.h /usr/include/bits/typesizes.h|while read fname;do
+        echo "Setting FD_SETSIZE to 16384 in ${fname}";
+        timestamp=$(date +%s);
+        mv -v ${fname} ${fname}.${timestamp} && awk '$1=="#define"&&$2=="__FD_SETSIZE"&&$3~/[0-9]+/&&$NF<16384{t=1}{if(t)printf("%s %s\t%i\n",$1,$2,16384);else{print};t=0}' ${fname}.${timestamp} > ${fname};
+    done;
+}
+
+#Add FPM configure flags to beginning.
+doFPM(){
+    _cfgLine_FPM="--enable-fpm --disable-cli --with-fpm-bin=${_phpVersion}/bin --with-fpm-log=/var/log/php-fpm.log --with-fpm-pid=/var/run/php-fpm.pid ${_cfgLine}";
+    if [[ $_buildVer == "52" ]]; then
+        _cfgLine_FPM="--enable-fastcgi ${_cfgLine_FPM}";
+    fi;
+}
+
+# Get source, configure and build.
+install_all(){
+	echo "Compiling...";
+	cd /usr/src/;
+	if [[ -f /usr/src/php-${_phpVersion}.tar.gz ]]; then 
+        rm -f /usr/src/php-${_phpVersion}.tar.gz || showFail "Failed to remove prior sources";
+    fi;
+	${_nice} wget $_phpDownload || showFail "Failed to download $_phpDownload";
+
+	[[ -f /usr/src/php-${_phpVersion}.tar.gz ]] && tar --no-same-owner -xzf php-${_phpVersion}.tar.gz || showFail "Failed to extract";
+    cd php-${_phpVersion} || showFail "Failed to extract";
+    if [[ ${_buildVer} == "52" ]]; then
+        # PHP 5.2 FPM patch for Nielson/Quirck
+        if [[ ${_supersecretsquirrel} -eq 1 ]]; then
+            echo "Super Secret Squirrel Mode - ENGAGE!!!!11!!one11!!";
+            ${_nice} wget http://php-fpm.org/downloads/php-5.2.17-fpm-0.5.14.diff.gz;
+            ${_nice} gunzip php-5.2.17-fpm-0.5.14.diff.gz;
+            ${_nice} patch -p1 -i php-5.2.17-fpm-0.5.14.diff;
+        fi;
+
+        # Patch to use libxml 2.9
+        if [[ $(\ls /opt/xml2/lib/libxml2.so.2.9* 2>/dev/null) ]]; then
+            echo "Installing libxml 2.9 patch";
+            ${_nice} patch -p1 -i /root/bin/install-opt-php-files/php52-libxml.patch;
+        fi;
+
+        # Backports for PHP 5.2
+        if [[ ${_52backports} == 1 ]]; then
+            echo "Installing PHP 5.2 Backports";
+            ${_nice} patch -p1 -i /root/bin/install-opt-php-files/php52-backports-security-20130717.patch
+        fi;
+
+        #[[ -e /opt/xml2/lib/libxml2.so.2.9.0 ]] && ln -sf /opt/xml2/lib/libxml2.so.2.9.0 /usr/lib64/libxml2.so.2;
+    elif [[ ( ${_buildVer} == "53" || ${_buildVer} == "70" ) && -d /usr/src/php-${_phpVersion} ]]; then
+        echo "SQLite patch";
+        makePatch /usr/src/sqlite.patch
+        patch -Np1 -d /usr/src/php-${_phpVersion} < /usr/src/sqlite.patch
+    elif [[ ${_buildVer} == "54" && -d /usr/src/php-${_phpVersion} ]]; then
+        echo "Fixing zend_vm_opcodes.h";
+        sed -ie '$a\' /usr/src/php-5.4.*/Zend/zend_vm_opcodes.h
+    elif [[ ${_buildVer} == "56" && ${HOSTTYPE} == "x86_64" && -d /usr/src/php-${_phpVersion} ]]; then
+        ${_nice} patch -p1 -i /root/bin/install-opt-php-files/zipint56-dblol.patch
+    fi;
+    if [[ ! ${_fastBuildForce} ]]; then 
+        export CFLAGS="${CFLAGS} --param ggc-min-expand=1 --param ggc-min-heapsize=4096";
+    fi;
+    if [[ ${_optimise} ]]; then export CFLAGS="${CFLAGS} ${_optFlag}";fi;
+    export CXXFLAGS="${CFLAGS}";
+
+	if [[ -d /usr/src/php-${_phpVersion} ]]; then
+        if [[ ! -f ./configure && -f ./buildconf ]]; then
+            ${_nice} ./buildconf || showFail "Failed to build configure script";
+        fi;
+        ${_nice} ./configure $_cfgLine $_extraCfgFlags || showFail "Failed to configure";
+		${_nice} make ${_fastBuild} && ${_nice} make install || showFail "Failed to build";
+        env > ${_phpPrefix}/.build.${_st}.env
+        echo "cmdline=\"$(cat /proc/$$/cmdline|tr "\0" " ")\"" > ${_phpPrefix}/.build.${_st}
+        echo "configure=\"${_cfgLine} ${_extraCfgFlags}\"" >> ${_phpPrefix}/.build.${_st}
+
+    else 
+        showFail "Cannot find /usr/src/php-${_phpVersion} folder";
+    fi;
+
+    if [[ $_doFPM ]]; then
+        echo "Building FPM binary";
+        if [[ ! -f ./configure && -f ./buildconf ]]; then
+            ${_nice} ./buildconf || showFail "Failed to build configure script";
+        fi;
+        ${_nice} ./configure $_cfgLine_FPM $_extraCfgFlags || showFail "Failed to configure";
+        ${_nice} make ${_fastBuild} && ${_nice} make install || showFail "Failed to build";
+    fi;
+
+    patch -p0 -d ${_phpPrefix}/bin -f phpize < /root/bin/install-opt-php-files/phpize-dblol.patch
+
+    if [[ ! -f ${_phpPrefix}/lib/php.ini ]]; then
+        if [[ ${controlPanel} == "cpanel" ]]; then
+            echo "Downloading phpini.";
+            ${_nice} cp /root/bin/install-opt-php-files/php${_buildVer}.ini ${_phpPrefix}/lib/php.ini || showFail "Failed to copy php.ini";
+            chown -v root. ${_phpPrefix}/lib/php.ini;
+            chmod -v 0644 ${_phpPrefix}/lib/php.ini;
+        elif [[ ${controlPane} == "plesk" && -e ${_phpPrefix}/php.ini-production ]]; then
+            cp -pv ${_phpPrefix}/php.ini-production ${_phpPrefix}/lib/php.ini
+        fi;
+    else
+        echo "${_phpPrefix}/lib/php.ini already exists. Leaving alone."
+    fi;
+
+    # Stripping un-needed symbols
+    if [[ ${_stripSymbols} -eq 1 ]]; then
+        echo "Stripping un-needed symbols from libraries and binaries.";
+        strip --strip-debug  ${_phpPrefix}/lib/php/extensions/no-debug-non-zts-*/*.{so,a};
+        strip --strip-unneeded $(\ls ${_phpPrefix}/{,s}bin/php{,-cli,-cgi,-fpm} 2>/dev/null);
+    fi;
+
+    # Prelinking binaries
+    if [[ ${_prelink} -eq 1 && -x /usr/sbin/prelink ]]; then
+        echo "Prelinking binaries.";
+        if [[ ! -e /etc/prelink.conf.d/alt-php.conf ]]; then
+            if [[ ! -d /etc/prelink.conf.d ]]; then
+                mkdir /etc/prelink.conf.d;
+            fi;
+            echo -e '-l /opt/*/lib\n-l /opt/php*/bin' > /etc/prelink.conf.d/alt-php.conf;
+        fi
+        /usr/sbin/prelink ${_phpPrefix}/lib/php/extensions/no-debug-non-zts-*/*.so 2>/dev/null;
+        /usr/sbin/prelink $(\ls ${_phpPrefix}/{,s}bin/php{,-cli,-cgi,-fpm} 2>/dev/null)
+    fi;
+
+    # Fix rpath on binaries to ensure /opt libs get loaded first
+    if [[ ${_chrpath} ]]; then
+        # Install chrpath if its not installed; which its probably not
+        if ! which chrpath &>/dev/null ; then
+            yum -y install chrpath
+        fi
+        # Make sure chrpath is available and iterate over all available php binaries        
+        if which chrpath &>/dev/null ; then
+            for thebin in ${_phpPrefix}/{,s}bin/php{,-cgi,-cli,-fpm} ; do
+                if [[ -f ${thebin} ]] ; then
+                    oldrpath=$(chrpath --list ${thebin} | awk -F= '{print$NF}')
+                    unset opt
+                    unset sys
+                    unset newrpath
+                    # Break extracted rpath into bits and rearrange with /opt in front
+                    for p in $(IFS=":" ; echo ${oldrpath[@]//\/\//\/} | tr " " "\n" | sort -r ; unset IFS) ; do
+                        if [[ ! -z ${p} ]] ; then
+                            if [[ ${p} =~ ^/opt ]] ; then
+                                if [[ -z ${opt} ]] ; then
+                                    opt=${p}
+                                else
+                                    opt="${opt}:${p}"
+                                fi
+                            else
+                                if [[ -z ${sys} ]] ; then
+                                    sys=${p}
+                                else
+                                    sys="${sys}:${p}"
+                                fi
+                            fi
+                        fi
+                    done
+                    # Assemble new rpath line without extraneous colos
+                    if [[ -n ${opt} && -n ${sys} ]] ; then
+                        newrpath="${opt}:${sys}"
+                    elif [[ -n ${sys} ]] ; then
+                        newrpath=${sys}
+                    elif [[ -n ${opt} ]] ; then
+                        newrpath=${opt}
+                    fi
+                    # Do eet
+                    chrpath --replace "${newrpath}" ${thebin}
+                fi
+            done
+        else
+            # Not using showFail here because its OK to continue if this fails
+            echo "There was a problem installing chrpath"
+        fi
+    fi
+
+
+
+
+}
+
+# Do this on failures
+showFail(){
+    echo;echo;
+    if [[ $1 ]]; then 
+        echo "$1";
+        echo;
+    fi;
+    echo "Installation FAILED.";
+    echo;
+    echo "If the build failed due to lack of resources, please make more resources avaialble and try";
+    echo "again. Please see wiki for common problems and resolutions. Otherwise, create bug report here:";
+    echo "  https://jira.endurance.com/projects/HL"
+    echo "Include description of issue and the following information:";
+    echo;
+    echo "    Log: ${_logFile}";
+    echo " Server: ${HOSTNAME} - $(hostname -i)";
+    echo "   Date: $(date)";
+    echo " Reason: ${1}";
+    echo "     RT: $(($(date +%s)-_st))";
+    echo "      H: $(free -ob|awk 'NR==2{print $4}') $(cat /proc/loadavg)";
+    echo;
+    echo "Contact ${MAINTAINER_EMAIL} if you have questions.";
+    echo;
+    set +x;
+    exit 1;
+}
+
+
+# Test installation success and give some infos
+postFlight(){
+    echo "======================================================================================"
+	if [[ -f ${_phpPrefix}/bin/php && -f ${_phpPrefix}/lib/php.ini && "$(${_phpPrefix}/bin/php -c ${_phpPrefix}/lib/php.ini -r "echo 'WIN';")" == "WIN" ]]; then 
+		echo "Successfully installed PHP v${_phpVersion}";
+		echo "Binary is located at ${_phpPrefix}/bin/php";
+        echo "Configuration is located at ${_phpPrefix}/lib/php.ini";
+        echo;
+        echo "-- PHP CLI Binary --";
+        ${_phpPrefix}/bin/php -v;
+		echo;
+        if [[ $_doFPM ]]; then         
+            echo "-- PHP FPM Binary --";
+            ${_phpPrefix}/sbin/php-fpm -v;
+            echo;
+        fi;
+        if [[ ${controlPanel} == "cpanel" ]]; then
+            showHandler;
+        elif [[ ${controlPanel} == "plesk" ]]; then
+
+cat << THINGS
+There are two methods of enabling it. One being via Service Plans, other per domain.
+
+1. Service Plans: Select a desired Service Plan, navigate to the "Hosting Parameters" tab, and select "5.4.35" for the "PHP version" drop-down menu.
+2. Per domain: Open a related control panel, "Websites & Domains" tab will have a list of configured domains and by each one there's a "Hosting Settings" link which will need to be selected. Once selected, you will notice a "PHP support" dropdown menu with two options. You will want to leave the first "Run PHP as" option set to "CGI application", and select 5.4.35 for the "PHP version" drop-down.
+THINGS
+
+        fi;
+        echo;
+        echo "Done".
+
+
+        if [[ ${_noclean} ]]; then
+            echo "Leaving sources and build folder.";
+        else
+            echo "Removing sources and build folder.";
+            rm -rf /usr/src/php-${_phpVersion}.tar.gz /usr/src/php-${_phpVersion} ;
+        fi;
+        if [[ ${RUSER} ]]; then _ruser="by ${RUSER}";fi;
+        if [[ ${_ticket} ]]; then _tticket="for ticket ${_ticket}"; fi;
+        echo "Side-by-side PHP v${_phpVersion} installed on $(date +"%d%b%y@%H:%M") ${_ruser} ${_tticket}" >> /root/.motd;
+    else
+        [[ ! -f ${_phpPrefix}/bin/php ]] && showFail "Failed to find ${_phpPrefix}/bin/php";
+        [[ ! -f ${_phpPrefix}/lib/php.ini ]] && showFail "Failed to find ${_phpPrefix}/lib/php.ini";
+        [[ ! "$(${_phpPrefix}/bin/php -c ${_phpPrefix}/lib/php.ini -r "echo 'WIN';")" == "WIN" ]] && showFail "Failed to execute PHP";
+    fi;
+    if [[ ${_st} ]]; then
+        echo "Completed in $(date -ud@$(($(date +%s)-_st)) +'%Hh %Mm %Ss')";
+    fi;
+    echo;
+}
+
+# Show current handler configuration.
+showHandler(){
+    #SuPHP
+    if [[ -e /usr/local/apache/conf/opt-php${_buildVer}.conf ]]; then
+        echo "PHP${_buildVer} is using the SuPHP handler.";
+        echo "Add the following line to .htaccess' of sites the customer wishes to run with this version of PHP"
+        echo;
+        echo "AddType application/x-httpd-php${_buildVer} .php";
+    elif [[ -e /usr/local/cpanel/cgi-sys/php${_buildVer} ]]; then
+        echo "PHP${_buildVer} is using the FastCGI wrapper handler.";
+        echo "Add the following line to .htaccess' of sites the customer wishes to run with this version of PHP"
+        echo;
+        echo "Action application/x-httpd-php${_buildVer} /cgi-sys/php${_buildVer}";
+        echo "AddHandler application/x-httpd-php${_buildVer} .php";
+    else 
+        echo "Cannot determine handler for PHP${_buildVer}.";
+    fi;
+}
+
+# Switch PHP handler
+switchHandler(){
+    echo;
+    if [[ $_switchHandler == "fcgi" ]]; then
+        echo "Removing SuPHP handler..."
+        rmSuPHPCfg;
+        echo "Adding FastCGI handler...";
+        mkFastCGICfg;
+    elif [[ $_switchHandler == "suphp" ]]; then
+        echo "Removing FastCGI handler...";
+        rmFastCGICfg;
+        echo "Adding SuPHP handler...";
+        mkSuPHPCfg;
+    else
+        showFail "Specified handler is unknown. See --help.";
+    fi;
+    echo "Rebuilding httpd.conf...";
+    /scripts/rebuildhttpdconf >/dev/null || showFail "Failed to rebuild httpd.conf";
+    echo "Reloading configuration...";
+    if [[ $(grep graceful /etc/init.d/httpd) ]]; then
+        service httpd graceful || showFail "Failed to reload Apache configuration";
+    else
+        service httpd restart || showFail "Failed to restart Apache";
+    fi;
+    echo "PHP handler changed.";
+    showHandler;
+    echo;
+    exit 0;
+}
+
+install_ioncube(){
+    if [[ ${HOSTTYPE} == x86_64 ]]; then
+        _arch="x86-64";
+    else
+        _arch="x86";
+    fi;
+    if [[ ${_buildVer} == 52 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20060613
+        _loader=ioncube_loader_lin_5.2.so
+    elif [[ ${_buildVer} == 53 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20090626
+        _loader=ioncube_loader_lin_5.3.so
+    elif [[ ${_buildVer} == 54 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20100525
+        _loader=ioncube_loader_lin_5.4.so
+    elif [[ ${_buildVer} == 55 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20121212
+        _loader=ioncube_loader_lin_5.5.so
+    elif [[ ${_buildVer} == 56 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20131226
+        _loader=ioncube_loader_lin_5.6.so
+#    elif [[ ${_buildVer} == 70 ]]; then
+#        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20141001
+#        _loader=ioncube_loader_lin_7.0.so
+    else
+        echo "No suitable version. Not installing IonCube.";
+        return 0;
+    fi;
+    mkdir -pv ${_extdir};
+    echo "Downloading and extracting IonCube Loader...";
+    wget -O- http://repo.gatorsec.net/install-opt-php/ioncube_loaders_lin_${_arch}.tar.gz|tar -C ${_extdir} -xz ioncube/${_loader} --strip-components=1 --no-same-owner
+    if [[ -e ${_extdir}/${_loader} ]]; then
+        echo "Enabling IonCube Loader in ${_phpPrefix}/lib/php.ini...";
+        sed -ri "/^[\;]?zend_extension=[\" ].*ioncube_loader_lin_.*.so[\" ]/d;/\[Zend\]/azend_extension=\"${_extdir}/${_loader}\"" ${_phpPrefix}/lib/php.ini
+        echo "Testing...";
+        if [[ $(${_phpPrefix}/bin/php -c ${_phpPrefix}/lib/php.ini -m|grep -i ioncube) ]]; then
+            echo "Success";
+        else
+            echo "Failed to install IonCube Loader.";
+        fi;
+    else
+        echo "Failed to download or extract IonCube Loader.";
+    fi;
+    echo "Done";
+}
+
+install_zendguard(){
+    if [[ ${HOSTTYPE} == x86_64 ]]; then
+        _arch="x86_64";
+    else
+        _arch="i386";
+    fi;
+    if [[ ${_buildVer} == 52 ]]; then
+        _fname=ZendOptimizer-3.3.9-linux-glibc23-${_arch}.tar.gz
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20060613
+        _zname=ZendOptimizer.so
+        _inpath=ZendOptimizer-3.3.9-linux-glibc23-${_arch}/data/5_2_x_comp/${_zname}
+    elif [[ ${_buildVer} == 53 ]]; then
+        _fname=ZendGuardLoader-php-5.3-linux-glibc23-${_arch}.tar.gz
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20090626
+        _zname=ZendGuardLoader.so
+        _inpath=ZendGuardLoader-php-5.3-linux-glibc23-${_arch}/php-5.3.x/${_zname}
+    elif [[ ${_buildVer} == 54 ]]; then
+        _fname=ZendGuardLoader-70429-PHP-5.4-linux-glibc23-${_arch}.tar.gz
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20100525
+        _zname=ZendGuardLoader.so
+        _inpath=ZendGuardLoader-70429-PHP-5.4-linux-glibc23-${_arch}/php-5.4.x/${_zname}
+    elif [[ ${_buildVer} == 55 ]]; then
+        _fname=zend-loader-php5.5-linux-${_arch}.tar.gz
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20121212
+        _zname=ZendGuardLoader.so
+        _inpath=zend-loader-php5.5-linux-${_arch}/${_zname}
+    elif [[ ${_buildVer} == 56 ]]; then
+        _fname=zend-loader-php5.6-linux-${_arch}.tar.gz
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20131226
+        _zname=ZendGuardLoader.so
+        _inpath=zend-loader-php5.6-linux-${_arch}/${_zname}
+    elif [[ ${_buildVer} == 70 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20141001
+        echo "ZendGuard not compatible with PHP 7.0. Skipping..."
+        return 0;
+    else
+        echo "No suitable version. Not installing ZendGuard/Optimzer.";
+        return 0;
+    fi;
+    mkdir -pv ${_extdir};
+    echo "Downloading and extracting ZendGuard/Optimizer...";
+    wget -O- http://repo.gatorsec.net/install-opt-php/${_fname}|tar -C /usr/src -xz ${_inpath} --no-same-owner && mv /usr/src/${_inpath} ${_extdir};
+    if [[ -e ${_extdir}/${_zname} ]]; then
+        echo "Enabling ZendGuard/Optimizer in ${_phpPrefix}/lib/php.ini...";
+
+        sed -ri "/^[\;]?zend_extension=[\" ].*Zend(Optimizer|GuardLoader).so[\" ]/d;/\[Zend\]/azend_extension=\"${_extdir}/${_zname}\"" ${_phpPrefix}/lib/php.ini
+        echo "Testing...";
+        if [[ $(${_phpPrefix}/bin/php -c ${_phpPrefix}/lib/php.ini -m|grep -E 'Zend (Optimizer|Guard)') ]]; then
+            echo "Success";
+        else
+            echo "Failed to install Zend Guard/Optimizer.";
+        fi;
+    else
+        echo "Failed to download or extract Zend Guard/Optimizer.";
+    fi;
+}
+
+install_sourceguardian(){
+    if [[ ${HOSTTYPE} == x86_64 ]]; then
+        _arch="x86_64";
+    else
+        _arch="i386";
+    fi;
+    if [[ ${_buildVer} == 52 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20060613
+        _sname="ixed.5.2.lin";
+    elif [[ ${_buildVer} == 53 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20090626
+        _sname="ixed.5.3.lin";
+    elif [[ ${_buildVer} == 54 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20100525
+        _sname="ixed.5.4.lin";
+    elif [[ ${_buildVer} == 55 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20121212
+        _sname="ixed.5.5.lin";
+    elif [[ ${_buildVer} == 56 ]]; then
+        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20131226
+        _sname="ixed.5.6.lin";
+#    elif [[ ${_buildVer} == 70 ]]; then
+#        _extdir=${_phpPrefix}/lib/php/extensions/no-debug-non-zts-20141001
+#        _sname="ixed.7.0.lin";
+    else
+        echo "No suitable version. Not installing SourceGuardian Loader.";
+        return 0;
+    fi;
+    mkdir -pv ${_extdir};
+    echo "Downloading and extracting SourceGuardian Loader...";
+    wget -O- http://repo.gatorsec.net/install-opt-php/loaders.linux-${_arch}.tar.gz|tar -C ${_extdir} -xz ${_sname} --no-same-owner
+    sed -ri "/^\;extension[ ]*=[\" ]*ixed\..*.lin[\" ]*/d" ${_phpPrefix}/lib/php.ini;
+    echo ";extension=\"${_sname}\"" >>  ${_phpPrefix}/lib/php.ini;
+    echo "Enable SourceGuardian manually in ${_phpPrefix}/lib/php.ini";
+}
+
+registerPleskPHP(){
+    echo "Registering PHP with Plesk...";
+    /usr/local/psa/bin/php_handler --add -displayname ${_phpVersion} -path ${_phpPrefix}/bin/php-cgi -phpini ${_phpPrefix}/lib/php.ini -type cgi -id ${_phpVersion}||showFail "Failed to register PHP";
+}
+
+getTicket(){
+    [[ ! ${_ticket} ]] && read -t30 -p"Ticket number (will continue automatically in 30 seconds): " _ticket;
+}
+
+checkDeps(){
+    echo "Checking build deps";
+    if [[ ${controlPanel} == "cpanel" ]]; then
+        rpm -q sqlite-devel >/dev/null||yum install -qy sqlite-devel||showFail "Failed to install sqlite-devel";
+    elif [[ ${controlPanel} == "plesk" ]]; then
+        yum -y install patch libxml2-devel bzip2-devel curl-devel libpng-devel libjpeg-devel freetype-devel gmp-devel libc-client-devel libicu-devel gcc-c++ ldap-devel libmcrypt-devel unixODBC-devel pspell-devel libxslt-devel libtool-ltdl-devel||showFail "Failed to install packages";
+        if [[ $(rpm -q plesk-mysql|grep ^plesk-mysql) && $(rpm -q mysql|grep ^mysql) ]]; then
+            pleskMysqlVer=$(rpm -q mysql|awk -F\- '$2{print $2"-"$3}');
+            if [[ ${pleskMysqlVer} && ! $(rpm -q mysql-devel|grep ^mysql) ]]; then
+                rpm -Uvh http://autoinstall.plesk.com/MYSQL_5.5/dist-rpm-RedHat-el5-x86_64/contrib/mysql-devel-${pleskMysqlVer}.${HOSTTYPE}.rpm||showFail "Failed to install mysql-devel";
+            fi;
+        fi;
+    fi;
+}
+
+
+####### Main #######
+_st=$(date +%s);
+title;
+checkEnv;
+getOpts "$@";
+
+if [[ ${_uninstall} ]]; then
+    initCfg;
+    uninstall;
+elif [[ ${controlPanel} == "cpanel" && $_showHandler ]]; then
+    initCfg;
+    showHandler;
+    exit;
+elif [[ ${controlPanel} == "cpanel" && $_switchHandler ]]; then
+    initCfg;
+    switchHandler;
+    exit;
+fi;
+getTicket;
+
+# Start logging everything now
+if [[ ! -d ${LOGPATH} ]]; then
+    echo "Creating \"${LOGPATH}\" for logging...";
+    mkdir -p ${LOGPATH};
+fi;
+_logFile="${LOGPATH}/php${_buildVer}_build-$(date +%s).log"
+echo "Output to $_logFile"
+exec > >(tee $_logFile) 2>&1
+
+if [[ ! $_skipwarn ]]; then 
+    showWarning;
+else
+    echo;
+    echo "Skipping warning."
+fi;
+initCfg;
+if [[ ${controlPanel} == "cpanel" ]]; then
+    checkCPHandler;
+fi;
+checkSpace;
+checkRAM;
+if [[ $_extraCfgFlags ]]; then
+    if [[ $_extraCfgFlags =~ --enable-fpm ]]; then
+        echo "Cannot enable FPM from --config-flags. Use --use-fpm instead.";
+        exit 1;
+    else
+        echo "Configuring with these additional flags: $_extraCfgFlags";
+    fi;
+fi;
+
+checkDeps;
+buildCfg;
+[[ $_doFPM ]] && doFPM;
+showCfg;
+
+if [[ $_dryrun ]]; then
+    echo "Dry-run - Skipping download, build and installation.";
+else
+    increaseFD_SETSIZE;
+    install_all;
+    if [[ ${controlPanel} == "cpanel" ]]; then 
+        if [[ $_useFastCGI ]]; then
+            mkFastCGICfg;
+        elif [[ $_useSuPHP ]]; then
+            mkSuPHPCfg;
+        fi;
+    elif [[ ${controlPanel} == "plesk" ]]; then 
+        registerPleskPHP;
+    fi;
+    if [[ ${_installZendGuard} ]]; then install_zendguard; fi;
+    if [[ ${_installIoncube} ]]; then install_ioncube; fi;
+    if [[ ${_installSourceGuardian} ]]; then install_sourceguardian; fi;
+fi;
+
+postFlight;
+[[ ${_debug} ]] && set +x;
+exit 0;
+

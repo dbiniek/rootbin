@@ -1,0 +1,3 @@
+Exclude everything except whatever actual files i want to include
+    !/root/bin/nssnap/    
+    /*

@@ -1,0 +1,788 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife - Joomla CLI Library
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash-JOS
+#- @subpackage CLI
+
+#+ Our main subcommand processing loop.
+#| Handles the "jos" subcommand.
+#- @param mixed $args... Positionals provided from CLI script.
+sak_cli_jos() {
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    ""|info|overview)     sak_cli_jos_info "$@" ;;
+    basic|basics)         sak_cli_jos_info "basics" ;;
+    cache|caches|caching) sak_cli_jos_info "$@" ;;
+#    count|counts)         sak_cli_jos_count_info "$@" ;;
+
+    backup)   sak_cli_jos_backup "$@" ;;
+    diff)     sak_cli_diff --only "wordpress" "$@" ;;
+    replace)  sak_cli_replace --only "joomla" "$@" ;;
+
+    set)                    sak_cli_jos_set "$@" ;;
+    addon|addons|component|components|extension|extensions|module|modules|\
+    plugin|plugins)         sak_cli_jos_addons "$@" ;;
+    templates|theme|themes) sak_cli_jos_themes "$@" ;;
+    user|users)             sak_cli_jos_users "$@" ;;
+
+    -h|help|--help)         sak_cli_help_jos ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&2;
+       sak_cli_help_jos; exit 1 ;;
+  esac
+}
+
+#+ Users subcommand handler.
+#- @param mixed $args... Command line positionals.
+sak_cli_jos_users() {
+  local cmd="$1" IFS=$' \t\n'
+  shift
+
+  case "$cmd" in
+    ""|info)  sak_cli_jos_user_info ;;
+
+#    disp|display|setdisp|setdisplay|changedisplay)
+#      sak_cli_jos_user_edit "display" "$@" ;;
+#    email|setemail|changeemail)
+#      sak_cli_jos_user_edit "email" "$@" ;;
+#    name|rename|setname|changename)
+#      sak_cli_jos_user_edit "username" "$@" ;;
+#    role|setrole|changerole)
+#      sak_cli_jos_user_edit "role" "$@" ;;
+
+    -h|help|--help) sak_cli_help_jos_user ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&2;
+       sak_cli_help_jos_user; exit 1 ;;
+  esac
+}
+
+##################################################################
+##################################################################
+#
+# Joomla Help
+#
+
+#@ Joomla command help
+sak_cli_help_jos() {
+  sak_cli_usage
+cat << EOF
+
+These are Joomla specific functions.
+
+Help Commands:
+  help      This help
+  info      Display Joomla information found in current directory
+
+Commands:
+  addons [OPTIONS]...
+          Addon information and manipulation. See command help for more info.
+
+  backup [all|db [DATABASE [PATH]]]
+          Without arguments, generate a core backup of the Joomla installation
+          detected in the current directory. If "all" is specified, a full
+          directory backup is created. If "db" is specified, a backup of the
+          installation or specified DB is created, optionally at the path
+          specified.
+
+  diff    Show a core file diff. Wrapper for main diff command.
+
+  replace [OPTIONS]...
+          Replace core install files for Joomla. Wrapper for main replace
+          command.
+
+  set [OPTIONS]...
+          Change Joomla configration options.
+
+  templates [OPTIONS]...
+          Template information.
+
+  users [OPTIONS]...
+          User information.
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ Joomla set command help
+sak_cli_help_jos_set() {
+  local b=$'\e[1m' u=$'\e[4m' e=$'\e[0m'
+  sak_cli_usage
+cat << EOF
+
+Help Commands:
+  help      This help
+
+Commands:
+  set name NEWNAME
+        Changes the site name to the new name specified
+
+  set desc DESCRIPTION
+        Changes the site's description (MetaDesc)
+
+  set offline BOOL
+  set online BOOL
+        Enable or disable "Maintenance" mode depending on BOOL.
+
+  set offline_message MESSAGE
+        Changes the message displayed to visitors when maintenance mode is
+        enabled. Note that changing the message does not enable offline mode.
+
+  set rewrite BOOL
+        Enable or disable use of mod_rewrite. The contents of htaccess.txt must
+        be copied to .htaccess for this to function properly.
+
+  set sef BOOL
+  set seo BOOL
+        Enable or disable Search Engine Friendly links.
+
+  set suffix BOOL
+        Enable or disable page suffixes, such as .html for article links and
+        .pdf for PDF links. Requires
+
+Note:
+  ${b}BOOL can be any of${e}: 0, 1, on, off, yes, no, true, false, enabled, or disabled.
+
+Examples:
+  sak-cli jos set name "Doug's Super Blog"
+  sak-cli jos set desc "The ultimate site for guys named Doug."
+  sak-cli jos set offline disabled
+  sak-cli jos set rewrite on
+  sak-cli jos set sef on
+  sak-cli jos set suffix on
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ Joomla addons command help
+sak_cli_help_jos_addons() {
+  local b=$'\e[1m' u=$'\e[4m' e=$'\e[0m'
+  sak_cli_usage
+cat << EOF
+
+Help Commands:
+  help      This help
+
+Commands:
+  enable [OPTIONS] ...
+        Enable an addon. See toggle help for more information.
+
+  disable [OPTIONS] ...
+        Disable an addon. See toggle help for more information.
+
+  info [OPTIONS]
+        Default. Displays information about installed addons. See options
+        below for filtering.
+
+Options:
+  -f, --filter STATUS
+      Filter addons by status:
+        disabled    Filter disabled addons from output
+        enabled     Filter enabled addons from output
+        protected   Filter protected addons from output
+
+  --fd, --filter-disabled
+      Alias to filter disabled addons
+
+  --fe, --filter-enabled
+      Alias to filter enabled addons
+
+  --fp, --filter-protected
+      Alias to filter protected addons
+
+  -t, --type TYPE
+      Show only TYPE addons, such as plugin or component. See notes.
+
+Note:
+  Only Joomla 2.5 and higher is fully supported. Some options may not work for
+  lower versions.
+
+  ${b}Valid types${e}: component, language, library, module, plugin
+
+Examples:
+  sak-cli jos addons
+  sak-cli jos addons --filter disabled
+  sak-cli jos addons -fp -t plugin
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ Joomla addons toggle command help
+sak_cli_help_jos_addons_toggle() {
+  local b=$'\e[1m' u=$'\e[4m' e=$'\e[0m'
+  sak_cli_usage
+cat << EOF
+
+Help Commands:
+  help      This help
+
+Commands:
+  enable NUM
+  disable NUM
+  enable [OPTIONS] [TYPE] (NAME|ELEMENT)
+  disable [OPTIONS] [TYPE] (NAME|ELEMENT)
+      Enable or disable an addon by name or numeric ID. If specifying by name,
+      the -a or -f flag may be required. When a name contains a space, it is
+      necessary to use quotes or use the element name instead.
+
+Options:
+  -a, --admin
+      Apply actions only to admin addon. Only required when admin and front-end
+      addon exists with the same name.
+
+  -f, --frontend
+      Apply actions only to front-end addon Only required when admin and
+      front-end addon exists with the same name.
+
+Notes:
+  Only Joomla 2.5 and higher is fully supported. This command will fail on lower
+  versions.
+
+  Addon type is optional if type prefix exists with name. Example: com_mailto
+  would automatically specify the "component" type.
+
+  ${b}Valid types${e}: component, module, plugin
+
+${b}${u}Warnings${e}${b}:
+  Avoid disabling core Joomla components as they may be needed to render or
+  administrate the site.
+
+  At least ${u}ONE${e}${b} authentication plugin must be active to log in.${e}
+
+Examples:
+  sak-cli jos addons disable 400
+  sak-cli jos addons enable -a module feed
+  sak-cli jos addons disable com_contact
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+##################################################################
+##################################################################
+#
+# Joomla CLI functions
+#
+
+#+ Info subcommand.
+#- @param mixed $args... Command line positionals.
+sak_cli_jos_info() {
+  local cmd="$1" basic=() i=0 input vuln soft path ver
+
+  if [[ -n "$cmd" ]]; then
+    shift
+    case "$cmd" in
+      cash) sak_cli_find_cache; return ;;
+      basic|basics|overview|cache|caches|caching) ;; # Fall through
+      #count|counts|
+      user|users|templates|theme|themes|plugin|plugins)
+        sak_cli_jos "$cmd"; return ;;  # Loop back to jos command
+      *) sak_cli_help_jos && exit 1 ;; # Error
+    esac
+  fi
+
+  sak_cli_get_installs "joomla"
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  sak_jos_cache_config 0 || return 1
+
+  for name in sitename MetaDesc session_handler offline gzip caching cache_handler \
+              cachetime sef sef_suffix sef_rewrite captcha; do
+    basic[$i]="$(sak_get_php_opt -v "$SAK_JOS_CONFIG" "$name")" || :
+    case "$i" in # Convert boolean to yes|no
+      3|4|5|8|9|10|11) basic[$i]="$(sak_cli_jos_info_yesno "${basic[$i]}")" ;;
+    esac
+    let "i++"
+  done
+
+  [[ "${basic[2]}" == "none" ]] && basic[2]='\e[36mPHP\e[0m'
+  [[ "${basic[2]}" == "database" ]] && basic[2]='\e[36mDatabase\e[0m'
+
+  case "$vuln" in
+   -1) vuln='\e[1mUnknown'     ;; # Unknown    = White
+    0) vuln='\e[32mSecure'     ;; # Secure     = Green
+    1) vuln='\e[33mOutdated'   ;; # Outdated   = Black
+    2) vuln='\e[31mVulnerable' ;; # Vulnerable = Red
+  esac
+
+  printf "
+==[ Overview ]======================-==--- -- -
+Path    : %s
+Software: \e[1mJoomla\e[0m
+Version : \e[1m%s\e[0m (%b\e[0m)
+
+Database: \e[1m%s\e[0m
+Prefix  : \e[1m%s\e[0m
+
+Site Name:  \e[1m%s\e[0m
+Site Desc:  \e[1m%s\e[0m
+
+Sessions:    %b
+Maint mode:  %b
+
+Compression: %b
+Caching:     %b (\e[36m%b\e[0m)
+Cache Time:  \e[35m%d min\e[0m
+
+SEF URLs:    %b     SEF Suffix:  %b
+Use Rewrite: %b     Use CAPTCHA: %b\n" \
+  "$path" \
+  "$ver" \
+  "$vuln" \
+  "$SAK_JOS_DB" \
+  "$SAK_JOS_PREFIX" \
+  "${basic[0]}" \
+  "${basic[1]}" \
+  "${basic[2]}" \
+  "${basic[3]}" \
+  "${basic[4]}" \
+  "${basic[5]}" \
+  "${basic[6]:-0}" \
+  "${basic[7]}" \
+  "${basic[8]}" \
+  "${basic[9]}" \
+  "${basic[10]}" \
+  "${basic[11]}"
+
+  [[ "$cmd" =~ "basic" ]] && echo && return 0
+
+  printf "\n==[ Themes ]========================-==--- -- -\n"
+  sak_cli_jos_theme_info 1
+
+  printf "\n==[ Users ]=========================-==--- -- -\n"
+  sak_cli_jos_user_info 1
+  echo
+}
+
+#+ Convert yes/no to readable format.
+#| @internal
+#- @param string $value  Value to be converted.
+sak_cli_jos_info_yesno() {
+  # 1 or "true" == yes
+  [[ "$1" -ge "1"  || "$1" == "true" ]] && echo '\e[34mYes\e[0m' && return 0
+  # Anything else is invalid/false
+  echo '\e[33mNo \e[0m' && return 0
+}
+
+#+ Joomla set subcommand.
+#| Used for editing Joomla settings.
+#- @param mixed $args... Command line positionals.
+sak_cli_jos_set() {
+  local cmd="$1" value="$2" bval data msg name owner script bool=0 invert=0 \
+        rewrite=0 msgs=() vuln soft path ver IFS
+
+  bval="$(sak_to_bool "$value")" || bval=""
+
+  case "$cmd" in
+    name|title|blogname|blogtitle)  name='sitename';;
+    desc|description|meta|metadesc) name='MetaDesc';;
+
+    online)
+      name="offline";   bool=1;   invert=1;;
+    offline|maint|maintenance)
+      name="offline";   bool=1;;
+    offline_message|offline_mesg)
+      name="offline_message"
+      ((bval)) && msgs+=("Setting the offline message will not enable maintenance mode. Enable separately if needed.");;
+
+    sef|seo)
+      name="sef";         bool=1;;
+    rewrite|sef_rewrite)
+      name="sef_rewrite"; bool=1
+      ((bval)) && msgs+=("Please be sure SEF/SEO links are enabled.")
+      ((bval)) && msgs+=("Make sure .htaccess has the proper rewrites from htaccess.txt.");;
+    suffix|sef_suffix)
+      name="sef_suffix";  bool=1 ;;
+
+    ""|-h|--help|help) sak_cli_help_jos_set; exit 0 ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3
+       sak_cli_help_jos_set; exit 1 ;;
+  esac
+
+  sak_cli_get_installs "joomla" || return 1
+
+  (( bool )) && {
+    [[ -n "$bval" ]] && value="$bval" || sak_fatal $SAK_ERR_ARG "Invalid value: $value"
+  }
+  (( bool & invert )) && (( value = (1 - value) ))
+
+  sak_version_req 0 "2.5" ||
+    sak_fatal $SAK_ERR_ARG "This command requires Joomla 2.5 or greater."
+
+  printf -v data "%s\x1E%s\n" "$name" "$value"
+
+  sak_jos_write_config 0 "$data" ||
+    sak_fatal $SAK_ERR_UNK "Error writing configuration file."
+
+  sak_cli_jos_info "basic"
+
+  for msg in "${msgs[@]}"; do
+    sak_message "Warning" "$msg"
+  done
+  [[ "${#msgs[@]}" != "0" ]] && echo
+}
+
+#+ Joomla theme modification.
+#- @param mixed $args... Command line positionals.
+sak_cli_jos_themes() {
+  sak_cli_jos_theme_info "$@"
+}
+
+#+ Joomla template information.
+#- @param mixed $args... Command line positionals.
+sak_cli_jos_theme_info() {
+  local cfile n theme act color parent sect IFS=$'\t\n'
+
+  sak_cli_get_installs "joomla"
+  sak_jos_cache_data 0 themes || return 1
+
+  cfile="$(sak_jos_cache_file THEMES)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving theme information."
+
+  [[ -z "$1" ]] &&
+    printf '\nLegend: [\e[33mA\e[0m] = Administrator,  [\e[34mF\e[0m] = Front-end\n\n'
+
+  while IFS=$'\x1E' read -ra theme; do
+    (( n++ % 25 == 0 )) && [[ -z "$1" ]] &&
+      printf '\e[1m###    Enabled   Name                                                  Type  Filename\e[0m\n'
+                   #1   [  Admin  ] Bluestork - Default              Version 2.5.0        [A]   bluestork
+    if [[ "${theme[0]}" -eq "0" ]]; then
+      act="0m         "
+    else
+      if [[ "${theme[1]}" -eq "0" ]]; then
+        act="34mFront-end"
+      else
+        act="33m  Admin  "
+      fi
+    fi
+    [[ "${theme[1]}" -eq "0" ]] && sect="34mF" || sect="33mA"
+    printf '#%-3d [\e[%s\e[0m] \e[34m%-32s\e[0m Version \e[33m%-12s\e[0m [\e[%s\e[0m]   \e[1m%s\e[0m\n' \
+      "$n" "$act" "${theme[4]}" "${theme[3]}" "$sect" "${theme[2]}"
+  done < "$cfile"
+}
+
+#+ Joomla user info.
+#- @param mixed $args... Command line positionals.
+sak_cli_jos_user_info() {
+  local i="$1" n cfile total vuln soft path ver user IFS=$'\t\n'
+  shift
+
+  sak_cli_get_installs "joomla"
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  sak_jos_cache_data 0 users ||
+    sak_fatal $SAK_ERR_SUB_ERR "Could not cache users."
+
+  cfile="$(sak_jos_cache_file USERS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving plugin information."
+
+  total="$(wc -l "$cfile")"
+  total="${total%% *}"
+
+  [[ -z "$i" ]] && echo
+  if [[ -n "$i" || "$total" -le "150" ]]; then
+    while IFS=$'\x1E' read -ra user; do
+      let "n++"
+      [[ -n "${user[5]}" ]] && user[4]="[${user[5]}] ${user[4]}"
+      printf '#%-3d \e[34m%-12s\e[0m \e[1m%-22s\e[0m  Disp: \e[34m%-16s\e[0m  Email: \e[1m%s\e[0m  Reg: \e[1m%s\e[0m  Last: \e[1m%s\e[0m\n' \
+        "${user[0]}" "${user[1]}" "(${user[4]})" "${user[2]}" "${user[3]}" "${user[6]}" "${user[7]}"
+
+      [[ -n "$i" && "$total" -gt "25" && "$n" -ge "25" ]] &&
+        printf '\e[33mShowing the first 25 (of %s) users, use \e[1m"sak-cli jos users"\e[0;33m to list all.\e[0m' "$total" &&
+        break
+    done < "$cfile"
+  else
+    while IFS=$'\x1E' read -ra user; do
+      [[ -z "$n" ]] && printf '\n  Total Users: %s\n\n' "$total"
+      let "n++"
+      [[ -n "${user[5]}" ]] && user[4]="[${user[5]}] ${user[4]}"
+      printf '#%-3d \e[34m%-12s\e[0m \e[1m%-22s\e[0m  Disp: \e[34m%-16s\e[0m  Email: \e[1m%s\e[0m  Reg: \e[1m%s\e[0m  Last: \e[1m%s\e[0m\n' \
+        "${user[0]}" "${user[1]}" "(${user[4]})" "${user[2]}" "${user[3]}" "${user[6]}" "${user[7]}"
+    done < "$cfile" | /usr/bin/less -SR
+  fi
+}
+
+#+ Joomla addon info and modification router.
+#- @param mixed $args... Command line positionals.
+sak_cli_jos_addons() {
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    activate|enable)    sak_cli_jos_addons_toggle 1 "$@" ;;
+    deactivate|disable) sak_cli_jos_addons_toggle 0 "$@" ;;
+
+    -h|help|--help) sak_cli_help_jos_addons ;;
+    ""|info)        sak_cli_jos_addons_info "$@" ;;
+    -?*)            sak_cli_jos_addons_info "$cmd" "$@" ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+       sak_cli_help_jos_addons; exit 1 ;;
+  esac
+}
+
+#+ Joomla addons information.
+#- @param mixed $args... Command line positionals.
+sak_cli_jos_addons_info() {
+  local i s t addon cfile fs fp lasttype opts type vuln soft path ver
+
+  opts="$(getopt -n "$SAK_BASENAME" -o "f:t:" -l "fd,fe,fp,filter:,filter-disabled,filter-enabled,filter-protected,type:" -- "$@")" ||
+    { sak_cli_help_jos_addons && exit 1; }
+  eval opts=($opts)
+  for i in "${!opts[@]}"; do
+    (( s > 0 )) && s=0 && continue
+    case "${opts[$i]}" in
+      -f|--filter) s=1
+        case "${opts[((i+1))]}" in
+          disabled)  fs=0;;
+          enabled)   fs=1;;
+          protected) fp=1;;
+          *) echo "$SAK_BASENAME: unknown argument -- ${opts[((i+1))]}" >&3
+             sak_cli_help_jos_addons; exit 1 ;;
+        esac;;
+      --fd|--filter-disabled)  fs=0;;
+      --fe|--filter-enabled)   fs=1;;
+      --fp|--filter-protected) fp=1;;
+      -t|--type)  type=${opts[((++i))]}; s=1;;
+      -h|--help|help) sak_cli_help_jos_addons; exit 0;;
+      --) break;;
+      *) echo "$SAK_BASENAME: unrecognized option \`${opts[$i]}'" >&3
+         sak_cli_help_jos_addons; exit 1 ;;
+    esac
+  done
+
+  sak_cli_get_installs "joomla"
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  sak_jos_cache_data 0 addons ||
+    sak_fatal_backtrace $SAK_ERR_SUB_ERR "Could not cache addons."
+
+  cfile="$(sak_jos_cache_file ADDONS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving addon information."
+
+  if sak_version_req 0 "1.6"; then
+    printf '\n  Legend:  \e[1m*\e[0m = Protected (Cannot remove),  [\e[33mA\e[0m] = Administrator,  [\e[34mF\e[0m] = Front-end\n'
+    while IFS=$'\x1E' read -ra addon; do
+      [[ "$addon" == "extensions_160" ]] && continue              # Skip header
+      [[ -n "$fs" && "${addon[1]}" == "$fs" ]] && continue        # Filter by status
+      [[ "$fp" == "1" && "${addon[7]}" == "1" ]] && continue      # Filter by protected
+      [[ -n "$type" && "${addon[2]}" != "$type" ]] && continue || # Skip other types
+        case "${addon[2]}" in
+          file|package|template) continue ;;  # Skip by default if no type requested
+        esac
+      # 0-ID  1-enabled  2-type  3-name  4-folder  5-element  6-client_id  7-protected
+      [[ "${addon[1]}" == "1" ]] && addon[1]="\e[32mON\e[0m" || addon[1]="  "           # Enabled
+      [[ "${addon[6]}" == "1" ]] && addon[6]="\e[33mA\e[0m" || addon[6]="\e[34mF\e[0m"  # Section
+      [[ "${addon[7]}" == "1" ]] && addon[7]="\e[1m*\e[0m" || addon[7]=" "              # Protected
+      [[ "$lasttype" != "${addon[2]}" ]] && # Header output
+        printf "\n\e[1;4m#####        Sect      Type P Name                           Element                       \e[0m\n"
+      case "${addon[3]:0:4}" in   # Trims prefixes
+        com_|mod_|plg_) addon[3]="${addon[3]#*_}";;
+      esac
+      [[ "${addon[2]}" == "plugin" ]] && addon[5]="plg_${addon[4]}_${addon[5]}"
+      printf '%-7d [%b] [%b] \e[1m%10s\e[0m %b %-29s  %s\n' \
+        "${addon[0]}" "${addon[1]}" "${addon[6]}" "${addon[2]}" \
+        "${addon[7]}" "${addon[3]}" "${addon[5]}"
+      lasttype="${addon[2]}"
+    done < "$cfile"
+    printf '\n  Legend:  \e[1m*\e[0m = Protected (Cannot remove),  [\e[33mA\e[0m] = Administrator,  [\e[34mF\e[0m] = Front-end\n\n'
+  elif sak_version_req 0 "1.5"; then
+    # NOTE - 1.5 is no longer supported, this code may not stay
+    printf '\n  Legend:  [\e[33mA\e[0m] = Administrator,  [\e[34mF\e[0m] = Front-end,  [\e[35mB\e[0m] = Both\n%12s\e[1m*\e[0m  = Protected (Cannot remove)\n\n'
+    sak_message "Warning" "Older version of Joomla detected. Output will be limited."
+    while IFS=$'\x1E' read -ra addon; do
+      [[ "${addon[1]}" == "1" ]] && addon[1]="\e[32mON\e[0m" || addon[1]="  "
+      case "${addon[0]}" in
+        components_150) t="c"; printf '\n\e[1;4m%-13s %-20s %-20s\e[0m\n' COMPONENTS Option Name;;
+        plugins_150) t="p"; printf '\n\e[1;4m%-14s %-20s\e[0m\n' PLUGINS Name ;;
+        *) # non-header
+          if [[ "$t" == "c" ]]; then
+            s="[ ]"
+            [[ "${addon[4]}" == "1" ]] && s="[\e[33mA\e[0m]"  # Admin
+            [[ "${addon[5]}" == "1" ]] && s="[\e[34mF\e[0m]"  # Front-end
+            [[ "${addon[4]}${addon[5]}" == "11" ]] && s="[\e[35mB\e[0m]"  # Admin
+            [[ "${addon[6]}" == "1" ]] && addon[6]="\e[1m*\e[0m" || addon[6]=" "  # Protected
+            printf '%-4s %b %b %b \e[1m%-20s\e[0m %s\n' \
+              "${addon[@]:0:2}" "$s" "${addon[6]}" "${addon[3]}" "${addon[2]}"
+          elif [[ "$t" == "p" ]]; then
+            [[ "${addon[4]}" == "1" ]] && addon[4]=["\e[33mA\e[0m]" || addon[4]="[\e[34mF\e[0m]"
+            [[ "${addon[5]}" == "1" ]] && addon[5]="\e[1m*\e[0m" || addon[5]=" "
+            printf '%-4s %b %b %b  %s\n' \
+              "${addon[@]:0:2}" "${addon[@]:4:2}" "${addon[2]}"
+          fi ;;
+      esac
+    done < "$cfile"
+    printf '\n  Legend:  [\e[33mA\e[0m] = Administrator,  [\e[34mF\e[0m] = Front-end,  [\e[35mB\e[0m] = Both\n%12s\e[1m*\e[0m  = Protected (Cannot remove)\n\n'
+  else
+    sak_fatal 1 "Unsupported version: Joomla ${ver}"
+  fi
+}
+
+#+ Enable or disable an extension.
+#| @param string $mode   Toggle mode, one of "enable" or "disable"
+#- @param mixed $args... Command line positionals.
+#- @return bool True on success. False on error.
+sak_cli_jos_addons_toggle() {
+  local mode="$1" c i s addon admin altn cfile frontend name opts type work
+  shift
+
+  opts="$(getopt -n "$SAK_BASENAME" -o "af" -l "admin,fe,frontend" -- "$@")" ||
+    { sak_cli_help_jos_addons_toggle && exit 1; }
+  eval opts=($opts) # Mad hax
+  for i in "${!opts[@]}"; do
+    (( s > 0 )) && s=0 && continue
+    case "${opts[$i]}" in
+      -a|--admin)         admin=1;;
+      -f|--fe|--frontend) frontend=1;;
+      --) break;;
+      -h|--help|help)
+        sak_cli_help_jos_addons_toggle; exit 0;;
+      *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3
+        sak_cli_help_jos_addons_toggle; exit 1;;
+    esac
+  done
+  type="${opts[((++i))]}"
+  name="${opts[((++i))]}"
+  altn="$name"
+
+  [[ "$type" == "help" && -z "$name" ]] &&
+    sak_cli_help_jos_addons_toggle && exit 0
+
+  if [[ ! "$type" =~ ^[0-9]+$ || -z "$type" ]]; then
+    [[ "$admin" == "1" && "$frontend" == "1" ]] && echo "$SAK_BASENAME: cannot specify both \`--admin' and \`--frontend'" &&
+      sak_cli_help_jos_addons && exit 1
+
+    # Special case for single argument (e.g. com_k2)
+    if [[ -z "$name" && "${type:3:1}" == "_" && "${#type}" -gt "4" ]]; then
+      case "${type:0:4}" in
+        com_) name="$type"; type="component" ;;
+        mod_) name="$type"; type="module" ;;
+        plg_) name="$type"; type="plugin" ;;
+        *) sak_version; sak_fatal $SAK_ERR_ARG "Specified type is not valid." ;;
+      esac
+      altn="$name"
+    else
+      if [[ -z "$type" || -z "$name" ]]; then
+        echo "$SAK_BASENAME: too few arguments"
+        sak_cli_help_jos_addons_toggle; exit 1
+      fi
+      case "$type" in
+        com|com_|component) [[ "${name:0:4}" == "com_" ]] || name="com_$name"; type="component" ;;
+        mod|mod_|module)    [[ "${name:0:4}" == "mod_" ]] || name="mod_$name"; type="module" ;;
+        plg|plg_|plugin)    [[ "${name:0:4}" == "plg_" ]] || name="plg_$name"; type="plugin" ;;
+        language|library|file|package|template) ;;
+        *) sak_version; sak_fatal $SAK_ERR_ARG "Specified type is not valid." ;;
+      esac
+    fi
+    i=0
+  else
+    i=1
+  fi
+
+  sak_cli_get_installs "joomla"
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  sak_version_req 0 "2.5" ||
+    sak_fatal "This command requires Joomla 2.5 or greater."
+
+  sak_jos_cache_data 0 addons ||
+    sak_fatal_backtrace $SAK_ERR_SUB_ERR "Could not cache addons."
+
+  cfile="$(sak_jos_cache_file ADDONS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving addon information."
+
+  if (( i )); then
+    while IFS=$'\x1E' read -ra addon; do
+      if [[ "${addon[0]}" == "$type" ]]; then
+        ((c++)); work=("${addon[@]}"); break  # First found is fine
+      fi
+    done < "$cfile"
+    type="${work[2]}"
+  else
+    while IFS=$'\x1E' read -ra addon; do
+      [[ "${addon[2]}" != "$type" ||
+        ( "$admin" == "1" && "${addon[6]}" == "0" ) ||
+        ( "$frontend" == "1" && "${addon[6]}" == "1" ) ]] && continue
+
+      [[ "$name" == "${addon[3]}" || "$name" == "${addon[5]}" ||
+        ( "$type" == "plugin" && "plg_${addon[4]}_${addon[5]}" == "$name" ) ]] ||
+        continue
+
+      ((c++)); work=("${addon[@]}")
+    done < "$cfile"
+  fi
+
+  case "$type" in   # Double-check type
+    component|module|plugin) ;;
+    *) sak_version; sak_fatal $SAK_ERR_ARG "Specified type cannot be toggled with this utility." ;;
+  esac
+  [[ "${work[3]:0:4}" =~ ^(com|mod|plg)_ ]] && name="${work[3]#*_}" || name="${work[3]}"
+
+  (( c == 0 )) &&
+    sak_fatal $SAK_ERR_ARG "No addon found with that name."
+  (( c > 1 )) &&
+    sak_fatal $SAK_ERR_ARG "Too many ($c) matches. Please specify --admin or --frontend."
+
+  ifile="$(sak_mkcache)"
+  # 0-ID  1-enabled  2-type  3-name  4-folder  5-element  6-client_id  7-protected
+  printf '%s\x1e%s\x1e%s\x1e%s\x1e%s\x1e%s\x1e%s\x1e%s\n' "${work[@]}" > "$ifile"
+
+  [[ "$mode" == "0" ]] && mode="disable" || mode="enable"
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/joomla/main.php" -o STDOUT -i "$ifile" \
+    --root --db "$SAK_JOS_DB" --prefix "$SAK_JOS_PREFIX" --path "$path" \
+    --version "$ver" --mode "$mode" --set addons)"
+
+  rm -f "$ifile"
+  if [[ -n "$err" ]]; then
+    sak_wait_message 5 "Error" "$err" 5 35
+    return 1
+  fi
+
+  sak_message "Toggle" "Successfully ${mode}d $name $type."
+  sak_cli_jos_addons_info --type "$type"
+  [[ "$type" == "plugin" && "$mode" == "disable" && "${work[4]}" == "authentication" ]] &&
+    sak_message "Warning" "Please note that at least ONE authentication plugin must be active to be able to log in!" && echo
+  return 0
+}
+
+#@ Joomla DB/Core backup
+sak_cli_jos_backup() {
+  local soft path ver
+
+  if [[ "$1" == "db" ]]; then
+    shift
+    sak_cli_jos_db_backup "$@"
+    return 0
+  fi
+
+  sak_cli_get_installs "joomla"
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  let "SAK_QUIET++"
+  sak_core_backup 0
+}
+
+#@ Joomla DB backup
+sak_cli_jos_db_backup() {
+  local db soft path ver
+
+  sak_cli_get_installs "joomla"
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  sak_jos_cache_config 0 || sak_fatal_backtrace $SAK_ERR_SUB_CNF "Error obtaining Joomla information."
+  db="$SAK_JOS_DB"
+  path="$PWD"
+
+  sak_data_backup "$db" "$path"
+}

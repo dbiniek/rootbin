@@ -1,0 +1,432 @@
+#!/usr/bin/env php
+<?php
+/*
+###########
+# WordPress Profiler auto installer/runner
+# https://confluence.endurance.com/display/HGS/WordPress+Optimizations#WordPressOptimizations-UsingWPProfiler
+# https://stash.endurance.com/projects/HGADMIN/repos/wpprofiler/browse
+# Please submit all bug reports at https://jira.endurance.com/secure/RapidBoard.jspa?rapidView=1083&projectKey=HL
+#
+# (C) 2016 - HostGator.com, LLC
+###########
+*/
+# Needed for the sake of plugins that modify headers.
+ini_set('display_errors', '0');
+
+if(! (php_sapi_name() == 'cli' && empty($SERVER['REMOTE_ADDR'])) ) {
+    die("Verboten.\n");
+}
+
+if ( ! file_exists('wp-config.php') ) {
+    die("\nThis must be run from the same directory as a working wp-config.php.\n\n");
+}
+
+print "\nLoading up Wordpress's internal config. This may take a bit...\n";
+require_once('wp-config.php');
+
+function check_ids($uid, $gid) {
+    if ( ( posix_getuid() == $uid ) and (posix_getgid() == $gid ) ) {
+        return True;
+    } else {
+        return False;
+    }
+}
+
+$uid = fileowner('wp-config.php');
+$gid = filegroup('wp-config.php');
+/*
+wp-admin is not supposed to be changed. Some people do it anyway. In that case, they're
+on their own, as there is no way to determine what the proper directory should be.
+*/
+$plugins_lib = ABSPATH . 'wp-admin/includes/plugin.php';
+/*
+These two libs are required because without them, wp-supercache will kill the
+script with a fatal error. A 'fatal error' is uncatchable for no particular
+reason other than 'PHP doesn't have its crap together'. If I could have
+caught the error with less damage than letting the script run, I'll never know.
+*/
+$file_lib = ABSPATH . 'wp-admin/includes/file.php';
+$misc_lib = ABSPATH . 'wp-admin/includes/misc.php';
+
+if ( !
+    (file_exists($plugins_lib)) and
+    (file_exists($file_lib)) and
+    (file_exists($misc_lib))
+) {
+    die("\nThe wp-admin directory is in the wrong place, or some of the includes are missing. You're on your own.\n\n");
+}
+
+require_once($plugins_lib);
+require_once($file_lib);
+require_once($misc_lib);
+
+
+$plugin_dir_path = WP_PLUGIN_DIR . '/p3-profiler';
+$plugin_path = $plugin_dir_path . '/p3-profiler.php';
+
+$profiler_installed = file_exists($plugin_path);
+
+function bootstrap() {
+    global $plugin_dir_path;
+    require_once($plugin_dir_path . '/p3-profiler.php');
+    require_once($plugin_dir_path . '/classes/class.p3-profiler-plugin-admin.php');
+    require_once($plugin_dir_path . '/classes/class.p3-profiler-reader.php');
+}
+
+if ($profiler_installed) {
+    bootstrap();
+}
+
+function install_profiler() {
+    $zip_file = '/root/bin/p3-profiler.zip';
+    print "Extracting plugin...\n";
+    global $uid, $gid, $plugin_dir_path;
+    if(!defined('WP_PLUGIN_DIR')) {
+        die("WP_PLUGIN_DIR not defined. Exiting for safety.\n");
+    } else {
+	$plugins_dir = WP_PLUGIN_DIR;
+        system('unzip -q ' . $zip_file . ' -d "' . $plugins_dir . '"');
+        system('chown -R --preserve-root ' . $uid . ':' . $gid . ' "' . $plugin_dir_path . '"');
+    }
+    print "Activating plugin...\n";
+    global $profiles_dir, $plugin_path, $profiler_installed;
+    if ( ! file_exists($profiles_dir) ) {
+        @mkdir($profiles_dir);
+    }
+    activate_plugin($plugin_path);
+
+    $profiler_installed = file_exists($plugin_path);
+    bootstrap();
+
+    print "Profiler installed!\n\n";
+}
+
+function delete_dir($dirPath) {
+    /*
+        This time, it should avoid an rm -rf / scenario. Thanks for that, PHP.
+    I'm certain that railroading forward with uninitialized variables is more
+    important than letting me know something is broken. If I wanted to code in
+    C, I would.
+
+    Based off the answer to a Overflow question on how to do this. Can't
+    figure out where it went, though.
+    */
+    if (! is_dir($dirPath)) {
+        return False;
+    }
+    if (substr($dirPath, strlen($dirPath) - 1, 1) != '/') {
+        $dirPath .= '/';
+    }
+    $files = glob($dirPath . '*', GLOB_MARK);
+    if ( file_exists($dirPath . '.htaccess') ) {
+        array_push($files, $dirPath . '.htaccess');
+    }
+    foreach ($files as $file) {
+        if (is_dir($file)) {
+            delete_dir($file);
+        } else {
+            unlink($file);
+        }
+    }
+    rmdir($dirPath);
+}
+
+function uninstall_profiler() {
+    global $plugin_path, $plugin_dir_path;
+    print "\nDeactivating plugin...\n";
+    deactivate_plugins($plugin_path);
+    print "Removing files...\n";
+    delete_dir($plugin_dir_path);
+    print "Plugin removed.\n\n";
+}
+
+/*
+Interestingly, the results all go in the uploads folder.
+I'm not really certain that's a good idea, but I'm not inclined to
+edit the profiler code to change it.
+*/
+$uploads_dir = wp_upload_dir();
+
+$profiles_dir = $uploads_dir['basedir'] . '/profiles/';
+$file_name = 'profile';
+
+/*     The following file is where the information collected by the plugin is
+   stored. It is not precisely json, but rather, is several json messages. Each
+   line contains one json message. The plugin provides an interface for parsing
+   this, so we'll use that instead of analyzing it ourselves.
+*/
+$file_path = $profiles_dir . $file_name . '.json';
+
+function set_profiling($bool) {
+    /*
+    Stole this from ./classes/class.p3-profiler-plugin-admin.php,
+    which uses a similar technique but gets its values from posted AJAX.
+    */
+    global $file_name, $file_path;
+    $opts = get_option( 'p3-profiler_options' );
+    if ($bool) {
+        if(!ini_get('allow_url_fopen')) {
+                die("allow_url_fopen must be enabled in the PHP configuration for this script to work.\n");
+        }
+        $opts['profiling_enabled'] = array(
+            'ip'                   =>  '',
+            'disable_opcode_cache' => 'true',
+            'name'                 => $file_name,
+        );
+        # Nuke and pave for a clean profiling.
+        file_put_contents($file_path, '');
+    }
+    else {
+        if ( !empty( $opts ) && array_key_exists( 'profiling_enabled', $opts ) && !empty( $opts['profiling_enabled']['name'] ) ) {
+                $transient   = get_option( 'p3_scan_' . $opts['profiling_enabled']['name'] );
+                file_put_contents( $file_path, $transient );
+                delete_option( 'p3_scan_' . $opts['profiling_enabled']['name'], $transient );
+        }
+        $opts['profiling_enabled'] = false;
+    }
+    update_option( 'p3-profiler_options', $opts );
+
+}
+
+function auto_profile() {
+    /*
+    We need the blog URL to determine if links we harvest from the page later are
+    pointing to the blog itself or out somewhere we don't want to bother.
+    */
+    $url = get_bloginfo($show='url');
+    $nerfed_url = explode("://", $url, 2);
+    $nerfed_url = $nerfed_url[1];
+
+    # Get the page, and turn it into a DOM object for scraping.
+    $response = file_get_contents( $url );
+
+    $doc = new DOMDocument();
+
+    /*
+    This next line gets all the warnings from PHP that the malformed HTML generates.
+    The fact that this works, or even needs to be done this way, bothers me.
+    */
+    $errors = @$doc->loadHTML($response);
+    $links = $doc->getElementsByTagName('a');
+
+    $useful_links = array();
+
+    /*
+    We only want to get links that actually point to other places on the blog and aren't just
+    targets to the same place. WordPress generates mostly absolute paths, so we'll focus on them.
+    We'll set this to a maximum of 8 visits. With some odd internal call, and the one we made
+    earlier, it will total to 10.
+
+    We don't want to be here all day.
+    */
+
+    $max_iterations = 8;
+    $count = 0;
+    # Avoid clusters of similar links skewing the results as easily.
+    shuffle($useful_links);
+    foreach ($links as $link) {
+        if ( $count++ > $max_iterations ) {
+            break;
+        }
+        $link = $link->getAttribute('href');
+        if ( eregi(preg_quote($nerfed_url), $link) or ( (strpos($link, ":") === FALSE) and (strpos($link, "#") === FALSE) ) ) {
+            file_get_contents( $link );
+        }
+    }
+}
+
+function print_array( $array) {
+    foreach ($array as $line) {
+        print $line;
+    }
+}
+
+function save_results($array) {
+    global $uid;
+    $userinfo = posix_getpwuid($uid);
+    $homedir = $userinfo['dir'];
+    $snapshot_folder = $homedir . '/.profile_results';
+    $url = site_url();
+    $domain = preg_replace('#https?://(.*?)/?$#i', '$1', $url);
+    $domain = str_replace('/', ',', $domain);
+    $output_savefile = $snapshot_folder . '/' . $domain . '.' . time();
+    @mkdir($snapshot_folder);
+    if (! $array) {
+        return;
+    }
+    if (file_put_contents($output_savefile, $array)) {
+        print "\nSaved results to: $output_savefile\n\n";
+    } else {
+        print "\nCouldn't save results file: $output_savefile. Please check permissions and try again.\n\n";
+    }
+}
+
+function analyze_results() {
+    global $file_path;
+    if ( (! trim(@file_get_contents($file_path))) or (! file_exists($file_path)) ) {
+        print "\nNo visits have been recorded.\nCheck the user's site to make sure it's actually working and pointing to the right place.\n\n";
+        return;
+    }
+    print "\nAnalyzing results...\n\n";
+    $results = new P3_Profiler_Reader($file_path);
+    $overview = $results->averages;
+
+    # The following items in $overview are values we need to handle specially.
+    $special_numbers = array('memory', 'queries', 'plugin_calls', 'visits',
+                             'plugin_impact', 'expected', 'observed', 'theme');
+
+    $special_dict = array();
+    foreach ($special_numbers as $item ) {
+        $special_dict[$item] = $overview[$item];
+        unset($overview[$item]);
+    }
+
+    $output = array();
+
+    array_push($output, "\n--Profiling Results for " . site_url() . "--\n\n");
+
+    # Bytes to Megabytes
+    $mem_megs = $special_dict['memory'] / 1024 / 1024;
+    # Percentage of total seconds to seconds
+    $profile_time = $special_dict['plugin_impact'] / 100 * $overview['total'];
+    $margin = $special_dict['observed'] - $special_dict['expected'];
+
+    array_push($output,"Data points:\n");
+    array_push($output,sprintf("    %-20s %.4f MB average\n", 'memory usage', $mem_megs));
+    array_push($output,sprintf("    %-20s %d average\n", 'database queries', $special_dict['queries']));
+    array_push($output,sprintf("    %-20s %d average\n", 'plugin calls', $special_dict['plugin_calls']));
+    array_push($output,sprintf("    %-20s %d\n", 'visits', $results->visits));
+
+    array_push($output,"\nTime breakdown:\n");
+    array_push($output,sprintf("    %-20s %.4f seconds average\n", 'Profiler overhead', $profile_time));
+    array_push($output,sprintf("    %-20s %.4f seconds average\n", 'Margin of Error', $margin));
+    foreach ($overview as $name => $time) {
+        array_push($output,sprintf("    %-20s %.4f seconds average\n", $name, $time));
+    }
+
+    array_push($output,"\n");
+
+    $plugins = $results->plugin_times;
+    array_push($output, "Plugins and theme breakdown:\n");
+
+    $plugin_percent = ($special_dict['theme'] / $overview['total'])*100;
+    array_push($output,sprintf("    %-20s %.2f%% %.4f seconds average\n", "theme",$plugin_percent, $special_dict['theme']));
+
+    foreach ($plugins as $name => $time) {
+        $plugin_percent = ($time / $overview['total'])*100;
+        array_push($output,sprintf("    %-20s %5.2f%% %.4f seconds average\n", $name,$plugin_percent, $time));
+    }
+    array_push($output,"\n");
+
+    return $output;
+}
+
+function do_help() {
+print <<<EOF
+
+    wpprofiler is an installer and automated runner for the WordPress 
+profiling plugin.
+
+The following options are available:
+
+-i : Install the profiler plugin.
+-u : Uninstall the profiler plugin.
+-p : Start up the profiler, do an automated scan, and stop the profiler.
+     This will remove the last set of profile data and overwrite it.
+     Implies -r.
+-m : Start up the profiling functionality, but don't automatically scan.
+     This will remove the last set of profile data and overwrite it.
+-r : Retrieve the results from the last scan.
+-d : Disable the profiling functionality. This does not uninstall or
+     deactivate the profiler, but turns off profiling.
+-h : Display this help screen.
+
+    You must run this script in the same directory as your target
+installation's wp-config.php file. The script will automatically setuid and
+setgid to the target uid and gid of that file.
+
+If multiple options are specified, they will run in this order:
+    i, p, r, m, d, u
+
+    The option m cannot be used with d or u. The option h is mutually exculsive
+to all other options.
+
+
+EOF;
+}
+
+function selector($options) {
+    /*
+    Main routing function.
+
+    PHP thought it was a steller idea to make getopt set the values of
+    options passed to it set to false, and then to unset other values. So,
+    I have to explicitly check if an item is set as false, rather than if it
+    is false.
+
+    Unforgivable.
+    */
+    global $plugin_dir_path;
+    if ( ($options['h'] === False) or ( ! $options )) {
+        do_help();
+        exit;
+    }
+    if ($options['i'] === False) {
+        if(file_exists("$plugin_dir_path")) {
+                print "Profiler Plugin already installed. Moving on to the next option.\n";
+        } else {
+                install_profiler();
+        }
+    }
+    global $profiler_installed;
+    if (! $profiler_installed ) {
+        die("\nCannot complete this operation: Plugin not installed.\n\n");
+    }
+
+    global $uid, $gid;
+
+    if ( ! check_ids($uid, $gid) ) {
+        posix_setgid($gid);
+        posix_setuid($uid);
+    }
+
+    if ( ! check_ids($uid, $gid) ) {
+        die("\nCould not set uid/gid to that of wp-config.php! Try using sudo -u\n\n");
+    }
+
+    if (($uid == 0) or ($gid == 0)) {
+        die("\nI will not run as root! Check the ownership on wp-config.php.\n\n");
+    }
+
+    if ($options['p'] === False) {
+        set_profiling(True);
+        print "\nProfiling. Please stand by...\n";
+        auto_profile();
+        set_profiling(False);
+        $results_output = analyze_results();
+        print_array($results_output);
+        save_results($results_output);
+    }
+    if ($options['r'] === False) {
+        $results_output = analyze_results();
+        print_array($results_output);
+        save_results($results_output);
+    }
+    # -r before -m because analyzing right after a manual scan started would
+    # result in nothing.
+    if ($options['m'] === False) {
+        set_profiling(True);
+        print "\n    Profiling activated. Please browse the site a bit to collect data, then use\n";
+        print "the -r option to get the results, and -d to deactivate profiling.\n\n";
+    }
+    if ($options['d'] === False) {
+        set_profiling(False);
+        print "\nProfiling turned off.\n\n";
+    }
+    if ($options['u'] === False) {
+        uninstall_profiler();
+    }
+}
+$options = getopt('hiuprmd');
+selector($options);
+?>

@@ -1,0 +1,493 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife -- (WordPress Main Library)
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash-WP
+#- @subpackage Main
+
+##################################################################
+##################################################################
+#
+# WordPress Specific Init
+#
+
+declare -a SAK_WP_CACHE_FILE # Array to store cache files
+declare -a SAK_WP_CACHE_TYPE # Type lookup array
+
+SAK_WP_INIT=-1      # Software array index (-1 for none)
+SAK_WP_CONFIG=""    # Config location cache
+SAK_WP_DB=""        # Database name
+SAK_WP_HOST=""      # Database hostname
+SAK_WP_PREFIX="wp_" # Table Prefix
+
+SAK_WP_VER=""
+
+SAK_WP_MU=0         # Multisite Toggle
+SAK_WP_MU_SITE=1    # Primary network
+SAK_WP_MU_BLOG=1    # Primary blog
+
+SAK_WP_CACHE=""     # Caching plugin (w3tc or wpsc)
+
+SAK_WP_API_VER=1    # For the plugin search
+
+SAK_WP_IMPORTING=0  # Used to override aspects of resurrection during imports
+
+##################################################################
+##################################################################
+#
+# WordPress Specific Functions
+#
+
+#+ Generates a unique salt for a WP config.
+#| This explicitly skips non-printables, single quotes, and backslashes, but
+#| not other symbols.
+#- @return string 64 character salt.
+sak_wp_make_salt() {
+  tr -d '\0-\40\47\134\177-\377' < /dev/urandom | head -c 64
+}
+
+#+ Generates WP salt configuration lines.
+#- @return string Configuration lines.
+sak_wp_make_salts() {
+  for salt in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT \
+              SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+    printf "define(%-20s%s);\n" "'$salt'," "'$(sak_wp_make_salt)'"
+  done
+}
+
+#+ WP cache file hash.
+#| Returns the corresponding cache file for the specified type.
+#| @param string $type Cache type.
+#- @return string|bool Cache file path. False if type not found.
+sak_wp_cache_file() {
+  local t="$1" type res ret
+
+  [[ "$SAK_WP_INIT" -ge "0" ]] || return 1
+  for type in "${!SAK_WP_CACHE_TYPE[@]}"; do
+    [[ "${SAK_WP_CACHE_TYPE[$type]}" == "${t}" ]] &&
+      echo "${SAK_WP_CACHE_FILE[$type]}" && return 0
+  done
+  return 1
+}
+
+#+ Cache config settings from an installation.
+#| sak_wp_cache_config INDEX [UPDATE]
+#| @param int $index    Software install index.
+#| @param bool $update  Force an update (ignore cache).
+#- @return bool True on success. False otherwise.
+sak_wp_cache_config() {
+  local i="$1" ms re uppath vuln soft path ver
+
+  # We don't bother doing this for the same ID unless an update is forced
+  [[ -z "$2" && "$SAK_WP_INIT" -eq "$i" ]] && return 0
+
+  SAK_WP_INIT=-1      # Software array index (-1 for none)
+  SAK_WP_CONFIG=""    # Config location cache
+  SAK_WP_DB=""        # Database name
+  SAK_WP_HOST=""      # Database hostname
+  SAK_WP_PREFIX="wp_" # Table Prefix
+  SAK_WP_MU=0         # Multisite Toggle
+
+  SAK_WP_VER=""
+
+  SAK_WP_MU_SITE=1    # Primary network
+  SAK_WP_MU_BLOG=1    # Primary blog
+
+  SAK_WP_CACHE=""     # Caching plugin (w3tc or wpsc)
+
+  SAK_WP_CACHE_FILE=() # Array to store cache files
+  SAK_WP_CACHE_TYPE=() # Lookup array
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  if [[ "$soft" != "wordpress" ]]; then
+    sak_fatal_backtrace $SAK_ERR_UNK "Unexpectedly detected $soft instead of WordPress. Please file a bug report."
+  fi
+
+  SAK_WP_VER="$ver"
+
+  # Check for wp-config.php
+  # WP does this same sort of check in PHP
+  if [[ ! -f "$path/wp-config.php" ]]; then
+    uppath="${path%%/}"; uppath="$(dirname $uppath)"
+    if [[ -f "$uppath/wp-config.php" && ! -f "$uppath/wp-settings.php" ]]; then
+      SAK_WP_CONFIG="$uppath/wp-config.php"
+    else
+      sak_wait_message 10 "Error" "Could not find or parse config file for this installation."
+      return 1
+    fi
+  else
+    SAK_WP_CONFIG="$path/wp-config.php"
+  fi
+
+  SAK_WP_DB="$(sak_get_php_opt "$SAK_WP_CONFIG" "DB_NAME")"
+
+  # TODO: Check that DB exists locally?
+  # TODO: Support for remote hosts?
+  if [[ -z "$SAK_WP_DB" ]]; then
+    if [[ "$SAK_CLI_MODE" -eq "0" ]]; then
+      sak_waitbox 5 "Error" "Could not determine database at $path"
+    else
+      sak_fatal $SAK_ERR_INT_CNF "Could not determine database at ${path}. Make sure the config and db are correct."
+    fi
+    return 1
+  fi
+
+  SAK_WP_HOST="$(sak_get_php_opt "$SAK_WP_CONFIG" "DB_HOST")"
+
+  re="^(localhost|127.0.0.1|)$"
+  if [[ "$SAK_WP_HOST" =~ $re ]]; then
+    SAK_WP_HOST=""
+  fi
+
+  SAK_WP_PREFIX="$(sak_get_php_opt -v "$SAK_WP_CONFIG" "table_prefix")"
+
+  ms="$(sak_get_php_opt "$SAK_WP_CONFIG" "MULTISITE")"
+  re="^(1|true)$"
+  shopt -s nocasematch
+  if [[ "$ms" =~ $re ]]; then
+    SAK_WP_MU=1
+
+    # Primary network (site)
+    SAK_WP_MU_SITE="$(sak_get_php_opt "$SAK_WP_CONFIG" "SITE_ID_CURRENT_SITE")"
+
+    # Primary blog
+    SAK_WP_MU_BLOG="$(sak_get_php_opt "$SAK_WP_CONFIG" "BLOG_ID_CURRENT_SITE")"
+
+    # Validate our findings
+    re='^[0-9]+$'
+    if [[ ! "$SAK_WP_MU_SITE" =~ $re || ! "$SAK_WP_MU_SITE" =~ $re ]]; then
+      # TODO: Error
+      SAK_WP_MU=0
+
+      SAK_WP_MU_SITE=1    # Primary network
+      SAK_WP_MU_BLOG=1    # Primary blog
+    fi
+  fi
+  shopt -u nocasematch
+
+  SAK_WP_INIT="$i"
+  return 0
+}
+
+#+ Cache WordPress data.
+#| @param int $index    Software install index.
+#| @param int $type     Data type.
+#- @return string|bool  Cache file path. False on failure.
+sak_wp_cache_data() {
+  local i="$1" type="$2" n t vuln soft path ver err cfile new=0
+
+  case "$type" in
+    basics) t="BASICS";;  counts)   t="COUNTS" ;; cron)   t="CRON"  ;;
+    users)  t="USERS" ;;  plugins)  t="PLUGINS";; themes) t="THEMES";;
+    *) sak_fatal_backtrace $SAK_ERR_UNK "Invalid cache type: $type" ;;
+  esac
+
+  sak_wp_cache_config "$i" || return 1
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  # Check if we can re-use a cache file for this type
+  cfile="$(sak_wp_cache_file "$t")"
+  [[ "$?" -ne "0" ]] && cfile="$(sak_mkcache)" && new=1
+
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -o "$cfile" --root \
+    --db "$SAK_WP_DB" --prefix "$SAK_WP_PREFIX" --path "$path" --get "$type")"
+
+  if [[ -n "$err" ]]; then
+    sak_wait_message 5 "Error" "$err" 5 35
+    return 1
+  fi
+
+  if [[ "$new" -eq "1" ]]; then
+    n="${#SAK_WP_CACHE_FILE[@]}"
+    SAK_WP_CACHE_FILE[$n]="$cfile"
+    SAK_WP_CACHE_TYPE[$n]="$t"
+  fi
+  return 0
+}
+
+#+ Activate and Deactivate plugins.
+#| Arguments are for specifying which are to be on -- plugins that are already
+#| enabled will stay as such, plugins that are not enabled, will be enabled, and
+#| plugins that are not listed will be deactivated.
+#| @param int $index    Software install index.
+#| @param int $module... List of module IDs that are to be active.
+#- @return bool True on success. False otherwise.
+sak_wp_set_plugins() {
+  local i="$1" n=0 index owner path plugin ret script args=() enabled=() \
+        vuln soft path ver
+  shift
+
+  # Indexes are off-by-one (+1) to be human readable in dialog
+  for index; do
+    index=${index//\"/}
+    let "index--"
+    enabled[$index]=1
+  done
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  sak_wp_cache_data "$i" plugins || return 1
+  cfile="$(sak_wp_cache_file PLUGINS)"
+  while IFS=$'\x1E' read -ra plugin; do
+    [[ "${plugin[0]}" == "0" && "${enabled[$n]}" == "1" ]] &&
+      args[$n]="+${plugin[1]}" # Enable it
+    [[ "${plugin[0]}" == "1" && "${enabled[$n]}" != "1" ]] &&
+      args[$n]="-${plugin[1]}" # Disable it
+    let "n++"
+  done < "$cfile"
+
+  [[ "${#args[@]}" -eq "0" ]] &&
+    sak_waitbox 5 "Warning" "No plugins to toggle!" && return 1
+
+  owner="$(stat -c %U "$path")"
+  script="$(sak_mktmp "$owner")"
+
+  cat "$SAK_MOD_DIR/soft/wordpress/gateway.php" > "$script"
+
+  /usr/bin/sudo -u "$owner" "$SAK_PHP" -q "$script" "$path" plugin "${args[@]}"
+  ret="$?"
+
+  rm -f "$script"
+  if [[ "$ret" -gt "0" ]]; then
+    sak_fatal_backtrace $SAK_ERR_SUB_ERR "Unexpected error running sub-command to toggle plugins."
+  fi
+}
+
+#+ Download a plugin via slug and version
+#| sak_wp_plugins_download SLUG VER
+#| @param string $slug    Plugin identifier slug.
+#| @param string $version Plugin version to install.
+#| @param string $url     Optional. Plugin download from this URL.
+#- @return bool True on success. False otherwise.
+sak_wp_plugins_download() {
+  local slug="$1" ver="$2" url="$3" cfile fail
+
+  cfile="$(sak_cache_file PLUGIN-WP_${ver}_${slug})"
+  if [[ "$?" -ne "0" ]]; then
+    cfile="$(sak_mkcache)"
+    new=1
+  else
+    echo "$cfile"
+    return 0
+  fi
+
+  if [[ -z "$url" ]]; then
+    printf -v request "http://downloads.wordpress.org/plugin/%s.%s.zip" \
+      "$slug" "$ver"
+    # Redirect this output to stderr so we don't interfere with the cache result
+    sak_message "Downloading" "Attempting to download $request" 6 70 >&3
+    sak_download "$request" "$cfile" || fail=1
+
+    # If first download fails, try again without the version
+    if [[ "$fail" -eq "1" ]]; then
+      sak_message -v 1 "Downloading" "Could not download, trying alternate." >&3
+      printf -v request "http://downloads.wordpress.org/plugin/%s.zip" \
+        "$slug"
+      sak_message "Downloading" "Attempting to download $request" 6 70 >&3
+      sak_download "$request" "$cfile" || return 1
+    fi
+  else
+    sak_message "Downloading" "Attempting to download $url" 6 70 >&3
+    sak_download "$url" "$cfile" || return 1
+  fi
+
+  if [[ "$new" -eq "1" ]]; then
+    n=${#SAK_WP_CACHE_FILE[@]}
+    SAK_CACHE_FILE[$n]="$cfile"
+    SAK_CACHE_TYPE[$n]="PLUGIN-WP_${ver}_${slug}"
+  fi
+
+  echo "$cfile"
+  return 0
+}
+
+#+ Installs a plugin from an install slug (from search)
+#| sak_wp_plugins_install INDEX SLUG [CACHEFILE]
+#| @param int $index    Software install index.
+#| @param string $slug  Plugin slug.
+#| @param string $sfile Search cache to use instead of searching again.
+#| @param string $pfile Use this file as plugin source, skip slug search.
+#- @return bool True on success. False otherwise.
+sak_wp_plugins_install() {
+  local i="$1" slug="$2" sfile="$3" cfile="$4" u sfile result request path \
+        re="^[0-9]{2}:[0-9]{2}$"
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  if [[ -z "$cfile" && -z "$sfile" ]]; then
+    sfile="$(sak_mkcache)"
+    [[ "$SAK_QUIET" -lt "1" ]] &&
+      sak_message "Information" "Searching for slug \`$slug'"
+    printf -v request "http://sak.dev.gatorsec.net/software/wp-plugin-search.php?api=%d&s=%s" "$SAK_WP_API_VER" "$slug"
+    sak_download "$request" "$sfile"
+  elif [[ -n "$cfile" ]]; then
+    sfile="$(sak_mkcache)"
+    printf 'Dummy\x1E1\x1Edummy-slug\x1Efile:///dev/zero\n' > "$sfile"
+    slug="dummy-slug"
+  fi
+
+  while IFS=$'\x1E' read -ra result; do
+    if [[ "${result[2]}" == "$slug" ]]; then
+      if [[ -z "$cfile" ]]; then
+        [[ "$SAK_QUIET" -lt "1" ]] &&
+          sak_message "Information" "Matched slug to plugin '${result[0]}' version ${result[1]}" 6 55
+        cfile="$(sak_wp_plugins_download "$slug" "${result[1]}")" ||
+          sak_fatal_backtrace $SAK_ERR_UNK "Error downloading plugin."
+      fi
+
+      [[ "$SAK_QUIET" -lt "1" ]] &&
+        sak_message "Installing" "Download complete, installing..."
+
+      u="$(stat -c "%u %U" "$path")"
+      owner="${u% *}"
+      ownername="${u#* }"
+      group="${SAK_GIDS[$owner]}"   # Use user's primary gid as group
+
+      # Check that we're not doing something crazy
+      if (( SAK_WP_IMPORTING == 1 )) || [[ "$owner" -ge "500" && "${SAK_UIDS[$owner]}" != "nobody" && \
+            "$group" -ge "500" ]]
+      then
+        # This bit is simply to make sure the directories within the zip file are
+        # not already there. We don't overwrite anything.
+        list="$(unzip -l "$cfile")"
+        while IFS=' ' read -ra entry; do
+          [[ ! "${entry[3]}" =~ "/" ]] && continue # File has no subdirectory, so skip the check
+          if [[ "${entry[2]}" =~ $re ]]; then
+            dir="wp-content/plugins/${entry[3]%%/*}"
+            if [[ -n "$dir" && -e "${path}/${dir}" ]]; then
+              sak_wait_message 10 "Error" "Plugin directory \`$dir' already exists. Refusing to overwrite."
+              return 2
+            fi
+          fi
+        done <<< "$list"
+
+        # The actual extraction
+        umask 0022
+        unzip -nq "$cfile" -d "$path/wp-content/plugins/" ||
+          sak_fatal_backtrace $SAK_ERR_SUB_ERR "Plugin extraction failed!"
+        umask 0077
+
+        # Ownership
+        while IFS=' ' read -ra entry; do
+          [[ "${entry[2]}" =~ $re ]] &&
+            chown "$ownername:$group" "$path/wp-content/plugins/${entry[3]}"
+        done <<< "$list"
+        return 0
+      else
+        sak_fatal_backtrace $SAK_ERR_SUB_CNF "Permissions or owner of current directory is invalid."
+      fi
+    fi
+  done < "$sfile"
+
+  sak_message "Error" "No matching results returned for install slug."
+  return 2
+}
+
+#+ Get cache settings.
+#| sak_wp_cache_cache INDEX
+#| @param int $index    Software install index.
+#- @return int Zero (0) on success. Non-zero on failure.
+sak_wp_cache_cache() {
+  local i="$1" n alias aliases err names cfile pfile plugin tfile types new=0 \
+        vuln soft path ver
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  SAK_WP_CACHE=""
+  sak_wp_cache_data "$i" "plugins" || return 1
+
+  pfile="$(sak_wp_cache_file PLUGINS)"
+  [[ "$?" -ne "0" ]] && return 1
+
+  while IFS=$'\x1E' read -ra plugin; do
+    if [[ "${plugin[0]}" == "1" ]]; then
+      case "${plugin[3]}" in
+#        "W3 Total Cache") SAK_WP_CACHE="w3tc"; break ;; # Bugfix for 14998, disable W3TC check
+        "WP Super Cache") SAK_WP_CACHE="wpsc"; break ;;
+      esac
+    fi
+  done < "$pfile"
+
+  [[ -z "$SAK_WP_CACHE" ]] && return 2
+
+  # Check if we can re-use a cache file for this type
+  cfile="$(sak_wp_cache_file CACHE)"
+  if [[ "$?" -ne "0" ]]; then
+    cfile="$(sak_mkcache)"
+    new=1
+  fi
+
+  if [[ "$SAK_WP_CACHE" == "w3tc" ]]; then
+    names=(
+      "pgcache.enabled" "pgcache.engine" "dbcache.enabled" "dbcache.engine"
+      "dbcache.lifetime" "objectcache.enabled" "objectcache.engine"
+      "objectcache.lifetime" "minify.enabled" "minify.engine" "minify.lifetime"
+      "cdn.enabled" "cloudflare.enabled" "browsercache.enabled")
+    aliases=(
+      "pgcache" "pgengine" "dbcache" "dbengine" "dlifetime" "objcache"
+      "objengine" "olifetime" "minify" "mengine" "mlifetime" "cdn" "cloudflare"
+      "browser")
+
+    if [[ -f "$path/wp-content/w3-total-cache-config-preview.php" ]]; then
+      printf "enabled\x1Efalse\npreview\x1Etrue\n" > "$cfile" # Preview mode enabled
+    elif [[ -f "$path/wp-content/w3-total-cache-config.php" ]]; then
+      printf "enabled\x1Etrue\npreview\x1Efalse\n" > "$cfile" # Enabled & Preview mode disabled
+      for n in "${!names[@]}"; do
+        alias="${aliases[$n]}"
+        value="$(sak_get_php_opt -a "$path/wp-content/w3-total-cache-config.php" "${names[$n]}")"
+        printf '%s\x1E%s\n' "$alias" "$value"
+      done >> "$cfile"
+    else
+      printf "enabled\x1Efalse\n" > "$cfile"  # Not enabled & Preview mode disabled
+    fi
+  elif [[ "$SAK_WP_CACHE" == "wpsc" ]]; then
+    names=(
+      "cache_enabled" "wp_cache_mod_rewrite" "super_cache_enabled"
+      "cache_compression" "wp_supercache_304" "cache_max_time"
+      "wp_cache_not_logged_in")
+    aliases=(
+      "enabled" "rewrite" "legacy" "compress" "browser" "lifetime" "usercache")
+    types=("-" "b" "bi" "b" "b" "-" "bi")
+
+    if [[ -f "$path/wp-content/wp-cache-config.php" ]]; then
+      for n in "${!names[@]}"; do
+        alias="${aliases[$n]}"
+        value="$(sak_get_php_opt -v "$path/wp-content/wp-cache-config.php" "${names[$n]}")"
+        case "${types[$n]}" in
+          b)    # Boolean
+            [[ "$value" == "1" || "$value" == "true" ]] && value="true" || value="false" ;;
+          bi)   # Boolean (inverse)
+            [[ "$value" == "1" || "$value" == "true" ]] && value="false" || value="true" ;;
+          *) ;; # As-is
+        esac
+        printf '%s\x1E%s\n' "$alias" "$value"
+      done > "$cfile"
+    else
+      printf "enabled\x1Efalse\n" > "$cfile"
+    fi
+  else
+    return 2 # shouldn't even make it here
+  fi
+
+  if [[ "$new" -eq "1" ]]; then
+    n=${#SAK_WP_CACHE_FILE[@]}
+    SAK_WP_CACHE_FILE[$n]="$cfile"
+    SAK_WP_CACHE_TYPE[$n]="CACHE"
+  fi
+  return 0
+}
+
+#+ Convert a db schema version to possible WP versions
+#| @param int $schema Schema version
+#- @return string Space delimited versions matching schema. Greatest first.
+sak_wp_db_lookup() {
+  local ver="$1" wpver \
+        url="http://sak.dev.gatorsec.net/software/installs/wordpress/ver_lookup.php?schema=%s"
+
+  printf -v url "$url" "$ver"
+  wpver="$(sak_download_pipe "$url")" || exit $SAK_ERR_INT_CMD
+
+  printf '%s' "$wpver"
+}

@@ -1,0 +1,27 @@
+--- php-5.6.0/ext/zip/lib/zipint.h      2014-09-16 06:00:15.483012112 -0600
++++ php-5.6.0.orig/ext/zip/lib/zipint.h 2014-09-16 05:46:36.238065494 -0600
+@@ -108,15 +108,15 @@
+ #endif
+ #endif
+ 
+-#if SIZEOF_OFF_T == 8
++//#if SIZEOF_OFF_T == 8
+ #define ZIP_OFF_MAX ZIP_INT64_MAX
+-#elif SIZEOF_OFF_T == 4
+-#define ZIP_OFF_MAX ZIP_INT32_MAX
+-#elif SIZEOF_OFF_T == 2
+-#define ZIP_OFF_MAX ZIP_INT16_MAX
+-#else
+-#error unsupported size of off_t
+-#endif
++//#elif SIZEOF_OFF_T == 4
++//#define ZIP_OFF_MAX ZIP_INT32_MAX
++//#elif SIZEOF_OFF_T == 2
++//#define ZIP_OFF_MAX ZIP_INT16_MAX
++//#else
++//#error unsupported size of off_t
++//#endif
+ 
+ #ifndef SIZE_MAX
+ #if SIZEOF_SIZE_T == 8
+

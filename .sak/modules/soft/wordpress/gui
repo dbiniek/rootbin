@@ -1,0 +1,718 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife -- WordPress GUI Library
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash-WP
+#- @subpackage GUI
+
+##################################################################
+##################################################################
+#
+# WordPress Specific Menus
+#
+
+#+ Main WordPress menu.
+#| sak_menu_wp_opts INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_opts() {
+  local i="$i" RET
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+  sak_wp_cache_config "$i" || return 1
+  RET=`"${SAK_DIALOG[@]}" \
+    --cancel-label "Back" \
+    --title "WordPress Operations" \
+    --menu "WordPress $ver\n$path" \
+    0 55 0 \
+    E "Edit Basics..." \
+    U "Edit Users..." \
+    P "Edit Plugins..." \
+    I "Install Plugins..." \
+    C "Create Backups..." \
+    R "Replace Core Install Files" \
+    D "Show File Differences" \
+    O "Show Orphaned Files"`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  while :; do
+    case "$RET" in
+      E) sak_menu_wp_edit "$i" || break ;;
+      U) sak_menu_wp_users "$i" || break ;;
+      P) sak_menu_wp_plugins "$i" || break ;;
+      I) sak_menu_wp_plugins_install "$i" || break ;;
+      C) sak_menu_backups "$i" "$SAK_WP_DB" || break ;;
+      R) sak_menu_core_replace "$i" || break ;;
+      D) sak_menu_core_diff "$i" || break ;;
+      O) sak_menu_core_orphans "$i" || break ;;
+      *) break ;;
+    esac
+  done
+  return 0
+}
+
+#+ Allows editing of basic blog settings.
+#| sak_menu_wp_edit INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_edit() {
+  local i="$1" modified=0 save found info cfile RET IFS=$'\t\n' \
+        blogname siteurl homeurl stylesheet template theme permalink temp \
+        owner script vuln soft path ver rewrite=0 cache=() ch=() \
+        back=$'--cancel-label\tBack' re="(%post_id%|%postname%)"
+
+  sak_wp_cache_data "$i" basics || return 1
+  cfile="$(sak_wp_cache_file BASICS)"
+  while IFS=$'\x1E' read -ra basic; do
+    case "${basic[0]}" in
+      blogname)             blogname="${basic[1]}"   ;;
+      siteurl)              siteurl="${basic[1]}"    ;;
+      home)                 homeurl="${basic[1]}"    ;;
+      stylesheet)           stylesheet="${basic[1]}" ;;
+      template)             template="${basic[1]}"   ;;
+      current_theme)        theme="${basic[1]}"      ;;
+      permalink_structure)  permalink="${basic[1]}"  ;;
+      db_version)           dbversion="${basic[1]}"  ;;
+    esac
+  done < "$cfile"
+
+  [[ "SAK_WP_MU" -eq "1" ]] && mu=" (\Z3MULTISITE\Zn)"
+
+  [[ -f "$path/wp-content/advanced-cache.php" ]]  && cache[0]="File"
+  [[ -f "$path/wp-content/object-cache.php" ]]    && cache[1]="Object"
+  [[ -f "$path/wp-content/db.php" ]]              && cache[2]="DB"
+
+  while :; do
+    if [[ "$modified" -eq "1" ]]; then
+      save=$'--extra-label\tSave\t--extra-button\t--help-label\tReset\t--help-button'
+      back=$'--cancel-label\tCancel'
+    fi
+
+    printf -v info "%sBlog Name\Zn: \Zb%s\Zn\n\n%sSite URL\Zn: \Z4\Zu%s\Zn
+%sHome URL\Zn: \Z4\Zu%s\Zn\n\nDatabase: \Zb%s\Zn%s\nPrefix: \Zb%s\Zn\n
+%sTheme\Zn: \Zb%s\Zn\n\n%sPermalinks\Zn: \Zb%s\Zn\n\nPossible Caching: \Zb%s\Zn" \
+\
+"${ch[0]}" "$blogname" \
+"${ch[1]}" "$siteurl" \
+"${ch[2]}" "$homeurl" \
+           "$SAK_WP_DB" "$mu" \
+           "$SAK_WP_PREFIX" \
+"${ch[3]}" "$theme" \
+"${ch[4]}" "${permalink:-\ZB\Z1NONE SET}" \
+           "${cache[*]:-NONE}"
+
+    [[ -n "$save" ]] && info="$info"$'\n\n'"\Z1* Unsaved changes!\Zn"
+
+    RET=`"${SAK_DIALOG[@]}" \
+      $save $back \
+      --ok-label "Select" \
+      --title "Edit Basic WordPress Settings" \
+      --menu "$info" \
+      0 0 0 \
+      B "Edit Blog Name..." \
+      S "Edit Site URL..." \
+      H "Edit Home URL..." \
+      U "Edit Site and Home URL..." \
+      T "Select theme..." \
+      R "Reset Theme to Default..." \
+      P "Edit Permalink Markup..."`
+
+    case "$?" in
+      0) ;; # Handle a menu item
+      2) return 0 ;; # Reset
+      3) # Save
+        cfile="$(sak_wp_cache_file BASICS)"
+        printf "blogname\t%s\nsiteurl\t%s\nhome\t%s\nstylesheet\t%s\ntemplate\t%s\ncurrent_theme\t%s\npermalink_structure\t%s" \
+          "$blogname" "$siteurl" "$homeurl" "$stylesheet" "$template" "$theme" "$permalink" \
+          > "$cfile"
+
+        err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -i "$cfile" \
+          --root --db "$SAK_WP_DB" --prefix "$SAK_WP_PREFIX" --set basics)"
+
+        if [[ -n "$err" ]]; then
+          sak_wait_message 5 "Error" "$err" 5 35
+          return 1
+        fi
+
+        # Update rewrite rules only if not multisite
+        if [[ "$rewrite" -eq "1" && "$SAK_WP_MU" -ne "1" ]]; then
+          IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+          owner="$(stat -c %U "$path")"
+          script="$(sak_mktmp "$owner")"
+
+          cat "$SAK_MOD_DIR/soft/wordpress/gateway.php" > "$script"
+          err="$(/usr/bin/sudo -u "$owner" "$SAK_PHP" -q "$script" "$path" rewrite STDOUT 2>&1)"
+
+          rm -f "$script" # delete script
+
+          if [[ -n "$err" ]]; then
+            echo
+            sak_wait_message 5 "Error" "$err" 5 35
+            sak_fatal_backtrace $SAK_ERR_SUB_ERR "Error adjusting permalink settings. Resolve any errors shown above or apply manually."
+          fi
+        fi
+        break ;;
+      127)
+        sak_sigwincheck && continue
+        sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+      255) sak_escaped ;;
+      *) return 1 ;;
+    esac
+
+    case "$RET" in
+      B) temp="$(sak_menu_wp_edit_item "blogname" "$blogname")" &&
+         ch[0]="\Z1" && blogname="$temp" ;;
+      S) temp="$(sak_menu_wp_edit_item "siteurl" "$siteurl")" &&
+         ch[1]="\Z1" && siteurl="$temp" ;;
+      H) temp="$(sak_menu_wp_edit_item "homeurl" "$homeurl")" &&
+         ch[2]="\Z1" && homeurl="$temp" ;;
+      U) temp="$(sak_menu_wp_edit_item "url" "$siteurl")" &&
+         ch[1]="\Z1" && siteurl="$temp" &&
+         ch[2]="\Z1" && homeurl="$temp" ;;
+      P) temp="$(sak_menu_wp_edit_item "permalink" "$permalink")"
+        stat="$?" # This needs special handling:
+        if [[ "$stat" -eq "0" ]]; then
+          [[ -n "$temp" && ! "$temp" =~ $re ]] &&
+            sak_wait_message 10 "Error" "Invalid permalink code. Permalinks must be blank, contain %post_id%, or %postname%." &&
+            continue;
+          ch[4]="\Z1" && permalink="$temp"
+          rewrite=1
+        fi ;;
+      R) temp="$(sak_menu_wp_reset_theme "$i" "$SAK_WP_VER")" &&
+         temp=($temp) &&
+         stylesheet="${temp[0]}" &&
+         template="${temp[1]}" &&
+         ch[3]="\Z1" && theme="${temp[2]}" ;;
+      T) temp="$(sak_menu_wp_themes "$i")" &&
+         temp=($temp) &&
+         stylesheet="${temp[0]}" &&
+         template="${temp[1]}" &&
+         ch[3]="\Z1" && theme="${temp[2]}" ;;
+    esac
+    [[ "$?" -eq "0" ]] && modified=1
+  done
+
+  return 0
+}
+
+#+ Edit menu for specific WP settings.
+#| sak_menu_wp_edit_item TYPE [DEFAULT]
+#| @param string $type    Item type.
+#| @param string $default Optional. Default text for this item.
+#- @return string Customized item text.
+sak_menu_wp_edit_item() {
+  local type="$1" default="$2"
+
+  case "$type" in
+    blogname)
+      title="Blog Name"
+      text="This is for the title of the blog." ;;
+    siteurl)
+      title="Site URL"
+      text="This is the root URL of the blog." ;;
+    homeurl)
+      title="Home URL"
+      text="This is the location on the HOME button.\nMay differ from Site URL." ;;
+    url)
+      title="Site & Home URL"
+      text="This syncs both the Site and Home URLs.\nDefault is Site URL." ;;
+    permalink)
+      title="Permalink"
+      # http://codex.wordpress.org/Using_Permalinks#Structure_Tags
+      # http://goo.gl/ZFgK6
+      text="See \Z4\Zuhttp://goo.gl/ZFgK6\Zn for info." ;;
+    username)
+      title="Change Username"
+      text="Enter the user's new login name." ;;
+    displayname)
+      title="Change Display Name"
+      text="Enter the user's new display-only name." ;;
+    pluginsearch)
+      title="Plugin Search"
+      text="Enter search terms." ;;
+  esac
+
+  # Workaround for being called in a subshell
+  trap 'SAK_SIGWINCH="${SECONDS}"' SIGWINCH
+
+  while :; do
+    RET=`"${SAK_DIALOG[@]}" \
+      --title "$title" \
+      --inputbox "$text" \
+      0 0 "$default"`
+
+    case "$?" in
+      0) echo $RET; break ;;
+      127)
+        sak_sigwincheck && continue
+        sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+      255) sak_escaped ;;
+      *) return 1 ;;
+    esac
+  done
+
+  return 0
+}
+
+#+ Checks for and resets the default theme.
+#| sak_menu_wp_reset_theme INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_reset_theme() {
+  local i="$1" ver major minor
+  local have_d=0 have_tt=0 have_te=0
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  major="${ver%%.*}"
+  minor="${ver##$major.}"
+  minor="${minor%%.*}"
+
+  sak_wp_cache_data "$i" themes || return 1
+  cfile="$(sak_wp_cache_file THEMES)"
+
+  while IFS=$'\x1E' read -ra theme; do
+    case "${theme[1]}" in
+      default)      have_d=1  ;;
+      twentyten)    have_tt=1 ;;
+      twentyeleven) have_te=1 ;;
+    esac
+  done < "$cfile"
+
+  # "default"      < 3.0
+  # "twentyten"    >= 3.0
+  # "twentyeleven" >= 3.2
+  if [[ "$major" -lt "3" && "$have_d" -eq "1" ]]; then
+    echo $'default\tdefault\tWordPress Default'
+    return 0
+  else
+    if [[ "$minor" -ge "2" && "$have_te" -eq "1" ]]; then
+      echo $'twentyeleven\ttwentyeleven\tTwenty Eleven'
+      return 0
+    else
+      if [[ "$have_tt" -eq "1" ]]; then
+        echo $'twentyten\ttwentyten\tTwenty Ten'
+        return 0
+      fi
+    fi
+  fi
+  # Fallthrough, we couldn't find a default
+  if [[ "$SAK_CLI_MODE" -eq "1" ]]; then
+    sak_fatal $SAK_ERR_INT_CMD "Could not reset theme, defaults could not be found. Please install one."
+  else
+    sak_waitbox 10 "Error" "Could not find a valid default theme. Please reinstall one."
+  fi
+
+  return 1
+}
+
+#+ Dialog to select a user role
+#| sak_menu_wp_select_role [TITLE] [TEXT]
+#| @param string $title Title of dialog. Default = "Change User Role"
+#| @param string $message Dialog message. Default = "Select the user's new role below."
+#- @return string New role name.
+sak_menu_wp_select_role() {
+  local title="$1" text="$2"
+
+  if [[ -z "$title" ]]; then
+    title="Change User Role"
+  fi
+
+  if [[ -z "$text" ]]; then
+    text="Select the user's new role below."
+  fi
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --title "$title" \
+    --menu "$text" \
+    0 0 0 \
+    A "Administrator" \
+    E "Editor" \
+    U "Author" \
+    C "Contributor" \
+    S "Subscriber"`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  # This wouldn't be needed if everyone would upgrade to bash 4.x :(
+  case "$RET" in
+    A) echo "administrator" ;;
+    E) echo "editor" ;;
+    U) echo "author" ;;
+    C) echo "contributor" ;;
+    S) echo "subscriber" ;;
+    *) echo "subscruber" ;;
+  esac
+
+  return 0
+}
+
+#+ List all users found in a specific WordPress install.
+#| sak_menu_wp_users INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_users() {
+  local i="$1" n=0 cfile users=()
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  sak_wp_cache_data "$i" users || return 1
+
+  cfile="$(sak_wp_cache_file USERS)"
+  while IFS=$'\x1E' read -ra user; do
+    users[((n++))]="${user[0]}"
+    users[((n++))]="${user[1]}"
+  done < "$cfile"
+
+  if [[ -z "$users" ]]; then
+    sak_wait_message 5 "Error" "No valid users found!"
+    return 1
+  fi
+
+  n=0 # Auto...
+  RET=`"${SAK_DIALOG[@]}" \
+    --ok-label "Select" \
+    --cancel-label "Back" \
+    --title "User List" \
+    --menu "$(sak_soft_name ${soft}) $ver\n$path" \
+    0 50 $n \
+    "${users[@]}"`
+
+  case "$?" in
+    0) ;;
+    3) # Rescan
+      sak_wp_cache_data "$i" users
+      return 0
+      ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  sak_menu_wp_user_edit "$RET"
+
+  return 0
+}
+
+#+ Edit a WordPress user.
+#| sak_menu_wp_user_edit INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_user_edit() {
+  local i="$1" f="" cfile modified=0 save size=9 temp RET \
+        u_id u_login u_name u_email u_reg u_stat u_cap \
+        opts=('--cancel-label' 'Back')
+
+  cfile="$(sak_wp_cache_file USERS)" || return 1
+
+  while IFS=$'\x1E' read -r u_id u_login u_name u_email u_reg u_stat u_cap; do
+    [[ "$u_id" -eq "$i" ]] && f=1 && break
+  done < "$cfile"
+
+  [[ -z "$f" ]] &&
+    sak_wait_message 5 "User" "User was not found." &&
+    return 1
+
+  while :; do
+    printf -v info "UID  : %s\nLogin: %s\nName : %s\nEmail: %s\nReg'd: %s\nStat : %s\nRole : %s" \
+      "$u_id" "$u_login" "$u_name" "$u_email" "$u_reg" "$u_stat" "$u_cap"
+
+    if [[ "$modified" -eq "1" ]]; then
+      opts=('--extra-label' 'Save' '--extra-button' '--cancel-label' 'Cancel')
+      info+=$'\n\n\Z1* Unsaved changes!\Zn'
+      size=11
+    fi
+
+    # TODO: Finish password stuffs...
+    RET=`"${SAK_DIALOG[@]}" \
+      "${opts[@]}" \
+      --title "Edit User: \Zu$u_login\Zn" \
+      --menu "$info" \
+      0 45 "$size" \
+      U "Change Username..." \
+      R "Change Role..." \
+      N "Change Display Name..."`
+
+    case "$?" in
+      0) ;;
+      3) # Save
+        cfile="$(sak_wp_cache_file USERS)"
+        # We completely overwrite the file as we will pull and cache it after
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$u_id" "$u_login" "$u_name" "$u_email" "$u_reg" "$u_stat" "$u_cap" \
+          > "$cfile"
+
+        err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -i "$cfile" \
+          --root --db "$SAK_WP_DB" --prefix "$SAK_WP_PREFIX" --set users)"
+
+        if [[ -n "$err" ]]; then
+          sak_wait_message 5 "Error" "$err" 5 35
+          return 1
+        fi
+
+        break ;;
+      127)
+      sak_sigwincheck && continue
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+      255) sak_escaped ;;
+      *) return 1 ;;
+    esac
+
+    case "$RET" in
+#      P) sak_menu_wp_user_pass "$1" && break ;;
+      U) temp="$(sak_menu_wp_edit_item "username" "$u_login")" &&
+         u_login="$temp";;
+      R) temp="$(sak_menu_wp_select_role)" &&
+         u_cap="$temp";;
+      N) temp="$(sak_menu_wp_edit_item "displayname" "$u_name")" &&
+         u_name="$temp";;
+    esac
+    if [[ "$?" -eq "0" ]]; then
+      modified=1
+    fi
+  done
+
+  return 0
+}
+
+#+ Change a user's password.
+#| sak_menu_wp_user_pass INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_user_pass() {
+  local i="$1" f info RET IFS=$'\t' \
+        u_id u_login u_name u_email u_reg u_stat u_cap
+
+  cfile="$(sak_wp_cache_file USERS)" || return 1
+
+  while IFS=$'\x1E' read -ra u_id u_login u_name u_email u_reg u_stat u_cap; do
+    [[ "$u_id" -eq "$i" ]] && f=1 && break
+  done < "$cfile"
+
+  [[ -z "$f" ]] &&
+    sak_wait_message 5 "User" "User was not found." &&
+    return 1
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --ok-label "Temporary" \
+    --extra-label "Cancel" \
+    --extra-button \
+    --cancel-label "Permanent" \
+    --title "Change Password: \Zu$u_name\Zn" \
+    --yesno "\nDo you wish to change the password of this user temporarily or permanently?" \
+    8 50`
+
+  # TODO: Implement these
+  case "$?" in
+    0) ;; # Temporary
+    1) ;; # Permanent
+    3) ;; # Cancel
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+  esac
+}
+
+#+ List all plugins found in a specific WordPress install.
+#| sak_menu_wp_themes INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_themes() {
+  local i="$1" t=1 cfile theme themes=()
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  sak_wp_cache_data "$i" themes || return 1
+
+  cfile="$(sak_wp_cache_file THEMES)"
+  while IFS=$'\x1E' read -ra theme; do
+    themes[((t++))]="$((n++))"
+    if [[ -n "${theme[4]}" ]]; then
+      [[ "${theme[4]:0:1}" == "!" ]] &&
+        themes[((t++))]="\Zb${theme[3]}\Zn (${theme[4]:1} \Z1missing!\Zn)" ||
+        themes[((t++))]="${theme[3]} (${theme[4]})"
+    else
+      themes[((t++))]="${theme[3]}"
+    fi
+    [[ "${theme[0]}" == "1" ]] && themes[((t-1))]+=" [CURRENT]"
+  done < "$cfile"
+
+  if [[ ! "${#themes[@]}" -gt "0" ]]; then
+    sak_wait_message 5 "Error" "No valid themes found!"
+    return 1
+  fi
+
+  n=0 # Auto...
+  RET=`"${SAK_DIALOG[@]}" \
+    --ok-label "Select" \
+    --cancel-label "Back" \
+    --title "Theme List" \
+    --menu "$(sak_soft_name ${soft}) $ver\n$path" \
+    0 65 "$n" \
+    "${themes[@]}"`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  theme=""; n=0
+  while IFS=$'\x1E' read -ra theme; do
+    [[ "$RET" -eq "$n" ]] && break
+    let "n++"
+  done < "$cfile"
+
+  if [[ -z "${theme[4]}" ]]; then
+    theme[4]="${theme[1]}"
+  else  # If parent template is missing, we can't use this.
+    if [[ "${theme[4]:0:1}" == "!" ]]; then
+      sak_waitbox 10 "Error" "\Z4${theme[3]}\Zn is broken as the child theme\n'\Z1${theme[4]:1}\Zn' is missing.\n\nPlease reinstall the theme '\Z1${theme[4]:1}\Zn' first."
+      return 1
+    fi
+  fi
+
+  printf '%s\t%s\t%s' "${theme[1]}" "${theme[4]}" "${theme[3]}"
+  return 0
+}
+
+#+ List all plugins found in a specific WordPress install
+#| sak_menu_wp_plugins INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_plugins() {
+  local i="$1" plugins cfile n=1 p=0 plugin plugins=() IFS=$' \t\n'
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  sak_wp_cache_data "$i" plugins
+
+  cfile="$(sak_wp_cache_file PLUGINS)"
+
+  # Read the cache file in and parse only what we need, junk the rest
+  while IFS=$'\x1E' read -ra plugin; do
+    plugins[((p++))]="$n"
+    plugins[((p++))]="${plugin[3]} (${plugin[2]})"
+    [[ "${plugin[0]}" -eq "0" ]] &&
+      plugins[((p++))]="off" || plugins[((p++))]="on"
+    let "n++"
+  done < "$cfile"
+
+  [[ -z "$plugins" ]] &&
+    sak_waitbox 10 "Information" "No plugins found!" && return 1
+
+  n=0 # Auto...
+  RET=`"${SAK_DIALOG[@]}" \
+    --ok-label "Select" \
+    --cancel-label "Back" \
+    --title "Plugin List" \
+    --checklist "$(sak_soft_name ${soft}) $ver\n$path" \
+    0 50 "$n" \
+    "${plugins[@]}"`
+
+  case "$?" in
+    0) ;;
+    3) # Rescan
+      sak_wp_cache_data "$i" plugins
+      return 0 ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  IFS=' '
+  sak_wp_set_plugins "$i" $RET
+
+  return 0
+}
+
+#+ Plugin search and install.
+#| NOTE: Search results are cached while script is running
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_wp_plugins_install() {
+  local t i="$1" n=0 cfile items new request terms slug=() \
+        re="^[-a-zA-Z0-9_. ]{3,}$"
+
+  terms="$(sak_menu_wp_edit_item pluginsearch)" || return 1
+
+  if [[ ! "$terms" =~ $re ]]; then
+    sak_wait_message 5 "Error" "Search must contain only alphanumeric characters, dash, space, and underscore. Minimum length is 3 characters."
+    return 1
+  fi
+
+  cfile="$(sak_cache_file PLUGIN-WP-SEARCH_${terms})"
+  if [[ "$?" -ne "0" ]]; then
+    cfile="$(sak_mkcache)"
+    new=1
+  fi
+
+  if [[ "$new" -eq "1" ]]; then
+    n=${#SAK_WP_CACHE_FILE[@]}
+    SAK_CACHE_FILE[$n]="$cfile"
+    SAK_CACHE_TYPE[$n]="PLUGIN-WP-SEARCH_${terms}"
+
+    printf -v request "http://jon.dev.gatorsec.net/software/wp-plugin-search.php?api=%d&s=%s" "$SAK_WP_API_VER" "$terms"
+    sak_download "$request" "$cfile"
+  fi
+
+  while IFS=$'\x1E' read -ra result; do
+    let "n++"
+    slug[$n]="${result[2]}"
+    printf -v t '%d\n%s\n' "$n" "${result[0]}"
+    items="${items}${t}"
+  done < "$cfile"
+
+  if [[ "$n" -eq "0" ]]; then
+    sak_wait_message 10 "No Results" "Your search did not return any results."
+    return 1
+  fi
+
+  while :; do
+    local IFS=$'\n'
+    RET=`"${SAK_DIALOG[@]}" \
+      --ok-label "Select" \
+      --cancel-label "Back" \
+      --title "Plugin Search" \
+      --menu "Results for: $terms" \
+      0 50 0 \
+      $items`
+
+    case "$?" in
+      0) break ;;
+      127)
+        sak_sigwincheck && continue
+        sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+      255) sak_escaped ;;
+      *) return 1 ;;
+    esac
+  done
+
+  sak_wp_plugins_install "$i" "${slug[$RET]}" "$cfile" &&
+  sak_wait_message 5 "Information" "Installation successful."
+
+  return 1
+}

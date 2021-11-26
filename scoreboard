@@ -1,0 +1,16 @@
+#!/bin/bash                                                                                                                                                                                                                                  
+# scoreboard - links dump to get apache processes, mainly used by scores
+# project: git.toolbox.hostgator.com/scores
+# wiki: https://gatorwiki.hostgator.com/Admin/ScoresAndScoreboard
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostGator.com, LLC
+
+                                                                                                                                                                                                                                             
+# Dump the output, grep anything that could conceivably be useful to us, awk out what we need, and sort it.                                                                                                                                  
+# conceivably we could play with the 'sort' command to make it do spiffier sorting, but really, what's the point?       
+if [ ! -e "/usr/bin/elinks" ]; then
+yum install elinks -y
+fi
+
+elinks --dump http://localhost/whm-server-status | awk '/GET|POST/ && $4~ "[a-zA-Z]" { print $11"\t\t"$12"\t\t"$14 }' | sort

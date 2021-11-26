@@ -1,0 +1,381 @@
+#!/usr/bin/perl
+############################################################################################
+# Multidomain SSL installer - can clone an installed ssl onto other domains in the account
+# Wiki: https://gatorwiki.hostgator.com/Admin/Mdssl (pending)
+# Project page: http://git.toolbox.hostgator.com/mdssl
+# Download: http://git.hgfix.net/mdssl/mdssl
+# version 1.20
+# By Matt Sheldon
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2012 - HostGator.com, LLC
+############################################################################################
+use YAML::Syck;
+use strict;
+use Digest::MD5 qw(md5_hex);
+use File::Temp qw(tempfile);
+use File::Copy;
+
+
+my $FORCE = 0;
+if ($ARGV[0]=~/^--force$/) {
+	shift(@ARGV);
+	$FORCE = 1;
+}
+
+
+my $action = shift(@ARGV) or usage();
+my $DOMAIN = '';
+my $USER = '';
+my @DOMAINS = ();
+if ($action eq 'clone'){
+	my $DOMAIN = shift(@ARGV) or die("Source domain required!\n");
+	while ($#ARGV>=0){
+		push(@DOMAINS,shift(@ARGV));
+	}
+	die ("At least one target domain required!\n") if ($#DOMAINS < 0);
+	
+	$USER = whoowns($DOMAIN) or die("Could not fetch owner information for $DOMAIN\n");
+	print "Source domain $DOMAIN owned by $USER\n";
+
+	my $sourceyaml = userdata_load($USER,$DOMAIN,1);
+
+	foreach my $target (@DOMAINS) {
+		print "Installing on domain: $target\n";
+		my $tuser = whoowns($target) or die("$target does not exist on the server!\n");
+		my $tyaml = userdata_load($tuser,$target);
+		die("Error: $target ($tuser) does not have same owner as $DOMAIN ($USER)\n") if (!$FORCE && ($tuser ne $USER && $tyaml->{ip} ne $sourceyaml->{ip}));
+		if ($tuser ne $USER && $tyaml->{ip} ne $sourceyaml->{ip}) {
+			open(DOMAINIPS,'/etc/domainips');
+			my $pass = 0;
+			while(<DOMAINIPS>){
+				if (/^$sourceyaml->{ip}:/) {
+					$pass = 1;
+					last;
+				}
+				close(DOMAINIPS);
+			}
+			die("ERROR: $target is not on a dedicated IP and not in the same account as $DOMAIN") if (!$pass);
+		}
+		my $dyaml = {%{$sourceyaml}};
+		map { if (exists $tyaml->{$_} ) { $dyaml->{$_} = $tyaml->{$_} } else { delete($dyaml->{$_}) }} qw(ip documentroot serveralias servername serveradmin scriptalias user owner group homedir phpopenbasedirprotect);
+		
+		# to protect against cross-account SSLs if the source account gets removed, since cPanel deletes the associated cert
+		# This is still an issue with mdssls in the same account, but it happens far less.
+		if ($dyaml->{user} ne $sourceyaml->{user}) {
+			my $ssldir = $dyaml->{sslcertificatefile};
+			$ssldir =~ s#/certs/.*.crt$##;
+			if (!-f "$ssldir/certs/$dyaml->{servername}.crt" && (!exists($dyaml->{sslcacertificatefile}) || !-f "$ssldir/certs/$dyaml->{servername}.cabundle") && !-f "$ssldir/private/$dyaml->{servername}.key") {
+				copy($dyaml->{sslcertificatefile},"$ssldir/certs/$dyaml->{servername}.crt");
+				copy($dyaml->{sslcertificatekeyfile},"$ssldir/private/$dyaml->{servername}.key");
+				copy($dyaml->{sslcacertificatekeyfile},"$ssldir/certs/$dyaml->{servername}.cabundle") if ( -f "$ssldir/certs/$dyaml->{servername}.cabundle");
+				chmod(0600,"$ssldir/private/$dyaml->{servername}.key");
+				
+				$dyaml->{sslcertificatefile} = "$ssldir/certs/$dyaml->{servername}.crt" if (-f "$ssldir/certs/$dyaml->{servername}.crt");
+				$dyaml->{sslcertificatekeyfile} = "$ssldir/private/$dyaml->{servername}.key" if (-f "$ssldir/private/$dyaml->{servername}.key");
+				$dyaml->{sslcacertificatekeyfile} = "$ssldir/certs/$dyaml->{servername}.cabundle" if ( -f "$ssldir/certs/$dyaml->{servername}.cabundle");
+			}
+		}
+		
+		
+		userdata_save($tuser,$target,$dyaml);
+	}
+	print "\nRemember to /scripts/rebuildhttpdconf and restart apache once you're done generating the SSL vhosts!\n";
+} elsif ($action eq 'info') {
+	$USER = shift;
+	die ("Invalid user $USER") if ($USER =~ /[^a-zA-Z0-9\-\_\.]/);
+	$USER = whoowns($USER) if ($USER =~ /\./);
+	die("Invalid user or domain specified.\n".usage()) if (!$USER);
+	my @files = </var/cpanel/userdata/$USER/*.*_SSL>;
+	my $yaml = undef;
+	my %SSLs = ();
+	my $aliases;
+	my $ssl_exists = 0;
+	foreach my $file (@files) {
+		$aliases = '';
+		$file =~ /\/var\/cpanel\/userdata\/.*?\/(.*)_SSL/;
+		$yaml = userdata_load($USER,$1,1);
+
+		if ($yaml->{serveralias}) {
+			my @splitalias = split(/ /,$yaml->{serveralias});
+			foreach my $alias (@splitalias) {
+				if ($alias !~ /^www\./) {
+					$aliases = $aliases . (length($aliases)>0?' '.$alias:$alias);
+				}
+			}
+		}
+		if (length($aliases)) {
+			$aliases = " [Parked: $aliases]";
+		}		
+
+		if (!exists($SSLs{$yaml->{sslcertificatefile}})) {
+			print "SSL found: $yaml->{sslcertificatefile}\n";
+			if (my $ssldomain = findssldomain($yaml->{ip})) {
+				print "Main domain installed on: $ssldomain\n";
+			}
+			@{$SSLs{$yaml->{sslcertificatefile}}} = ($1 . $aliases); 
+		} else {
+			push(@{$SSLs{$yaml->{sslcertificatefile}}},$1 . $aliases);
+		}
+	}
+
+
+	if (scalar keys %SSLs > 0) {
+		$ssl_exists = 1;		
+		foreach my $ssl (keys %SSLs) {
+			print "Certificate: $ssl\nInstalled on: \n\t";
+			print join(', ',@{$SSLs{$ssl}});
+			print "\n\n";
+			open(X509,"openssl x509 -text -in $ssl|");
+			while (<X509>){
+				$_=~s/^\s{1,8}//;
+				print if (/Issuer:|Validity$|Not.(Before|After)|Subject:|DNS:/);
+			}
+			close(X509);
+		}
+	}
+	
+	if (!$ssl_exists) {
+		print "No SSLs found.\n";
+	}
+} elsif ($action eq 'update') {
+	# update SSL for things like adding domains to the cert
+	$USER = shift;
+	if ($USER=~/\./) {
+		$USER = whoowns($USER);
+	}
+	if (!$USER || !-d "/var/cpanel/userdata/$USER") { die("Invalid user.\n".usage())}
+	open(USERFILE,"/var/cpanel/users/$USER") or die("Could not open cpanel user file for $USER");
+	my @ips = grep(/^IP=/,<USERFILE>);
+	close(USERFILE);
+	$ips[0]=~m/^\s*IP=([0-9\.]+)\s*$/i;
+	my $ssldomain = findssldomain($1);
+	
+	my $userdata = userdata_load($USER,$ssldomain,'yes');
+	
+	my $rstart = 0;
+	my $cert = '';
+	my $key = '';
+	my $cabundle = '';
+	my $line;
+	# get cert
+	print "Enter the certificate you want to update this with:\n";
+	while (1) {
+		$line = <>;
+		last if (length($line)==0);
+		if ($line =~ /^-----BEGIN CERTIFICATE-----$/) {$rstart = 1;}
+		$cert .= $line if ($rstart);
+		if ($line =~ /END CERTIFICATE/) {$rstart = 2; last};
+	}
+	die('Invalid certificate') if ($rstart != 2);
+	$rstart = 0;
+	# get key
+	print "Enter the RSA key for the certificate:\n";
+	while (1) {
+		$line = <>;
+		last if (length($line)==0);
+		if ($line =~ /^-----BEGIN RSA PRIVATE KEY-----$/) {$rstart = 1;}
+		$key .= $line if ($rstart);
+		if ($line =~ /END RSA PRIVATE KEY/) { $rstart = 2; last};
+	}
+	die('Invalid RSA key') if ($rstart != 2);
+
+	# get CA
+	print "Does this certificate have a CA bundle (you can say yes and submit empty one to use current one)? [Y|n]: ";
+	$line = <>;
+	my $useca = 0;
+	if ($line !~ /^n/i) {
+		print "Enter CA bundle (<ctrl-d> when finished):\n";
+		$useca = 1;
+		while (1) {
+			$line = <>;
+			last if (length($line)==0);
+			if ($line =~ /^-----BEGIN /) {$rstart = 1;}
+			$cabundle .= $line if ($rstart && length($line) > 1);
+		}
+	}
+
+	# get modulus
+	my ($fh,$fn) = tempfile() or die('could not write temp file for SSL install');
+	print $fh $cert;
+	open(OSSL,'openssl x509 -noout -modulus -in '.$fn.'|');
+	my $certmodulus = <OSSL>;
+	close(OSSL);
+	close($fh);
+	open(KSSL,'>'.$fn);
+	print KSSL $key;
+	close(KSSL);
+	open(OSSL,'openssl rsa -noout -modulus -in '.$fn.'|');
+	my $keymodulus = <OSSL>;
+	close(OSSL);
+
+	unlink($fn);
+	if (length($certmodulus) < 10) { die('Invalid certificate, could not retrieve modulus.') }
+	if (length($keymodulus) < 10) { die('Invalid RSA key, could not retrieve modulus.') }
+	if (md5_hex($certmodulus) ne md5_hex($keymodulus)) { die('Modulus mismatch, does this key go with this certificate?') }
+
+	# we got here, cert and key are good
+	print "Installing new certificate...\n";
+	my $now = time();
+	rename($userdata->{sslcertificatefile},$userdata->{sslcertificatefile}.".old.".$now);
+	rename($userdata->{sslcertificatekeyfile},$userdata->{sslcertificatekeyfile}.".old.".$now);
+	open(OSSL,'>'.$userdata->{sslcertificatefile});
+	print OSSL $cert;
+	close(OSSL);
+	open(OSSL,'>'.$userdata->{sslcertificatekeyfile});
+	print OSSL $key;
+	close(OSSL);
+	
+	my $needcaupdate = 0;
+	if ($useca && length($cabundle) > 10) {
+		if (!exists $userdata->{sslcacertificatefile}) {
+			print "No previous ca bundle, creating a new one...\n";
+			$userdata->{sslcacertificatefile} = $userdata->{sslcertificatefile};
+			$userdata->{sslcacertificatefile} =~ s/\.crt$/\.cabundle/;
+		}
+		rename($userdata->{sslcacertificatefile},$userdata->{sslcacertificatefile}.'.old.'.$now) if (-f $userdata->{sslcacertificatefile});
+		open(OSSL,'>'.$userdata->{sslcacertificatefile});
+		print OSSL $cabundle;
+		close(OSSL);
+		$needcaupdate = 1;
+	}
+	if (length($userdata->{sslcacertificatefile}) > 10 && !$useca) { $needcaupdate = 2; }
+	if ($needcaupdate) {
+		my @userfiles = </var/cpanel/userdata/$USER/*.*_SSL>;
+		foreach my $uf (@userfiles) {
+			$uf=~/\/([^\/]+)_SSL/;
+			my $ud=$1;
+			print "Updating domain $ud ($uf) for $USER\n";
+			my $udd = userdata_load($USER,$ud,'yes');
+			if ($needcaupdate==2) {
+				delete $udd->{sslcacertificatefile};
+			} else {
+				$udd->{sslcacertificatefile}=$udd->{sslcertificatefile};
+				$udd->{sslcacertificatefile}=~s/\.crt/\.cabundle/;
+			}
+			rename("/var/cpanel/userdata/$USER/${ud}_SSL","/var/cpanel/userdata/$USER/${ud}_SSL.old.$now");
+			userdata_save($USER,$ud,$udd);
+		}
+	}
+	print "New certificate installed.  Backups of original saved with suffix '.old.$now'.  Remember to restart Apache and make sure everything works!\n";
+	print "You added or removed a CA bundle.  You need to /scripts/rebuildhttpdconf before restarting apache for this to take effect.\n" if ($needcaupdate);
+} else {
+	usage();
+}
+
+
+
+# userdata_load(user,domain,[ssl=yes|no])
+sub userdata_load {
+        my $user = shift;
+        my $domain = shift;
+        my $ssl = ($#_>=0)?shift:0;
+        $ssl=($ssl=~/y|1/)?'_SSL':'';
+        my $file = "/var/cpanel/userdata/$user/$domain$ssl";
+        if (! -e "$file") { # attempt to find parent subdomain if it's an addon
+                open(UDD,"/etc/userdatadomains") or die("Could not find file: $file and userdatadomains non-existent.\n");
+                my @dl = grep { /^$domain: $user/ } <UDD>;
+                close(UDD);
+                my @sl=split(/==/,$dl[0]);
+                if (length($sl[3])) {
+                        $file = "/var/cpanel/userdata/$user/$sl[3]$ssl";
+                }
+
+        }
+        die("ERROR: Could not load file: $file\n") unless (-f $file);
+        my $data = LoadFile($file);
+        return $data;
+}
+
+
+#userdata_save(user,domain,yaml to dump for now no ssl check, it's always on)
+sub userdata_save {
+	my $user = shift;
+	my $domain = shift;
+	my $yaml = shift;
+	my $file;
+	if (-e "/var/cpanel/userdata/$user/${domain}") {
+		$file = "/var/cpanel/userdata/$user/${domain}_SSL";
+	} else {
+                open(UDD,"/etc/userdatadomains") or die("Could not find file: $file and userdatadomains non-existent.\n");
+                my @dl = grep { /^$domain: $user/ } <UDD>;
+                close(UDD);
+                my @sl=split(/==/,$dl[0]);
+                if (length($sl[3])) {
+                        $file = "/var/cpanel/userdata/$user/$sl[3]_SSL";
+                }		
+	}
+	if (!$file) { die("Could not find associated non-ssl Vhost for $domain."); }
+	
+	if (!-f $file) {
+		print "Dumping to file $file\n";
+		return DumpFile($file,$yaml);
+	} elsif ($FORCE==1) {
+		print "Dumping to file $file (forced on already existing file)\n";
+		return DumpFile($file,$yaml);
+	} else {
+		die("File $file already exists.  use mdssl --force clone to override.\n");
+	}
+}
+
+sub usage {
+	print "Usage: $0 <command> <domain> [<domain1> <domain2> ...]\n";
+	print "$0 clone <domain> <domain1> [<domain2> ...]:\n\tClone SSL vhost for domain onto domain1,2,etc. \n\tThis can now clone either to domains/subdomains in same account, or other domains in other accounts on the same IP (to be used with chgacctip).\n\tIf you just want to use a multi-domain SSL on multiple accounts on different dedi IPs, you can just do that through WHM as separate SSL installs.\n\tIf used with multiple accounts, creates new copy of cert, mdssl info will not show these domains together for that reason.\n";
+	print "$0 info <user|domain>:\n\tShow SSL installation information for user\n";
+	print "$0 update <user|domain>:\n\tAllows you to install a new certificate for the domain\n\t(Eg., if user added new domains to a multidomain cert)\n";
+	print "\n";
+	exit();
+}
+
+# gee I wonder wat this function copies
+sub whoowns {
+	my $dom = shift;
+	$dom=~s/^www\.//;
+	open(USERDOMAINS,'/etc/userdomains');
+	while(<USERDOMAINS>){
+		if (/^$dom: (\S+)/i) {
+			close(USERDOMAINS);
+			return $1;
+		}
+	}
+	close(USERDOMAINS);
+	return 0;
+
+}
+
+# findssldomain($ip) search ssldomains and/or fall back to searching userdata for the cert matching the ip
+sub findssldomain {
+	my $ip = shift;
+	return 0 if $ip !~ /([0-9]+\.){3}[0-9]+/;
+	
+	open(my $fh,'/etc/ssldomains');
+	if ($fh) {
+		while (<$fh>) {
+			if (/:\s$ip$/) {
+				s/:.*$//;
+				chomp();
+				return $_;
+			}
+		}
+	}	
+	# couldnt get it from ssl domains, fallback to scanning userdata
+	my @ssls = </var/cpanel/userdata/*/*.*_SSL>;
+	
+	my $yaml;
+	my $cert;
+	foreach my $ssl (@ssls) {
+		$yaml = LoadFile($ssl);
+		if (exists($yaml->{sslcertificatefile}) && $yaml->{ip} eq $ip) {
+			$cert = $yaml->{sslcertificatefile};
+			$cert =~ s#.*/|\.crt$##g;
+			$cert =~ s/^www\.//;
+			return $cert if ($cert eq $yaml->{servername});
+		}
+	}
+	if ($cert) {
+		return $cert;
+	} else {
+		return 0;
+	}
+	
+}

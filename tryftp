@@ -1,0 +1,398 @@
+#!/usr/bin/perl
+
+###########
+# tryftp
+# Used to more efficiently check FTP login details from a Migrations ticket
+# Wiki links: http://git.toolbox.hostgator.com/tryftp/pages/Home
+#             https://gatorwiki.hostgator.com/Migrations/TransferTryftp
+# Gitorious link: http://git.toolbox.hostgator.com/tryftp
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+# Example with old host that causes tryftp to throw an error.
+# https://gatordesk.hostgator.com:7778/#view_ticket/BEN-18761813
+
+use strict;
+use Net::hostent;
+use Net::FTP;
+use Cwd;
+use Socket;
+use Getopt::Long;
+use Data::Dumper;
+use IO::Socket;
+use Fcntl;
+use Symbol;
+
+my @logins            = ();        #Used to return login information from read_stdin
+#my $successful_logins = {};
+#my @failed_logins     = ();
+my $login_results     = {}; #Hash array with the results of the login tests.
+my $sanitycheck;   #Flag to indicate whether or not the input data passed a simple sanity check.
+my $ipaddr;        #IP address to test.
+my $domainname;    #Domain name to test.
+my $username;      #Username to test FTP for.
+my $password;      #FTP Password to test
+my $sftp_port;
+my $help     = 0;  #0= Don't show help.                       1= Show help.
+my $download = 0;  #0= Print a test wget with "-O -" switch.  1= Print a wget line with full download flags.
+my $nocheck  = 0;  #0= Check the FTP logins                   1= Don't check the FTP logins.
+my $lftp_available = have_lftp(); # 0=No lftp                 1=lftp is available.
+GetOptions ('help'     => \$help,
+            'download' => \$download,
+            'nocheck'  => \$nocheck,
+            'sftp_port=i' => \$sftp_port);
+
+if ($help == 1) {
+     showhelp();
+     exit 0;
+}
+
+
+#-------------- Set the variables to test -------------------
+if ($#ARGV == 2) { #If there are 3 arguments then the user must have supplied login info. on the command line.
+     my $line = "$ARGV[0] $ARGV[1] $ARGV[2]";
+     $sanitycheck = check_login_line($line);
+     if ($sanitycheck) {
+          push(@logins, $line);          
+     }
+}else {            #If there aren't 3 arguments, then read input from STDIN, expecting the user to paste a ticket.
+     $sanitycheck = read_stdin(\@logins);
+}
+
+if ($sanitycheck) {
+     if ($nocheck) { #If --nocheck was given, then just print the wget lines.
+          if (fake_test_logins(\@logins, $login_results)) {
+               show_successful_getlines($login_results);
+          }
+     }else {
+          print "Testing logins...\n\n";
+          if (test_logins(\@logins, $login_results)) {
+               show_successful_getlines($login_results);
+               print "All logins were successful.\n";
+          }else {
+               show_failures($login_results);
+               print "Successful logins:\n";
+               show_successful_getlines($login_results);
+               print "Failed logins:\n";
+               show_failed_getlines($login_results);
+          }
+     }
+}
+exit (0);
+
+#----------------------- Subroutines ------------------------
+
+# Build a fake set of ligin results for the purpose of printing lftp or wget lines.
+# Input:  An array reference with one or more lines in to form: host user password
+# Output: An array of login result values, all showing successful FTP tests.
+sub fake_test_logins {
+     my $logins  = shift;
+     my $login_results = shift;
+     if (scalar(@{$logins}) == 0) {
+          return 0; # If there are no logins, then return a failure.
+     }
+     foreach my $login (@{$logins}) {
+          $login_results->{$login} = 1;
+     }
+     return 1;
+}
+
+# Test an array of FTP login credentials.
+# Input:  An array reference with one or more lines in to form: host user password
+# Output: An array of login result values. (See test_login for result definitions)
+#         Return value = 0 if any logins failed.
+#         Return value = 1 in all logins succeeded.
+sub test_logins {
+     my $logins  = shift;
+     my $login_results = shift;
+     my $overall_result = 1;
+     if (scalar(@{$logins}) == 0) {
+          return 0; # If there are no logins, then return a failure.
+     }
+     foreach my $login (@{$logins}) {
+          my $result = test_login($login); # Fetch a login result (0, 1, or 2)
+          $login_results->{$login} = $result;
+          if ($result == 0) {
+               $overall_result = 0; # If any logins fail, then the overall result is a failure.
+          }
+     }
+     return $overall_result;
+}
+
+# Test a single set of login credentials.
+# Input:  Reference to a string with the "Host User Password"
+#         Global variable $sftp_port
+# Output: A result value.  0=Failed.
+#                          1=FTP.
+#                          2=SFTP.
+sub test_login {
+     my $login = shift;
+     if ($lftp_available) {
+          if (test_sftp($login)) {
+               return 2; #SFTP works.
+          }
+     }
+     if (test_ftp($login)) {
+          return 1; #FTP works.
+     }
+     return 0; #Neither login worked.
+}
+
+# Test FTP credentials for one login.
+# Input:  Host
+#         User
+#         Password
+# Return: 1 if the connection was made.
+#         0 if the connection attempt failed.
+sub test_ftp {
+     my $login = $_[0];
+     my ($host, $user, $pass, @extra) = split(' ', $login);
+     if (scalar(@extra)) {
+         $pass .= " ".join(" ", @extra); #Include the rest of the password if it has spaces.
+     }
+     my $result;  #Returned result of the test
+     my $ftp;     #Net::FTP object
+     print "Testing FTP login: " . $user . " @ " . $host . "\n";
+     $ftp = Net::FTP->new($host, Timeout => 10);
+     if (!$ftp) {
+          print "Failed to connect to server.";
+          return 0;
+     }
+     if ($@) {
+          print $@ . "\n";
+          return 0;
+     }else {
+          if (!$ftp->login($user, $pass)) {
+               print $ftp->message;
+               return 0;
+          }else {
+               my @lines = $ftp->dir() or warn "Directory listing failed: ", $ftp->message;
+               foreach my $line (@lines) {
+                    #print $line . "\n";
+               }
+               $result = 1;
+          }
+          $ftp->quit;
+     }
+     return $result;
+}
+
+# Test SFTP credentials for one login.
+# Input:  Host
+#         User
+#         Password
+#         Global variable $sftp_port
+# Return: 1 if the connection was made.
+#         0 if the connection attempt failed.
+sub test_sftp {
+     my $login = shift;
+     my ($host, $user, $pass, @extra) = split(' ', $login);
+     if (scalar(@extra)) {
+          $pass .= " ".join(" ", @extra); #Include the rest of the password if it has spaces.
+     }
+     print 'Testing SFTP login: ' . $user . ' @ ' . $host . "\n";
+     my $cmd = 'lftp -u \''.$user."','".$pass.'\' sftp://'.$host.' -e "set dns:fatal-timeout 10; set net:timeout 10; set net:max-retries 1; ls -l; exit"';
+     $cmd .= ' -p '.$sftp_port if $sftp_port;
+     my @output = `$cmd`;
+     if ($output[0] =~ m/^d.+\.$/) {
+          return 1;
+     }
+     return 0;
+}
+
+# Check to see if we have lftp on this server.
+# Input:  Nothing
+# Output: 1=Yes
+#         0=No
+sub have_lftp {
+     chomp (my $lftp = `which lftp 2>/dev/null`);
+     if ($lftp) {
+          return 1;
+     }else{
+          warn "Unable to test for SFTP since lftp was not found on the system\n";
+          return 0;
+     }
+}
+
+# Show the information we want the user to see after one or more successful connections.
+# Input:  Array reference $login_results
+# Output: wget lines are printed for the successful login(s).
+sub show_successful_getlines {
+     my $login_results = shift;
+     foreach my $login (keys %{$login_results}) {
+          if ($login_results->{$login} == 1) { #If FTP was successful
+               if ($lftp_available) {
+                    print_lftp_ftp($login);
+               }else{
+                    print_wget_ftp($login);
+               }
+          }elsif ($login_results->{$login} == 2) { #If FTP was successful
+               print_lftp_sftp($login);
+          }
+     }
+}
+
+# Show the information we want the user to see after one or more successful connections.
+# Input:  Array reference $login_results
+# Output: wget lines are printed for the failed login(s).
+sub show_failed_getlines {
+     my $login_results = shift;
+     foreach my $login (keys %{$login_results}) {
+          if ($login_results->{$login} == 0) { #If FTP login test failed
+               if ($lftp_available) {
+                    print_lftp_ftp($login);
+               }else{
+                    print_wget_ftp($login);
+               }
+          }
+     }
+}
+
+# Print lftp lines for the user to run.
+# Input:  string with login info (i.e. "1.2.3.4 myuser mysecret")
+#         Global "download" flag.
+#         Global variable $sftp_port
+# Output: lftp lines are printed.
+sub print_lftp_sftp {
+     my $login   = shift;
+     my $hupline = (split(/\n/, $login))[0];
+     my ($host, $user, $pass, @extra) = split(' ', $hupline);
+     if (scalar(@extra)) {
+          $pass .= " ".join(" ", @extra);
+     }
+     if ($download) {
+          my $cmd = "lftp -u '".$user."','".$pass." sftp://$host -e 'set net:limit-total-rate 3276800 ; mirror --verbose=2 -c --parallel=1 --only-missing ./ ./; exit'";
+          $cmd .= ' -p '.$sftp_port if $sftp_port;
+          print "$cmd\n\n";
+     } else {
+          my $cmd = 'lftp -u \''.$user."','".$pass.'\' sftp://'.$host.' -e "set net:max-retries 1; ls -l; exit"';
+          $cmd .= ' -p '.$sftp_port if $sftp_port;
+          print "$cmd\n\n";
+     }
+}
+
+# Print lftp ftp lines (i.e. non-sftp) for the user to run.
+# Input:  Reference to an array of login lines. (Array element example: "1.2.3.4 myuser mysecret")
+#         Global "download" flag.
+# Output: lftp lines are printed.
+sub print_lftp_ftp {
+     my $login   = shift;
+     my $hupline = (split(/\n/, $login))[0];
+     my ($host, $user, $pass, @extra) = split(' ', $hupline);
+     if (scalar(@extra)) {
+          $pass .= " ".join(" ", @extra);
+     }
+     if ($download) {
+          my $cmd = "lftp -u '".$user."','".$pass." ftp://$host -e 'set net:limit-total-rate 3276800 ; mirror --verbose=2 -c --parallel=1 --only-missing ./ ./; exit'";
+          print "$cmd\n\n";
+     } else {
+          my $cmd = 'lftp -u \''.$user."','".$pass.'\' ftp://'.$host.' -e "set net:max-retries 1; ls -l; exit"';
+          print "$cmd\n\n";
+     }
+}
+
+# Print wget ftp lines for the user to run.
+# Input:  Reference to an array of login lines. (Array element example: "1.2.3.4 myuser mysecret")
+#         Global "download" flag.
+# Output: wget lines are printed.
+sub print_wget_ftp {
+     my $login   = shift;
+     my $hupline = (split(/\n/, $login))[0];
+     my ($host, $user, $pass, @extra) = split(' ', $hupline);
+     if (scalar(@extra)) {
+          $pass .= " ".join(" ", @extra);
+     }
+     if ($download == 1) {
+          print "wget -nH -r -N -l inf -t 5 -T 10 --connect-timeout=5 --waitretry=2 --limit-rate=3200k --ftp-user='" . $user . "' --ftp-password='" . $pass . "' ftp://" . $host . "/\n\n";
+     } else {
+          print "wget -O - --ftp-user='" . $user . "' --ftp-password='" . $pass . "' ftp://" . $host . "/\n\n";
+     }
+}
+
+# Show a failure message as part of an example that can be pasted into a ticket for the customer.
+sub show_failures {
+     my $login_results  = shift;
+     my $total_failures = 0;
+     foreach my $line (keys %{$login_results}) {
+          if ($login_results->{$line} == 0) {
+               $total_failures++;
+          }
+     }
+     if (scalar($total_failures) > 1) { # Multi-login message
+          print "-----------------------------------------------------\n";
+          print "Hello,\n\nWe greatly apologize for the inconvenience, but we are currently unable to access the following logins at the old host via FTP.\n\n";
+          print "Failed logins:\n";
+          foreach my $line (keys %{$login_results}) {
+               if ($login_results->{$line} == 0) { # If this login failed, then print it.
+                    print $line . "\n";
+               }
+          }
+          print "Please check these login details and provide any necessary changes so that we may proceed.  Let us know if you have any further questions or issues and we'll be happy to assist.\n\n";
+          print "-----------------------------------------------------\n";
+     }elsif($total_failures==1) { # Single-login message
+          print "-----------------------------------------------------\n";
+          print "Hello,\n\nWe greatly apologize for the inconvenience, but we are currently unable to access the following login at the old host via FTP.\n\n";
+          foreach my $line (keys %{$login_results}) {
+               if ($login_results->{$line} == 0) { # If this login failed, then print it.
+                    print $line . "\n";
+               }
+          }
+          print "Please check these login details and provide any necessary changes so that we may proceed.  Let us know if you have any further questions or issues and we'll be happy to assist.\n\n";
+          print "-----------------------------------------------------\n";
+     }
+}
+
+# Read pasted data from STDIN and check to make sure it is somewhat sane.
+# Input:  Reference to an array to populate.
+#         One or more lines from STDIN in to form: host user password
+# Output: Array is populated with any valid lines.
+#         Return value: 0=Problem with one or more lines.
+#                       1=All lines OK.
+sub read_stdin {
+     my $array   = $_[0];
+     @{$array}   = ();     # Clear the array.
+     my $result = 1;      # Success flag: 0=One or more problems found with the pasted data. 1=No problems found.
+     print "Paste the login info. in \"host user password\" format.  End with Ctrl-d.\n";
+
+     my @file = <STDIN>; # Read Input from STDIN 
+
+     #-------------- Extract useful variables from the input --------
+     foreach my $line (@file) {
+          if (check_login_line($line)) {
+               push(@{$array}, $line);
+          }
+     }
+     return $result;
+}
+
+# Sanity check a "host user pass" line.
+# Input:  A string that contains login information in the form "host user pass"
+# Output: 0=problem, 1=OK
+sub check_login_line {
+     my $line  = shift;
+     my @check = split(/\s/, $line);
+     if (scalar(@check) != 3) {
+          print "Invalid line found.  Each line should have 3 fields.\n";
+          return 0;
+     }
+     if (length($check[0])>90 || length($check[1])>90 || length($check[2])>90) {
+          print "Invalid line found.  One or more fields are too long.\n";
+          return 0;
+     }
+     return 1;
+}
+
+sub showhelp {
+     print "Usage: tryftp <host or IP> <user> <password> [--help] [--download]\n";
+     print "       or\n";
+     print "       tryftp\n\n";
+     print "       -h or --help     : Show this help information.\n";
+     print "       -d or --download : Print wget line with full download flags.  Otherwise, use flag to print to STDOUT.\n";
+     print "       -n or --nocheck  : Don't check the logins.  Just print the wget lines.\n\n";
+     print "If no arguments are given, then it waits for form info. to be pasted.  End the pasted info. with Ctrl-d.\n";
+     print "Example of what to paste (Note: Tickets from the transfer form have the ip user pass pre-formatted in a list):\n";
+     print "50.222.123.234 myuser my5uper5ecret\n";
+     print "mysuperduperdomain.com myuser2 my5uper5ecret2\n";
+}

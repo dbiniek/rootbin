@@ -1,0 +1,192 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+#########################################################################
+# oi - Created and maintained by Ryan Beckwith Version 2.0              #
+# Provides information regarding resellers and their clients.           #
+# Git URL:  http://git.toolbox.hostgator.com/oi/oi/blobs/raw/master/oi  #
+# Wiki URL: https://gatorwiki.hostgator.com/Admin/OI                    #
+# Questions, comments, bugs: email rbeckwith@hostgator.com              #
+#                                                                       #
+# (C) 2011 - HostGator.com, LLC                                         #
+#########################################################################
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Quota;
+
+my $usage = <<USAGE;
+
+oi <owner>    - Prints clients of owner and primary domain of said client.
+oi <client>   - Prints the owner of the client.
+oi -v <owner> - Prints clients and ALL of their domains.
+oi -d <owner> - Prints domains of owner and clients.
+oi -c <owner> - Prints clients of owner.
+oi -q <owner> - Prints quotas for clients and owner.
+
+USAGE
+
+#if( -e "/root/bin/Human.pm" ) { require Human; }
+#else { print "Retrieving necessary module...\n"; system("GET toolbox.hostgator.com/rbeck/Human.pm > /root/bin/Human.pm"); print "Complete.\nNow re-run.\n"; exit(0); }
+Getopt::Long::Configure("bundling");
+my($username,$listall,$listdomains,$listclients,$listquotas,$owner,@clients);
+GetOptions( "v|verbose|all|a" => \$listall, "d|domain|dom" => \$listdomains, "c|client|clients" => \$listclients, "q|quotas|quota" => \$listquotas );
+if( @ARGV == 1 )
+{
+    $username = $ARGV[0];
+    open(CFILE,"/var/cpanel/users/${username}") || die "Couldn't open ${username}'s cPanel file! $!\n";
+    chomp($owner = (grep(/^OWNER=/,<CFILE>))[0]);
+    close(CFILE);
+    $owner =~ s/^OWNER=//;
+    if( $username ne $owner )
+    {
+        print "$owner\n";
+        exit(0);
+    }
+    if( $listall && ! $listdomains && ! $listclients && ! $listquotas ) { &verbose(); }
+    elsif( $listdomains && ! $listall && ! $listclients && ! $listquotas ) { &domains(); }
+    elsif( $listclients && ! $listall && ! $listdomains && ! $listquotas ) { &clients(); }
+    elsif( $listquotas && ! $listdomains && ! $listall && ! $listclients ) { &quotas(); }
+    elsif( $username && ! $listall && ! $listdomains && ! $listclients && ! $listquotas )
+    {
+        &basic();
+        foreach my $client (@clients)
+        {
+            open(UFILE,"/var/cpanel/users/${client}") || die "Couldn't open ${client}'s cPanel file! $!\n";
+            chomp(my $primary = (grep(/^DNS=/,<UFILE>))[0]);
+            close(UFILE);
+            $primary =~ s/^DNS=//;
+            printf("%-16s - %50s\n",$client,$primary);
+        }
+        exit(0);
+    } else { print $usage; exit(1); }
+} else {
+    print $usage;
+    exit(1);
+}
+sub basic
+{
+    open(OI,"/etc/trueuserowners");
+    chomp( @clients = sort( grep(/:\s+${owner}$/,<OI>) ) );
+    close(OI);
+    map(s/:\s+[\w\d]+//,@clients);
+}
+sub verbose
+{
+    if( ! @clients || @clients == 0 )
+    {
+        &basic();
+        foreach my $client (@clients)
+        {
+            open(UFILE,"/var/cpanel/users/${client}") || die "Can't open /var/cpanel/users/${client}: $!\n";
+            chomp(my @data = <UFILE>);
+            close(UFILE);
+            my $primary = (grep(/^DNS=/,@data))[0];
+            my @domains = sort(grep(/^DNS\d+=/,@data));
+            $primary =~ s/^DNS=//;
+            map(s/^DNS\d+=//,@domains);
+            printf("%-16s - %50s\n",$client,$primary);
+            foreach my $dom (@domains)
+            {
+                printf("%69s\n",$dom);
+            }
+        }
+    }
+}
+sub quotas
+{
+    if( ! @clients || @clients == 0 )
+    {
+        &basic();
+        my $total = { "curblock" => 0, "curinode" => 0, "dbcount" => 0, "dbusage" => 0 };
+        printf("%110s\n","-" x 110);
+        printf("%-16s %-25s %-25s %-25s %-25s\n","User","Disk use","Inode use","DBCount","DBSize");
+        printf("%110s\n","-" x 110);
+        foreach my $client (@clients)
+        {
+            my $cluid = (getpwnam($client))[2];
+            my $quota = { "curblock" => undef, "curinode" => undef, "dbcount" => undef, "dbusage" => undef };
+            foreach (("/home","/tmp","/"))
+            {
+                my $dev = Quota::getqcarg($_);
+                my($curblock,$curinode) = (Quota::query($dev,$cluid))[0,4];
+                if( ! $curblock ) { $curblock = 0; }
+                if( ! $curinode ) { $curinode = 0; }
+                $total->{"curblock"} += $curblock;
+                $total->{"curinode"} += $curinode;
+                $quota->{"curblock"} += $curblock;
+                $quota->{"curinode"} += $curinode;
+            }
+            if( -e "/var/cpanel/datastore/${client}/mysql-db-count" )
+            {
+                open(DBCOUNT,"<","/var/cpanel/datastore/${client}/mysql-db-count");
+                $quota->{"dbcount"} = <DBCOUNT>;
+                close(DBCOUNT);
+            } else { $quota->{"dbcount"} = 0; }
+            if( -e "/var/cpanel/datastore/${client}/mysql-disk-usage" )
+            {
+                open(DBUSAGE,"<","/var/cpanel/datastore/${client}/mysql-disk-usage");
+                $quota->{"dbusage"} = <DBUSAGE>;
+                close(DBUSAGE);
+            } else { $quota->{"dbusage"} = 0; }
+            $total->{"dbcount"} += $quota->{"dbcount"};
+            $total->{"dbusage"} += $quota->{"dbusage"};
+            printf("%-16s %-25s %-25s %-25s %-25s\n",$client,&data($quota->{"curblock"} * 1024), &commaformat($quota->{"curinode"}), &commaformat($quota->{"dbcount"}), &data($quota->{"dbusage"}));
+        }
+        printf("%110s\n","-" x 110);
+        printf("%-16s %-25s %-25s %-25s %-25s\n","Total",&data($total->{"curblock"} * 1024), &commaformat($total->{"curinode"}), &commaformat($total->{"dbcount"}),&data($total->{"dbusage"}));
+    }
+}
+sub domains
+{
+    &basic();
+    foreach my $client (@clients)
+    {
+        open(DOMS,"/etc/userdomains");
+        chomp(my @info = <DOMS>);
+        close(DOMS);
+        my @domains = grep(/: $client$/,@info);
+        map(s/:.*$//,@domains);
+        @domains = sort(@domains);
+        foreach my $dom (@domains)
+        {
+            print "$dom\n";
+        }
+    }
+}
+sub clients { if( ! @clients || @clients == 0 ) { &basic(); } foreach (@clients) { print "$_\n"; } }
+
+sub commaformat
+{
+    my $number_in = shift;
+    if( ! $number_in ) { return 0; }
+    if( $number_in =~ /\d+(\.\d+)?$/ )
+    {
+        my($number,$decimal) = split(/\./,$number_in);
+        my @breakdown = split(//,$number);
+        if( @breakdown < 4 )
+        {
+            if( $decimal ) { return "${number}.${decimal}"; }
+            else { return $number; }
+        }
+        my $start = @breakdown % 3;
+        $start = 3 if $start == 0;
+        my $result = "";
+        $result .= join( "", splice(@breakdown,0,$start) ) . ",";
+        while( @breakdown != 3 ) { $result .= join( "", splice(@breakdown,0,3) ) . ","; }
+        $result .= join( "", splice(@breakdown,0,3) );
+        return "${result}.${decimal}" if $decimal;
+        return $result;
+     } else { return 0; }
+}
+sub data
+{
+    my $data_in = shift;
+    if( $data_in !~ /^\d+(\.\d+)?$/ ) { return 0 }
+    my $KB = 1024;
+    my $MB = 1024**2;
+    my $GB = 1024**3;
+    if( $data_in >= $GB ) { my $result = sprintf( "%.2fG", $data_in / $GB ); return $result; }
+    elsif( $data_in < $GB && $data_in >= $MB ) { my $result = sprintf( "%.2fM", $data_in / $MB ); return $result; }
+    elsif( $data_in < $MB && $data_in >= $KB ) { my $result = sprintf( "%.2fK", $data_in / $KB ); return $result; }
+    else { my $result = sprintf( "%.2f", $data_in ); return $result }
+}

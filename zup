@@ -1,0 +1,4326 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# ZUP - ZoneUPdater
+# Utility to update zone files for domains on Panel driven servers.
+# Confluence: https://confluence.endurance.com/display/HGS/ZoneUPdater 
+# Please submit all bug reports at jira.endurance.com 
+#
+# (C) 2012 - HostGator.com, LLC
+###########
+# 
+{
+package Runner;
+
+use strict;
+use Getopt::Long qw (:config pass_through);
+use Term::ANSIColor;
+use Data::Dumper;
+#  perl-link processed: use ZUP::Panel::Cpanel;
+
+BEGIN {
+package ZUP::Panel::Cpanel;
+# perl-link processed: use base qw(ZUP::Panel);
+
+BEGIN {
+package ZUP::Panel;
+
+use strict;
+use Term::ANSIColor;
+use Data::Dumper;
+use Getopt::Long;
+use Sys::Hostname;
+use File::Find ();
+use File::Basename;
+use POSIX qw(strftime);
+our $VERSION = "1.1.2";
+our $errstr  = "";
+
+sub new {
+
+	my $type         = shift;
+	my $parseopts    = shift;
+	my $class        = ref $type || $type;
+	my $self         = {};
+	$self->{opts}    = {};
+	$self->{domains} = {}; # "domain.tld" -> ZUP::Parser object generated on "/var/named/domain.tld.db".
+	$self->{failed}  = {}; # "domain.tld" -> "err msg" - domains that we failed to generate zup objects for and errors related.
+	$self->{errstr}  = "";
+	$self->{rcsarcs} = "/home/hgtransfer/zup-backups/RCS-archives";
+	$self->{rcswork} = "/var/named";
+	bless ($self, $class);
+	my $help;
+
+	my $rcsbin  = `which rcs 2>/dev/null`;
+	chomp $rcsbin;
+	$self->{rcspath} = dirname($rcsbin);
+
+	if ($parseopts) {
+		GetOptions (
+                 # Primary options - these determine what domains we work on.
+                 'updateuser|u=s'        => \$self->{opts}->{cpuser},       # update all domains under this user.
+                 'updateuserlist|ul=s'   => \$self->{opts}->{ulist},        # update all domains under the users listed in the file.
+                 'updatereseller|r=s'    => \$self->{opts}->{reselleruser}, # update all domains under this reseller.
+                 'updatedomain|d=s'      => \$self->{opts}->{domain},       # update a specific domain
+                 'updatedomainlist|dl=s' => \$self->{opts}->{domlist},      # update all domains specified in the file.
+
+                 # Secondary options - these determine what records are altered and how.
+                 'setsoaauth|sns=s'      => \$self->{opts}->{setsoaauth},   # set the authoritative NS in the SOA record.
+                 'setsoaemal|sem=s'      => \$self->{opts}->{setsoaemail},  # set the email address in the SOA record.
+                 'bumpserial|s'          => \$self->{opts}->{bumpserial},   # update the serial numbers.
+                 'setmxrecords|mx=s'     => \$self->{opts}->{mxrecords},    # update the MX records.
+                 'setnsrecords|ns=s'     => \$self->{opts}->{nsrecords},    # update the NS records
+                 'setcnamerecords|c=s'   => \$self->{opts}->{cnamerecords}, # update the CNAME records
+                 'setarecords|a=s'       => \$self->{opts}->{arecords},     # update the A records.
+                 'updatespecip|sip=s'    => \$self->{opts}->{updatesip},    # update the IP addresses in the A records
+                 'updateacctip|aip=s'    => \$self->{opts}->{updateaip},    # update the account IP address in the A records
+                 'setspfrecord|spf=s'    => \$self->{opts}->{spf},          # update the SPF record.
+                 'setdkimrecord|dkim=s'  => \$self->{opts}->{dkim},         # update the DKIM record.
+
+                 # Tertiary options - common 'bundled' set of actions to be performed.
+                 'gapps'                 => \$self->{opts}->{gapps},        # update records to use Google Apps.
+                 'godaddy'               => \$self->{opts}->{godaddy},      # update records to use Godaddy MX.
+                 'office365'             => \$self->{opts}->{office365},    # update records to use Office365 Records.
+                 'wlive=s'               => \$self->{opts}->{wlive},        # update records to use windows live. Arg = hostid.
+
+                 # Restore domain from RCS;
+                 'restoredomain=s'       => \$self->{opts}->{resdomain},
+                 
+                 # rndc reload after request is processed.
+                 'reload'                => \$self->{opts}->{reload},
+                 'setremotemx'           => \$self->{opts}->{setremotemx},
+                 'setlocalmx'            => \$self->{opts}->{setlocalmx},
+                 # help
+                 'help'                  => \$help,
+		);
+
+		if ($help) {
+			$class->help();
+			$errstr = "Usage was requested.";
+			return;
+		}
+
+		if ($self->{opts}->{resdomain}) {
+			$errstr = $self->restoredomain(); #this will print and read from the terminal.
+			return;
+		}
+
+		if ($self->{opts}->{setremotemx} and $self->{opts}->{setlocalmx}) {
+			$errstr = "--setremotemx and --setlocalmx passed... Only one of these can be used.";
+			return;
+		}
+
+		if (not ( ($self->{opts}->{cpuser}       or $self->{opts}->{reselleruser} or
+		           $self->{opts}->{domain}       or $self->{opts}->{ulist}        or
+		           $self->{opts}->{domlist})
+		           and
+		          ($self->{opts}->{mxrecords}    or $self->{opts}->{nsrecords}  or
+		           $self->{opts}->{cnamerecords} or $self->{opts}->{arecords}   or
+		           $self->{opts}->{spf}          or $self->{opts}->{dkim}       or
+		           $self->{opts}->{bumpserial}   or $self->{opts}->{wlive}      or
+		           $self->{opts}->{gapps}        or $self->{opts}->{godaddy}    or
+		           $self->{opts}->{office365}    or $self->{opts}->{updatesip}  or
+		           $self->{opts}->{updateaip}    or $self->{opts}->{setsoaauth} or
+		           $self->{opts}->{setsoaemail})
+		) ) {
+			$errstr = "Failed to parse arguments successfully.\n[!] Please remember that you must specify atleast two options, one from the 'domain selection' section, and one from the 'domain update' section.\n[!] See '--help' for more details.";
+			return;
+		}
+	}
+	return $self;
+}
+
+# Returns the hash of domains with the related parser object.
+sub domain_info {
+
+	my $self = shift;
+	return ($self->{domains}, $self->{failed});
+}
+
+sub restorezone {
+
+	my $self   = shift;
+	my $domain = shift;
+	my $parser = $self->{domains}->{$domain};
+	return $parser->restorezone();
+}
+
+# Input: The zone parser object.
+sub processrequest {
+
+	my $self   = shift;
+	my $parser = shift;
+	my $output = "";
+
+	if ($self->{opts}->{bumpserial}) {
+		$output .= "Bumping serial... ";
+		$parser->update_serial();
+		$parser->savezone();
+		$output .= "Done.\n";
+	}
+
+	if ($self->{opts}->{setsoaauth}) {
+		if (my $soa_auth = parse_soa_ns($self->{opts}->{setsoaauth})) {
+			$output .= "Updating the NS in the SOA record... ";
+			$parser->set_soa_auth($soa_auth);
+			$parser->savezone();
+			$output .= "Done.\n";
+		} else {
+			$self->{errstr} = "Failed to parse the SOA NS record successfully.";
+		}
+	}
+
+	if ($self->{opts}->{setsoaemail}) {
+		if (my $soa_email = parse_soa_email($self->{opts}->{setsoaemail})) {
+			$output .= "Updating the email address in the SOA record to '$soa_email'... ";
+			$parser->set_soa_email($soa_email);
+			$parser->savezone();
+			$output .= "Done.\n";
+		} else {
+			$self->{errstr} = "Failed to parse the email address successfully.";
+		}
+	}
+
+	if ($self->{opts}->{mxrecords}) {
+		if (my $mxrecords = parse_mx( $self->{opts}->{mxrecords} )) {
+			$output .= "Updating MX records... ";
+			$parser->set_mx_records($mxrecords);
+			$parser->savezone();
+			$output .= "Done.\n";
+		} else {
+			$self->{errstr} = "Failed to parse MX records successfully.";
+		}
+	}
+
+	if ($self->{opts}->{nsrecords}) {
+		if (my $nsrecords = parse_ns( $self->{opts}->{nsrecords} )) {
+			$output .= "Updating NS records... ";
+			$parser->set_ns_records($nsrecords);
+			if ( not $self->{opts}->{setsoaauth} ) {
+				$output .= "Done.\n";
+				$output .= "No SOA NS specified, so setting '$nsrecords->{1}' in the SOA... ";
+				$parser->set_soa_auth($nsrecords->{1});
+			}
+			$parser->savezone();
+			$output .= "Done.\n";
+		} else {
+			$self->{errstr} = "Failed to parse NS records successfully.";
+		}
+	}
+
+	if ($self->{opts}->{arecords}) {
+		if (my $arecords = parse_ar( $self->{opts}->{arecords} )) {
+			$output .= "Updating A records... ";
+			$parser->set_a_records($arecords);
+			$parser->savezone();
+			$output .= "Done.\n";
+		} else {
+			$self->{errstr} = "Failed to parse A records successfully.";
+		}
+	}
+
+	if ($self->{opts}->{updatesip}) {
+		my $ips = parse_updatesip( $self->{opts}->{updatesip} );
+		if (ref($ips) eq 'HASH') {
+			$output  .= "Updating the IPs in the A records as so:\n";
+			foreach my $oip (keys %{$ips}) {
+				$output .= "\t'$oip' -> '$ips->{$oip}'\n";
+			}
+			$parser->update_ips_in_a_records($ips);
+			$parser->savezone();
+			$output  .= "IPs updated. Replacement breakdown:\n";
+			foreach my $oip (keys %{$ips}) {
+				$output .= "\t'$oip' replaced '$ips->{$oip}' time(s)\n";
+			}
+		} else {
+			$self->{errstr} = "Failed to parse IP addresses successfully.";
+		}
+	}
+
+	if ($self->{opts}->{updateaip}) {
+		if ($self->{opts}->{updateaip} =~ m/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+			my $acctip = eval { $self->get_account_ip($parser->{domain}); };
+			if (not $acctip) {
+				$self->{errstr} = "Failed to retreive account IP for '$parser->{domain}'. This typically means the userdata is corrupt.";
+			} else {
+				my %ips = ($acctip => $self->{opts}->{updateaip});
+				$output  .= "Updating the account IP: '$acctip' to '$self->{opts}->{updateaip}'... ";
+				$parser->update_ips_in_a_records(\%ips);
+				$parser->savezone();
+				$output  .= "Done. Replacement breakdown:\n";
+				foreach my $oip (keys %ips) {
+					$output .= "\t'$oip' replaced '$ips{$oip}' time(s)\n";
+				}
+			}
+		} else {
+			$self->{errstr} = "The argument passed was not a valid IP address: '$self->{opts}->{updateaip}'";
+		}
+	}
+
+	if ($self->{opts}->{cnamerecords}) {
+		if (my $crecords = parse_cname( $self->{opts}->{cnamerecords} )) {
+			$output .= "Updating CNAME records... ";
+			$parser->set_cname_records($crecords);
+			$parser->savezone();
+			$output .= "Done.\n";
+		} else {
+			$self->{errstr} = "Failed to parse CNAME records successfully.";
+		}
+	}
+
+	if ($self->{opts}->{spf}) {
+		if (my $spfrecord = $self->{opts}->{spf} ) {
+			$output .= "Setting SPF record... ";
+			$parser->set_spf_record("\"$spfrecord\"");
+			$parser->savezone();
+			$output .= "Done.\n";
+		} else {
+			$self->{errstr} = "Failed to parse SPF record successfully.";
+		}
+	}
+
+	if ($self->{opts}->{dkim}) {
+		if (my $dkimrecord = parse_dkim( $self->{opts}->{dkim} )) {
+			$output .= "Updating DKIM records... ";
+			$parser->set_dkim_records($dkimrecord);
+			$parser->savezone();
+			$output .= "Done.\n";
+		} else {
+			$self->{errstr} = "Failed to parse DKIM record successfully.";
+		}
+	}
+
+	if ($self->{opts}->{gapps}) {
+		$output .= "Setting Google Apps... ";
+		$parser->set_gapps();
+		$parser->savezone();
+		$output .= "Done.\n";
+	} elsif ($self->{opts}->{wlive}) {
+		$output .= "Setting Windows Live... ";
+		$parser->set_winlive($self->{opts}->{wlive});
+		$parser->savezone();
+		$output .= "Done.\n";
+	} elsif ($self->{opts}->{office365}) {
+		$output .= "Setting Office 365... ";
+		$parser->set_office365();
+		$parser->savezone();
+		$output .= "Done.\n";
+	} elsif ($self->{opts}->{godaddy}) {
+		$output .= "Setting Godaddy MX... ";
+		$parser->set_godaddy();
+		$parser->savezone();
+		$output .= "Done.\n";
+	}
+	return $output;
+}
+
+# Input: The zone parser object.
+# If the reload option is set, it will call the rndcreload function for the parser.
+sub reloadzone {
+
+	my $self   = shift;
+	my $parser = shift;
+	if ($self->{opts}->{reload}) {
+		my $output .= "Performing 'rndc reload' on domain... ";
+		my $rndc = $parser->rndcreload();
+		if ($rndc) {
+			$output .= "Failed. Full output:\n$rndc\n\n"
+		} else {
+			$output .= "Done.";
+		}
+		return $output;
+	} else {
+		return;
+	}
+}
+
+sub tar_backup {
+
+	my $self       = shift;
+	my $timestamp  = strftime( "%H%M%S", localtime( time ) );
+	my $daystamp   = strftime( "%m-%d-%Y", localtime( time ) );
+	my $backupdir  = "/home/hgtransfer/zup-backups/${daystamp}/";
+	my $backupfile = $backupdir."zup-backup-${timestamp}.tar";
+
+	if (not -d $backupdir) {
+		use File::Path qw(make_path);
+		make_path ($backupdir, { owner => 'root', group => 'root' } ) or $self->{errstr} = "Failed to created '$backupdir' to backup zone data." and return;
+	}
+	my @zonefiles;
+	foreach my $zone (values %{$self->{domains}}) {
+		my $zonefile = $zone->getzonefile();
+		if (-e $zonefile) {
+			push @zonefiles, $zonefile;
+		}
+	}
+
+	# The tarring is done in an awkward way to ensure we do not encounter any 
+	# 'odd' limits when processing a large set of domains.
+	my $output;
+	if (scalar(@zonefiles) > 1) {
+		my $zone = shift @zonefiles;
+		$output .= `tar -hcf $backupfile $zone 2>&1`;
+		if (($? >> 8)) {
+			$self->{errstr} = "Failed to generate tar file. Output: $output";
+			return;
+		}
+	}
+	foreach (@zonefiles) {
+		$output = `tar -hrf $backupfile $_ 2>&1`;
+		if (($? >> 8)) {
+			$self->{errstr} = "Failed to generate tar file. Output: $output";
+			return;
+		}
+	}
+	return $backupfile;
+}
+
+# Returns the errstr set by the individual calls within the module
+sub get_errmsg {
+
+	my $self = shift;
+	return $self->{errstr};
+}
+
+sub clearerr {
+
+	my $self = shift;
+	$self->{errstr} = "";
+	return 1;
+}
+
+sub errstr {
+
+	my $self = shift;
+
+	if (@_) {
+		$errstr = shift;
+	} else {
+		return $errstr;
+	}
+}
+
+sub colorify {
+
+	my $string = shift;
+	my $color  = shift;
+	return color("$color").$string.color("reset");
+}
+
+####
+#### Private methods that shoud only be called within the module
+####
+# Input should be a string with a single NS record. Example:
+# "ns1.newprimarydomain.com"
+# Output will be a string with any changes made for proper syntax.
+sub parse_soa_ns {
+
+	my $input = shift;
+	if ( (split /\s/, $input) > 1) {
+		return;
+	}
+	$input .= substr($_[0], -1) eq "." ? "" : "."; # add '.' if needed
+	return $input;
+}
+
+sub parse_soa_email {
+
+	my $input = shift;
+	if ( (split /\s/, $input) > 1) {
+		return;
+	}
+	$input =~ s/\@/\./g; # replace all @s with .s
+	$input .= substr($_[0], -1) eq "." ? "" : "."; # add '.' if needed
+	return $input;
+}
+
+# Input should be a string with A records separated by commas. Example:
+# "mail=>67.123.13.3,mail2=>68.122.12.2"
+# Output hash that can be passed to set_a_records.
+sub parse_ar {
+
+	my $input   = shift;
+	my @records = split(/\s*,\s*/, $input);
+	my $output  = {};
+	for (my $i = 0; $i < @records; $i++) {
+		my ($record, $host) = split (/\s*=>?\s*/, $records[$i], 2);
+		if ($host !~ m/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+			$host .= substr($_[0], -1) eq "." ? "" : "."; # add '.' if needed
+		}
+
+		$output->{$record} = $host;
+	}
+	return $output;
+}
+
+# Input should be a comma separated string with two IPs. Example:
+# "67.123.13.3=>68.122.12.2, 50.23.11.22 => 50.23.22.22", etc.
+# Output a hash that can be passed to update_ips_in_a_records.
+sub parse_updatesip {
+
+	my $input   = shift;
+	my @records = split(/\s*,\s*/, $input);
+	my $output  = {};
+	for (my $i = 0; $i < @records; $i++) {
+		my ($oldip, $newip) = split (/\s*=>\s*/, $records[$i], 2);
+		if ($oldip =~ m/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/ and $newip =~ m/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+			$output->{$oldip} = $newip;
+		}
+	}
+	return $output;
+}
+
+# Input should be a string with A records separated by commas. Example:
+# "mail=>ghs.google.com,docs=>ghs.google.com"
+# Output hash that can be passed to set_cname_records.
+sub parse_cname {
+
+	my $input   = shift;
+	my @records = split(/\s*,\s*/, $input);
+	my $output  = {};
+	for (my $i = 0; $i < @records; $i++) {
+		my ($record, $host) = split (/\s*=>?\s*/, $records[$i], 2);
+		$host .= substr($_[0], -1) eq "." ? "" : "."; # add '.' if needed
+		$output->{$record} = $host;
+	}
+	return $output;
+}
+
+# Input should be a string with ns records separated by commas. Example:
+# "ns1.google.com,ns2.google.com,ns3.google.com"
+# Output hash that can be passed to set_ns_records.
+sub parse_ns {
+
+	my $input   = shift;
+	my @records = split(/\s*,\s*/, $input);
+	my $output  = {};
+	for (my $i = 0; $i < @records; $i++) {
+		$output->{$i+1} = $records[$i];
+		$output->{$i+1} .= substr($_[0], -1) eq "." ? "" : "."; # add '.' if needed
+	}
+	return $output;
+}
+
+# Input should be a string with the DKIM records separated by commas. Example:
+# 'default._domainkey=>v=DKIM1\; k=rsa\; p=MHwwDQYJKoZIhvcNAQEBBQADawAwaAJhALYyW31r0Kt4ufPX29cZZ619nKE/Fx01rtdDBggTzgny581S0/KdU5in+iYyJbtuR4shMv0sqvjo14024sG9fjiqh2qBuDRCUm9GHdHyhwjMfLDKCjNvuFNJg8s41fHJkQIDAQAB\;'
+# Output hash that can be passed to set_dkim_records.
+sub parse_dkim {
+
+	my $input   = shift;
+	my @records = split(/\s*,\s*/, $input);
+	my $output  = {};
+	for (my $i = 0; $i < @records; $i++) {
+		my ($record, $dkim) = split (/\s*=>\s*/, $records[$i], 2);
+		if (not $dkim) {
+			return;
+		}
+		$output->{$record} = "\"$dkim\"";
+	}
+	return $output;
+}
+
+# Input should be a string with mx records separated by commas. example:
+# "1=>ns1.google.com,5=>ns2.google.com,10=>ns3.google.com"
+# Output hash that can be passed to set_mx_records.
+sub parse_mx {
+
+	my $input   = shift;
+	my @records = split(/\s*,\s*/, $input);
+	my $output  = {};
+	for (my $i = 0; $i < @records; $i++) {
+		my ($priority, $record) = split (/\s*=>?\s*/, $records[$i], 2);
+		return if ($priority !~ m/\d+/);
+		$record .= substr($_[0], -1) eq "." ? "" : "."; # add '.' if needed
+		$output->{$record} = $priority;
+	}
+	return $output;
+}
+
+1;
+
+};
+BEGIN {
+$INC{'ZUP/Panel.pm'} = "/dev/null";
+};
+use base qw(ZUP::Panel);
+
+use strict;
+use Data::Dumper;
+use File::Find ();
+use File::Basename;
+use POSIX qw(strftime);
+#  perl-link processed: use ZUP::Parser;
+
+BEGIN {
+package ZUP::Parser;
+
+use strict;
+use POSIX qw(strftime);
+use File::Basename;
+use Data::Dumper;
+use Sys::Hostname;
+use Cpanel::DnsUtils::Fetch;
+use Cpanel::ZoneFile;
+
+our $VERSION = "1.1.2";
+our $errstr  = "";
+my $hostname = hostname();
+our $spf_include;
+
+if($hostname =~ /\.ehost\.com$/) {
+        $spf_include = "include:ehost.com";
+} elsif($hostname =~ /\.ehosts\.com$/) {
+        $spf_include = "include:ehosts.com";
+} elsif($hostname =~ /\.ideahost\.com$/) {
+        $spf_include = "include:ideahost.com";
+} elsif($hostname =~ /\.hostclear\.com$/) {
+        $spf_include = "include:hostclear.com";
+} else {
+        $spf_include = "include:websitewelcome.com";
+}
+
+sub new {
+
+	my $class    = shift;
+	my $zonefile = shift;
+
+	my $self              = {};
+	$self->{class}        = $class;
+	$self->{zonefile}     = $zonefile;
+	$self->{domain}       = "";
+	$self->{errstr}       = "";
+	$self->{changed}      = 0;
+	$self->{DNS_RECORDS}  = {};
+	$self->{origuid}      = "-1";
+	$self->{origgid}      = "-1";
+	$self->{zonebackup}   = "";
+	$self->{starttime}    = strftime( "%m/%d/%Y %H:%M:%S", localtime( time ) );
+	bless($self, $class);
+	if ($zonefile =~ /\.((hostgator|websitewelcome)\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear)\.com).db$/) {
+		$errstr = "[!] You are attempting to make modifications to a Shared/Reseller server's zone file.  Check your Syntax!";
+		return;
+	}
+
+	# parse the file
+	$self->zoneparse();
+	if ($self->{errstr}) {
+		$errstr = "Failed to parse zone file - $self->{errstr}";
+		return;
+	} else {
+		return $self;
+	}
+}
+
+####
+#### File Interactions
+####
+
+# Input: path to zone file that will be parsed.
+sub zoneparse {
+
+	my $self         = shift;
+	my $zonefile     = shift || $self->{zonefile};
+	$self->{origuid} = (stat $zonefile)[4];
+	$self->{origgid} = (stat $zonefile)[5];
+	my $zone_contents;
+
+	my $reading_header = 1;
+	my $header;
+
+	open( my $inZONE, '<', $zonefile ) or $self->{errstr} = "Could not open input file: '$zonefile':$!" and return 0;
+	while (<$inZONE>) {
+		if ($_ !~ m/^\s*;/) {
+			$reading_header = 0;
+		}	
+		if ($reading_header) {
+			$header .= $_ unless $_ =~ m/ZUP/;
+		} else {
+			$zone_contents .= $_;
+		}
+	}
+	close($inZONE);
+	$self->{zonebackup} = $header.$zone_contents;
+	if ($zonefile ne $self->{zonefile}) {
+		$self->{zonefile} = $zonefile;
+	}
+	$self->{DNS_RECORDS}->{header} = $header;
+
+	my $records = clean_records($zone_contents);
+
+	#print Dumper $records;
+
+	my @ESCAPABLE_CHARACTERS   = qw/ ; " \\\\ /;
+	my $rr_class               = qr/(?:IN|HS|CH)/i;
+	my $rr_ttl                 = qr/(?:\d+[wdhms]?)+/i;
+	my $valid_name_start_char  = q/(?:[\p{IsAlnum}\@_\-*:+=!#$%^&`~,\[\]{}|?'\/]|/ . join( '|', map { "\\\\$_" } @ESCAPABLE_CHARACTERS ) . ')';
+
+	# The above, but adds the literal '.' character.
+	my $valid_name_char        = qr/(?:$valid_name_start_char|[\.\\])/o;
+	my $valid_txt_char         = qr/\S+/o;
+	my $valid_quoted_txt_char  = qr/.+/o;
+
+	# Like the above, but adds whitespace (space and tabs) too.
+	my $valid_quoted_name_char = qr/(?:$valid_name_start_char|[. ;\t()\\])/o;
+	my $valid_name             = qr/$valid_name_start_char$valid_name_char*/o;
+	my $valid_ip6              = qr/[\@a-zA-Z_\-\.0-9\*:]+/;
+	my $rr_type                = qr/\b(?:NS|A|CNAME)\b/i;
+	my $ttl_cls                = qr/(?:\b((?:$rr_ttl))\s)?(?:\b((?:$rr_class)|(?:$rr_ttl))\s)?/o;
+	my $generate_range         = qr{\d+\-\d+(?:/\d+)?};
+	my $last_good_line;
+	# Our record arrays.
+	$self->{DNS_RECORDS}->{NS_records}    = [];
+	$self->{DNS_RECORDS}->{A_records}     = [];
+	$self->{DNS_RECORDS}->{CNAME_records} = [];
+	$self->{DNS_RECORDS}->{IP6A_records}  = [];
+	$self->{DNS_RECORDS}->{MX_records}    = [];
+	$self->{DNS_RECORDS}->{SRV_records}   = [];
+	$self->{DNS_RECORDS}->{SOA_records}   = [];
+	$self->{DNS_RECORDS}->{PTR_records}   = [];
+	$self->{DNS_RECORDS}->{TXT_records}   = [];
+
+	foreach (@$records) {
+		next if /^\s*$/; # nothing to do on blank lines.
+
+		# Should match A, CNAME and NS records
+		if (/^($valid_name)? \s+ $ttl_cls ($rr_type) \s ($valid_name)/ixo) {
+			my ( $name, $ttl, $class, $type, $host ) = ( $1, $2, $3, $4, $5 );
+			my %record = (
+						   'name'  => $name,
+						   'ttl'   => $ttl,
+						   'class' => $class,
+						   'type'  => $type,
+						   'host'  => $host
+			);
+			if ( uc $type eq 'NS' ) {
+				push @{ $self->{DNS_RECORDS}->{NS_records} }, \%record;
+			} elsif ( uc $type eq 'A' ) {
+				push @{ $self->{DNS_RECORDS}->{A_records} }, \%record;
+			} elsif ( uc $type eq 'CNAME' ) {
+				push @{ $self->{DNS_RECORDS}->{CNAME_records} }, \%record;
+			}
+		} elsif (/^($valid_name)? \s+ $ttl_cls AAAA \s ($valid_ip6)/ixo) {
+
+			# Should match ipv6 A records
+			my ( $name, $ttl, $class, $host ) = ( $1, $2, $3, $4 );
+			my %record = (
+						   'name'  => $name,
+						   'ttl'   => $ttl,
+						   'class' => $class,
+						   'host'  => $host,
+			);
+			push @{ $self->{DNS_RECORDS}->{IP6A_records} }, \%record;
+		
+		} elsif (/^($valid_name)? \s+ $ttl_cls MX \s+ (\d+) \s+ ($valid_name_char+)/ixo) {
+
+			# MX records
+			my ( $name, $ttl, $class, $pri, $host ) = ( $1, $2, $3, $4, $5 );
+			my %record = (
+						   'name'     => $name,
+						   'ttl'      => $ttl,
+						   'class'    => $class,
+						   'priority' => $pri,
+						   'host'     => $host
+			);
+			push @{ $self->{DNS_RECORDS}->{MX_records} }, \%record;
+		
+		} elsif (/^($valid_name)? \s+ $ttl_cls SRV \s+ (\d+) \s+ (\d+) \s+ (\d+) \s+ ($valid_name) /ixo) {
+
+			# SRV records
+			my ( $name, $ttl, $class, $pri, $weight, $port, $host ) = ( $1, $2, $3, $4, $5, $6, $7 );
+			my %record = (
+						   'name'     => $name,
+						   'ttl'      => $ttl,
+						   'class'    => $class,
+						   'priority' => $pri,
+						   'weight'   => $weight,
+						   'port'     => $port,
+						   'host'     => $host
+			);
+			push @{ $self->{DNS_RECORDS}->{SRV_records} }, \%record;
+			
+		} elsif (/^($valid_name) \s+  $ttl_cls SOA \s+ ($valid_name) \s+ ($valid_name) \s+ ($rr_ttl) \s+($rr_ttl) \s+ ($rr_ttl) \s+ ($rr_ttl) \s+ ($rr_ttl)/ixo) {
+
+			# SOA records
+			my %SOA_record = (
+							   'origin'     => $1,
+							   'ttl'        => $2,
+							   'class'      => $3,
+							   'primary'    => $4,
+							   'email'      => $5,
+							   'serial'     => $6,
+							   'refresh'    => $7,
+							   'retry'      => $8,
+							   'expire'     => $9,
+							   'minimumTTL' => $10
+			);
+			push @{ $self->{DNS_RECORDS}->{SOA_records} }, \%SOA_record;
+		
+		} elsif (/^($valid_name)? \s+ $ttl_cls PTR \s+ ($valid_name)/ixo) {
+
+			# PTR records
+			my %record = ( 
+						   'name'  => $1,
+						   'ttl'   => $2,
+						   'class' => $3,
+						   'host'  => $4
+			);
+			push @{ $self->{DNS_RECORDS}->{PTR_records} }, \%record;
+			
+		} elsif (/($valid_name)? \s+ $ttl_cls TXT \s+ ("$valid_quoted_txt_char*(?<!\\)"|$valid_txt_char+)/ixo) {
+
+			# TXT records
+			my %record = ( 
+						   'name'  => $1,
+						   'ttl'   => $2,
+						   'class' => $3,
+						   'host'  => $4
+			);
+			push @{ $self->{DNS_RECORDS}->{TXT_records} }, \%record;
+
+		} elsif (/^\s*\$TTL \s+ ($rr_ttl)/ixo) {
+
+			# Default $TTL setting
+			my %record = ( 'ttl' => $1 );
+			$self->{DNS_RECORDS}->{TTL_record} = \%record;
+
+		} elsif (/^\s*\$ORIGIN\s+($valid_name_char+)/io) {
+
+			# $ORIGIN setting - should never be set on a cpanel server, so nothing of major importance needs to be done here.
+			# do nothing.
+			$self->{DNS_RECORDS}->{ORIGIN_record} .= "$_\n";
+		} elsif (/^ \s* \$GENERATE \s+($generate_range) \s+ ($valid_name) \s+ (?:($rr_ttl) \s+)? (?:($rr_class) \s+)? ([a-z]+) \s+ ($valid_name) /ixo) {
+
+			# $GENERATE statements should never be present on a cpanel server. so ignoring these too.
+			# do nothing
+			$self->{DNS_RECORDS}->{GENERATE_records} .= "$_\n";
+		} else {
+			 $self->{errstr} = "Unknown record type: '$_'";
+			 return 0;
+		}
+	}
+	if (not $self->{DNS_RECORDS}->{Origin_record}) {
+		( $self->{domain} = basename($self->{zonefile}) ) =~ s/\.db$//;
+	} else {
+		( $self->{domain} = $self->{DNS_RECORDS}->{Origin_record} ) =~ s/^\s*\$ORIGIN\s+//;
+	}
+	return 1;
+}
+
+# Restore the zone file back to what it was.
+sub restorezone {
+
+	my $self     = shift;
+	my $zonefile = $self->{zonefile};
+	open my $zonefile_fh, ">", $zonefile or $self->{errstr} = "Could not open file for writing: '$zonefile': $!" and return 0;
+	print $zonefile_fh $self->{zonebackup};
+	return 1;
+}
+
+# Input: Path to file where the new zone data will be written.
+#        If no input is specified, it will write to the zone file itself.
+sub savezone {
+
+	my $self    = shift;
+	my $newfile = shift || $self->{zonefile};
+
+	if ($self->{changed}) {
+		$self->update_serial();
+	}
+
+	open my $newfile_fh, ">", $newfile or $self->{errstr} = "Could not open file for writing: '$newfile':$!" and return;
+	print $newfile_fh $self->{DNS_RECORDS}->{header};
+	print $newfile_fh "; ZUP Updated on ".$self->{starttime}."\n";
+	print $newfile_fh $self->{DNS_RECORDS}->{ORIGIN_record};
+	print $newfile_fh $self->stringify_ttl();
+	print $newfile_fh $self->stringify_soa_records();
+	print $newfile_fh "\n; NS Records\n";
+	print $newfile_fh $self->stringify_ns_records();
+	print $newfile_fh "\n; MX Records\n";
+	print $newfile_fh $self->stringify_mx_records();
+	print $newfile_fh "\n; ipv4 A records\n";
+	print $newfile_fh $self->stringify_a_records();
+
+	if (scalar @{$self->{DNS_RECORDS}->{CNAME_records}}) {
+		print $newfile_fh "\n; CNAME Records\n";
+		print $newfile_fh $self->stringify_cname_records();
+	}
+	if (scalar @{$self->{DNS_RECORDS}->{TXT_records}}) {
+		print $newfile_fh "\n; TXT records\n";
+		print $newfile_fh $self->stringify_txt_records();
+	}
+	if (scalar @{$self->{DNS_RECORDS}->{IP6A_records}}) {
+		print $newfile_fh "\n; ipv6 A records\n";
+		print $newfile_fh $self->stringify_ip6a_records();
+	}
+	if (scalar @{$self->{DNS_RECORDS}->{SRV_records}}) {
+		print $newfile_fh "\n; SRV records\n";
+		print $newfile_fh $self->stringify_srv_records();
+	}
+	if (scalar @{$self->{DNS_RECORDS}->{PTR_records}}) {
+		print $newfile_fh "\n; PTR records\n";
+		print $newfile_fh $self->stringify_ptr_records();
+	}
+	if (exists $self->{DNS_RECORDS}->{GENERATE_records}) {
+		print $newfile_fh "\n; \$GENERATE records\n";
+		print $newfile_fh $self->{DNS_RECORDS}->{GENERATE_records};
+	}
+	close $newfile_fh;
+	if (defined $self->{origuid} and defined $self->{origgid}) {
+		chown $self->{origuid}, $self->{origgid}, $newfile or $self->{errstr} = "Could not update file ownership: '$newfile':$!" and return;
+	}
+	return 1;
+}
+
+sub validatezone {
+
+	my $self     = shift;
+	my $namedc   = shift;
+	my $zonefile = shift || $self->getzonefile();
+	(my $domain  = $self->{domain}) =~ s/\.$//;
+
+	my $check = `$namedc $domain $zonefile`;
+	if ($check =~ m/OK$/) {
+		return 0;
+	} else {
+		return $check;
+	}
+}
+
+sub update_named_cache {
+
+  my $self   = shift;
+  my @domain = shift;
+
+  if (@domain) {
+    my $ZoneRecordRef = Cpanel::DnsUtils::Fetch::fetch_zones( 'zones' => \@domain);
+    my $ZoneFile = Cpanel::ZoneFile->new( 'text' => $ZoneRecordRef->{$domain[0]}, 'domain' => $domain[0] );
+    $ZoneFile->increase_serial_number();
+  }
+}
+
+# Returns false if 'rndc reload zone' is successful; returns full output otherwise.
+sub rndcreload {
+	my $self   = shift;
+	(my $dom   = $self->{domain}) =~ s/\.$//;
+	my ( $rndc, $check);
+    my @zones = ("internal", "external");
+
+    foreach my $zone (@zones) {
+        $rndc .= `rndc reload $dom in $zone 2>&1`;
+        if ($? != 0) {
+            print "There was a problem reloading $dom in zone \"$zone\".\n";
+            $check = 1;
+        }
+        sleep 1;
+    }
+
+    if ($check) { return $rndc; }
+    else { return; }
+}
+
+####
+#### Retrieve records
+####
+
+sub getzonefile {
+
+	my $self = shift;
+	if (exists $self->{zonefile}) {
+		return $self->{zonefile};
+	}
+	return;
+}
+
+sub getdomainname {
+
+	my $self = shift;
+	if ($self->{domain}) {
+		return $self->{domain};
+	}
+	return;
+}
+# Returns an array of hashes that contain details about the A records.
+sub get_a_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{A_records};
+}
+
+# Returns an array of hashes that contain details about the CNAME records.
+sub get_cname_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{CNAME_records};
+}
+
+# Returns an array of hashes that contain details about the ipv6 A records.
+sub get_ip6a_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{IP6A_records};
+}
+
+# Returns an array of hashes that contain details about the NS records.
+sub get_ns_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{NS_records};
+}
+
+# Returns an array of hashes that contain details about the MX records.
+sub get_mx_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{MX_records};
+}
+
+# Returns an array of hashes that contain details about the SOA records.
+sub get_soa_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{SOA_records};
+}
+
+# Returns an array of hashes that contain details about the A records.
+sub get_srv_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{SRV_records};
+}
+
+# Returns an array of hashes that contain details about the A records.
+sub get_ptr_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{PTR_records};
+}
+
+# Returns an array of hashes that contain details about the TTL records.
+sub get_ttl_record {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{TTL_record};
+}
+
+# Returns an array of hashes that contain details about the TXT records.
+sub get_txt_records {
+
+	my $self = shift;
+	return $self->{DNS_RECORDS}->{TXT_records};
+}
+
+# Returns the current value for the serial in the SOA record.
+sub get_serial {
+
+	my $self = shift;
+	my $soa_record = @{$self->get_soa_records()}[0];
+	
+	return $soa_record->{serial};
+}
+
+# Returns the errstr set by the individual calls within the module
+sub get_errmsg {
+
+	my $self = shift;
+	return $self->{errstr};
+}
+
+####
+#### Update records
+####
+
+# Input: A string with the new authoritative server name. Example:
+# "ns1.newdomain.com"
+# Set's the authoritive NS in the SOA record
+sub set_soa_auth {
+
+	my $self       = shift;
+	my $new_auth   = shift;
+	my $soa_record = $self->get_soa_records()->[0];
+	if ($soa_record and ref $soa_record eq 'HASH') {
+		$self->{changed} = 1;
+		$soa_record->{primary} = $new_auth;
+		return 1;
+	}
+	return;
+}
+
+# Input: A string with the new SOA email address. Example:
+# "root.newdomain.com"
+# Set's the email address in the SOA record
+sub set_soa_email {
+
+	my $self = shift;
+	my $new_email = shift;
+	my $soa_record = $self->get_soa_records()->[0];
+	if ($soa_record and ref $soa_record eq 'HASH') {
+		$self->{changed} = 1;
+		$soa_record->{email} = $new_email;
+		return 1;
+	}
+	return;
+}
+
+# Input: A hash with the following { "Index" => "new host record" }. Example:
+# (1 => "ns1.new.com", 2 => "ns2.new.com"), etc;
+# If the index values go past the number of NS records currently with the zone file,
+# then new NS records will be created.
+sub set_ns_records {
+
+	my $self    = shift;
+	my $newNS   = shift;
+	my $curNS   = $self->get_ns_records();
+	my @indexes = keys %$newNS;
+
+	if ( grep { $_ <= 0 } @indexes ) {
+		$self->{errstr} = "NS records passed do not have valid indexes!";
+		return 0;
+	} else {
+		$self->{changed} = 1;
+		foreach my $n (@indexes) {
+			if ( $n <= scalar(@{$curNS}) ) {
+				@{$curNS}[$n-1]->{host} = $newNS->{$n};
+			} else {
+				my %record = (
+							   'name'  => @{$curNS}[0]->{name},
+							   'ttl'   => @{$curNS}[0]->{ttl},
+							   'class' => @{$curNS}[0]->{class},
+							   'type'  => @{$curNS}[0]->{type},
+							   'host'  => $newNS->{$n}
+				);
+				push @{$curNS}, \%record;
+			}
+		}
+		return 1;
+	}
+}
+
+# Input: A hash with the following { "record" => "priority" }. Example:
+# ("mx1.domain.com" => "10", "mx2.domain.com" => "5"), etc;
+# This will remove the current MX records and replace them with records
+# for the input.
+sub set_mx_records {
+
+	my $self  = shift;
+	my $newMX = shift;
+	my $curMX = $self->get_mx_records();
+	$self->{changed} = 1;
+
+	my ($curname, $curttl, $curclass);
+	if (@{$curMX}) {
+		($curname, $curttl, $curclass) = (@{$curMX}[0]->{name}, @{$curMX}[0]->{ttl}, @{$curMX}[0]->{class});
+		@{$curMX} = ();
+	} else {
+		($curname, $curttl, $curclass) = ("@", $self->get_ttl_record()->{ttl}, "IN");
+	}
+
+	foreach my $host (keys %$newMX) {
+		my %record = (
+					   'name'     => $curname,
+					   'ttl'      => $curttl,
+					   'class'    => $curclass,
+					   'priority' => $newMX->{$host},
+					   'host'     => $host
+		);
+		push @{$curMX}, \%record;
+	}
+	return 1;
+}
+
+# Input: Hash with the following { "record" => "host/ip"}. Example:
+# ("mail" => "66.123.13.23.", "secret" => "111.11.11.11"), etc;
+# If the record already exists then it will be updated, if not it will be added.
+# Note: This will check for and remove any duplicate CNAME records with the same record name.
+sub set_a_records {
+
+	my $self   = shift;
+	my $newA   = shift;
+	my $curA   = $self->get_a_records();
+	my $curC   = $self->get_cname_records();
+	my $domain = $self->{domain};
+	$domain   .= substr($_[0], -1) eq "." ? "" : "."; # add '.' if needed
+	$self->{changed} = 1;
+
+	foreach my $newname (keys %$newA) {
+		# clean the CNAME records of any duplicates
+		foreach my $index (0 .. $#{$curC}) {
+			if (lc ($curC->[$index]->{name}) eq lc $newname) {
+				delete $curC->[$index];
+			}
+		}
+		# check if a record for this hostname already set.
+		foreach (@{$curA}) {
+			if (lc ($_->{name}) eq lc ($newname)) {
+				$_->{host} = $newA->{$newname};
+				delete $newA->{$newname};
+			}
+			if ( ($newname eq '@') and ($_->{name} eq $domain) ) {
+				$_->{host} = $newA->{$newname};
+				delete $newA->{$newname};
+			}
+		}
+	}
+
+	# now we only have new records left to deal with, so
+	# go through those and add new records for them.
+	my ($ttl, $class, $type);
+	if (not @{$curA}) {
+		$ttl   = $self->get_ttl_record()->{ttl};
+		$class = "IN";
+		$type  = "A";
+	} else {
+		$ttl   = @{$curA}[0]->{ttl};
+		$class = @{$curA}[0]->{class};
+		$type  = @{$curA}[0]->{type};
+	}
+
+	foreach my $newname (keys %$newA) {
+		my %record = (
+					   'name'  => $newname,
+					   'ttl'   => $ttl,
+					   'class' => $class,
+					   'type'  => $type,
+					   'host'  => $newA->{$newname}
+					 );
+		push @{$curA}, \%record;
+	}
+	return 1;
+}
+
+# Input: Hash with the following structure: ("old ip1" => "new ip1", "old ip2" => "new ip2", etc). Example:
+# ("50.23.11.22" => "66.123.13.23", "50.23.11.23" => "50.23.22.23"), etc;
+# Output: None - it alters the hash passed in such that
+# the values are the number of replacements for each IP.
+sub update_ips_in_a_records {
+
+	my $self  = shift;
+	my $ips   = shift;
+	my $curA  = $self->get_a_records();
+	my $count = 0;
+	$self->{changed} = 1;
+
+	foreach my $oip (keys %{$ips}) {
+		my $nip = $ips->{$oip};
+		$ips->{$oip} = 0;
+		foreach my $record (@{$curA}) {
+			if ($record->{host} eq $oip) {
+				$record->{host} = $nip;
+				$ips->{$oip}++;
+			}
+		}
+	}
+}
+
+# Input: Hash with the following { "record" => "fqdn"}. Example:
+# ("mail" => "ghs.google.com.", "docs" => "ghs.google.com."), etc;
+# If the record already exists then it will be updated, if not it will be added.
+# Note: This will check for and remove any duplicate A records with the same record name.
+sub set_cname_records {
+
+	my $self = shift;
+	my $newC = shift;
+	my $curC = $self->get_cname_records();
+	my $curA = $self->get_a_records();
+	$self->{changed} = 1;
+	foreach my $newname (keys %$newC) {
+		# clean the A records for any duplicates
+		foreach my $index ( 0 .. $#{$curA}) {
+			if (lc ($curA->[$index]->{name}) eq lc $newname) {
+				delete $curA->[$index];
+			}
+		}
+		# check if a record for this hostname already set.
+		foreach (@{$curC}) {
+			if (lc ($_->{name}) eq lc ($newname)) {
+				$_->{host} = $newC->{$newname};
+				delete $newC->{$newname};
+			}
+		}
+	}
+
+	# now we only have new records left to deal with, so
+	# go through those and add new records for them. 
+	my ($ttl, $class, $type);
+	if (not @{$curC}) {
+		$ttl   = $self->get_ttl_record()->{ttl};
+		$class = "IN";
+		$type  = "CNAME";
+	} else {
+		$ttl   = @{$curC}[0]->{ttl};
+		$class = @{$curC}[0]->{class};
+		$type  = @{$curC}[0]->{type};
+	}
+
+	foreach my $newname (keys %$newC) {
+		my %record = (
+					   'name'  => $newname,
+					   'ttl'   => $ttl,
+					   'class' => $class,
+					   'type'  => $type,
+					   'host'  => $newC->{$newname}
+					 );
+		push @{$curC}, \%record;
+	}
+	return 1;
+}
+
+sub set_gapps {
+
+	my $self      = shift;
+	my %mxrecords = ("ASPMX.L.GOOGLE.COM."      => "1",
+                     "ALT1.ASPMX.L.GOOGLE.COM." => "5",
+                     "ALT2.ASPMX.L.GOOGLE.COM." => "5",
+                     "ASPMX2.GOOGLEMAIL.COM."   => "10",
+                     "ASPMX3.GOOGLEMAIL.COM."   => "10");
+
+	my %cnrecords = ("mail"     => "ghs.google.com.",
+                     "docs"     => "ghs.google.com.",
+                     "start"    => "ghs.google.com.",
+                     "calendar" => "ghs.google.com.",
+                     "sites"    => "ghs.google.com.");
+
+	$self->set_mx_records(\%mxrecords);
+	$self->set_spf_record("\"v=spf1 a mx include:_spf.google.com ~all\"");
+	$self->set_cname_records(\%cnrecords);
+	return 1;
+}
+
+sub set_winlive {
+
+	my $self      = shift;
+	my $hostid    = shift;
+	my %mxrecords = ("$hostid.pamx1.hotmail.com." => "10");
+	my %cnrecords = ($hostid => "domains.live.com.");
+	$self->set_mx_records(\%mxrecords);
+	$self->set_spf_record("\"v=spf1 a mx include:hotmail.com ~all\"");
+	$self->set_srv_record("_sipfederationtls._tcp", "10", "2", "5061", "federation.messenger.msn.com.");
+	$self->set_cname_records(\%cnrecords);
+	return 1;
+}
+
+sub set_godaddy {
+
+	my $self      = shift;
+	my %mxrecords = ("smtp.secureserver.net."       => "10",
+	                 "mailstore1.secureserver.net." => "20");
+	my %cnrecords = ("mail" => "pop.secureserver.net.");
+	$self->set_mx_records(\%mxrecords);
+	$self->set_cname_records(\%cnrecords);
+	return 1;
+}
+
+sub set_office365 {
+
+	my $self      = shift;
+	(my $mxhost   = $self->{domain}) =~ s/\.$//;
+	$mxhost	      =~ s/\./\-/g;
+	my %mxrecords = ("${mxhost}.mail.protection.outlook.com." => "0");
+	my %cnrecords = ("autodiscover" => "autodiscover.outlook.com.");
+	$self->set_mx_records(\%mxrecords);
+	$self->set_spf_record("\"v=spf1 a mx ".$spf_include." include:outlook.com ~all\"");
+	$self->set_srv_record("_sip._tls", "100", "1", "443", "sipdir.online.lync.com.");
+	$self->set_srv_record("_sipfederationtls._tcp", "100", "1", "5061", "sipfed.online.lync.com.");
+	$self->set_cname_records(\%cnrecords);
+	return 1;
+}
+
+# Input: record name, priority, weight, port, and host. Example:
+# ("_sipfederationtls._tcp", "10", "2", "5061", "federation.messenger.msn.com.")
+sub set_srv_record {
+
+	my $self     = shift;
+	my $name     = shift;
+	my $priority = shift;
+	my $weight   = shift;
+	my $port     = shift;
+	my $host     = shift;
+	my $domain   = $self->{domain};
+	$domain     .= substr($_[0], -1) eq "." ? "" : "."; # add '.' if needed
+
+	my $curSRV   = $self->get_srv_records();
+	my %record   = ( 'name'     => $name.".".$domain,
+	                 'ttl'      => $self->get_ttl_record()->{ttl},
+	                 'class'    => "IN",
+	                 'priority' => $priority,
+	                 'weight'   => $weight,
+	                 'port'     => $port,
+	                 'host'     => $host 
+	               );
+	push @{$curSRV}, \%record;
+	return 1;
+}
+
+# Input: full quoted string for new SPF. Example:
+# \"v=spf1 a mx include:websitewelcome.com include:outlook.com ~all\"
+sub set_spf_record {
+
+	my $self   = shift;
+	my $newspf = shift;
+	my $curTXT = $self->get_txt_records();
+
+	if (scalar @{$curTXT}) {
+		foreach (@{$curTXT}) {
+			if ($_->{host} =~ m/spf1/) {
+				$_->{host} = $newspf;
+				return 1;
+			}
+		}
+	} else {
+		my ($name, $ttl, $class) = ("@", $self->get_ttl_record()->{ttl}, "IN");
+		my %record = (
+					   'name'  => $name,
+					   'ttl'   => $ttl,
+					   'class' => $class,
+					   'host'  => $newspf
+			);
+		push @{$curTXT}, \%record;
+		return 1;
+	}
+	return 0;
+}
+
+# Input: hash of 'dkim host => dkim key'. Example:
+# ('default._domainkey' => 'v=DKIM1\; k=rsa\; p=MHwwDQYJKoZIhvcNAQEBBQADawAwaAJhALYyW31r0Kt4ufPX29cZZ619nKE/Fx01rtdDBggTzgny581S0/KdU5in+iYyJbtuR4shMv0sqvjo14024sG9fjiqh2qBuDRCUm9GHdHyhwjMfLDKCjNvuFNJg8s41fHJkQIDAQAB\;')
+sub set_dkim_records {
+
+	my $self    = shift;
+	my $newdkim = shift;
+	my $curTXT  = $self->get_txt_records();
+
+	foreach my $record (keys %{$newdkim}) {
+		if (scalar @{$curTXT}) {
+			foreach (@{$curTXT}) {
+				if ($_->{host} =~ m/dkim/i) {
+					$_->{host} = $newdkim->{$record};
+					return 1;
+				}
+			}
+		}
+		my ($name, $ttl, $class) = ($record, $self->get_ttl_record()->{ttl}, "IN");
+		my %record = (
+					   'name'  => $name,
+					   'ttl'   => $ttl,
+					   'class' => $class,
+					   'host'  => $newdkim->{$record}
+		);
+		push @{$curTXT}, \%record;
+		return 1;
+	}
+	return 0;
+}
+
+# Input: none
+# Will get automatically called whenever the records
+# have been updated via one of the update methods.
+sub update_serial {
+
+	my $self       = shift;
+	my $soa_record = @{$self->get_soa_records()}[0];
+	my $newserial  = strftime( "%Y%m%d%H", localtime( time ) );
+
+	$soa_record->{serial} = ( $newserial > $soa_record->{serial} ) ? $newserial : $soa_record->{serial} + 1;
+
+	return $soa_record->{serial};
+}
+
+
+####
+#### Print Records
+####
+
+sub stringify_ttl {
+
+	my $self = shift;
+	my $output;
+	
+	my $record = $self->get_ttl_record();
+	if ($record) {
+		next if not (keys %$record);
+		$output .= "\$TTL $record->{ttl}\n";
+	}
+	return $output;	
+}
+
+sub stringify_ns_records {
+
+	my $self = shift;
+	my $output;
+	
+	foreach my $record (@{$self->get_ns_records()}) {
+		next if not (keys %$record);
+		$output .= sprintf "%-25s\t%5s\t%2s\tNS\t%s\n", $record->{name}, $record->{ttl}, $record->{class}, $record->{host};
+	}
+	return $output;
+}
+
+sub stringify_a_records {
+
+	my $self = shift;
+	my $output;
+	
+	foreach my $record (@{$self->get_a_records()}) {
+		next if not (keys %$record);
+		$output .= sprintf "%-25s\t%5s\t%2s\tA\t%s\n", $record->{name}, $record->{ttl}, $record->{class}, $record->{host};
+	}
+	return $output;
+}
+
+sub stringify_cname_records {
+
+	my $self = shift;
+	my $output;
+
+	foreach my $record (@{$self->get_cname_records()}) {
+		next if not (keys %$record);
+		$output .= sprintf "%-25s\t%5s\t%2s\tCNAME\t%s\n", $record->{name}, $record->{ttl}, $record->{class}, $record->{host};
+	}
+	return $output;
+}
+
+sub stringify_ip6a_records {
+
+	my $self = shift;
+	my $output;
+	
+	foreach my $record (@{$self->get_ip6a_records()}) {
+		next if not (keys %$record);
+		$output .= sprintf "%-25s\t%5s\t%2s\tAAAA\t%s\n", $record->{name}, $record->{ttl}, $record->{class}, $record->{host};
+	}
+	return $output;
+}
+
+sub stringify_soa_records {
+
+	my $self = shift;
+	my $output;
+	
+	foreach my $record (@{$self->get_soa_records()}) {
+		next if not (keys %$record);
+		$output .= "$record->{origin}\t$record->{ttl}\t$record->{class}\tSOA\t$record->{primary}\t$record->{email} (\n";
+		$output .= "\t\t$record->{serial}\t; serial\n";
+		$output .= "\t\t$record->{refresh}\t\t; refresh, seconds\n";
+		$output .= "\t\t$record->{retry}\t\t; retry, seconds\n";
+		$output .= "\t\t$record->{expire}\t\t; expire, seconds\n";
+		$output .= "\t\t$record->{minimumTTL} )\t\t; minimum, seconds\n";
+	}
+	return $output;
+}
+
+sub stringify_mx_records {
+
+	my $self = shift;
+	my $output;
+	
+	foreach my $record (sort {$a->{priority} <=> $b->{priority}} @{$self->get_mx_records()}) {
+		next if not (keys %$record);
+		$output .= sprintf "%-25s\t%5s\t%2s\tMX\t%2s\t%s\n", $record->{name}, $record->{ttl}, $record->{class}, $record->{priority}, $record->{host};
+	}
+	return $output;
+}
+
+sub stringify_txt_records {
+
+	my $self = shift;
+	my $output;
+	
+	foreach my $record (@{$self->get_txt_records()}) {
+		next if not (keys %$record);
+		$output .= sprintf "%-25s\t%5s\t%2s\tTXT\t%s\n", $record->{name}, $record->{ttl}, $record->{class}, $record->{host};
+	}
+	return $output;
+}
+
+sub stringify_srv_records {
+
+	my $self = shift;
+	my $output;
+	
+	foreach my $record (@{$self->get_srv_records()}) {
+		next if not (keys %$record);
+		$output .= sprintf "%-25s\t%5s\t%2s\tSRV\t%2s\t%2s\t%4s\t%s\n", $record->{name}, $record->{ttl}, $record->{class}, $record->{priority}, $record->{weight}, $record->{port}, $record->{host};
+	}
+	return $output;
+}
+
+sub stringify_ptr_records {
+
+	my $self = shift;
+	my $output;
+	
+	foreach my $record (@{$self->get_ptr_records()}) {
+		next if not (keys %$record);
+		$output .= sprintf "%-25s\t%5s\t%2s\tPTR\t%s\n", $record->{name}, $record->{ttl}, $record->{class}, $record->{host};
+	}
+	return $output;
+}
+
+sub clearerr {
+
+	my $self = shift;
+	$self->{errstr} = "";
+	return 1;
+}
+
+####
+#### Private methods that shoud only be called within the module
+####
+
+sub clean_records {
+
+	my $zone            = shift;
+	my $x               = 0;
+	my $in_comment      = 0;
+	my $in_quote        = 0;
+	my $in_concat       = 0;
+	my $last_char       = '';
+	my $next_is_escaped = 0;
+	my @lines;
+
+	$zone =~ s/\r\n/\n/sg;
+	$zone =~ s{[ \t]+}{ }g;    # Collapse whitespace, turn TABs to spaces.
+
+	# Trim comments, handle parentheses and some escape sequences.
+	while (1) {
+		my $c = substr( $zone, $x, 1 );
+
+		# If we're not in a comment then process parentheses, braces, comment
+		# tags, and quotes. If not, just look for the newline.
+		if ( !$in_comment ) {
+			if ( !$next_is_escaped ) {
+				if ( $c eq '"' ) {
+					$in_quote = !$in_quote;
+				} elsif ( $c eq '\\' ) {
+					$next_is_escaped = 1;
+				} elsif ( !$in_quote ) {
+					if ( $c eq ';' ) {
+						$in_comment = 1;
+						substr( $zone, $x, 1 ) = '';
+						$x--;
+					} elsif ( $c eq '(' ) {
+						substr( $zone, $x, 1 ) = ' ';
+						$in_concat++;
+					} elsif ( ($in_concat) && ( $c eq ')' ) ) {
+						substr( $zone, $x, 1 ) = ' ';
+						$in_concat--;
+					}
+				}
+			} else {
+				$next_is_escaped = 0;
+			}
+		} elsif ( $c ne "\n" ) {
+			substr( $zone, $x, 1 ) = '';
+			$x--;
+		}
+		if ( $c eq "\n" ) {
+			$in_comment = 0;
+			if ($in_concat) {
+				substr( $zone, $x, 1 ) = '';
+				$x--;
+			}
+		}
+		$x++;
+		if ( $x >= length($zone) ) { last; }
+		$last_char = $c;
+	}
+
+	return [ split( /\n/, $zone ) ];
+}
+
+1;
+
+};
+BEGIN {
+ZUP::Parser->import();
+};
+$INC{'ZUP/Parser.pm'} = "/dev/null";
+#  perl-link processed: use ZUP::RCS;
+
+BEGIN {
+package ZUP::RCS;
+require 5.002;
+use strict;
+use Exporter;
+use Carp;
+use Time::Local;
+use vars qw($VERSION $revision);
+use subs qw(_rcsError);
+
+# Even though I don't really export anything, I use Exporter
+# to look for 'nonFatal' 'Verbose' tags.
+use vars qw(@ISA @EXPORT_OK);
+@ISA       = qw(Exporter);
+@EXPORT_OK = qw(nonFatal Verbose);
+
+#------------------------------------------------------------------
+# global stuff
+#------------------------------------------------------------------
+$VERSION  = '1.05';
+$revision = '$Id: Rcs.pm,v 1.28 2003/12/12 00:53:34 freter Exp $';
+my $Dir_Sep = ( $^O eq 'MSWin32' ) ? '\\'   : '/';
+my $Exe_Ext = ( $^O eq 'MSWin32' ) ? '.exe' : '';
+my $Rcs_Bin_Dir = '/usr/local/bin';
+my $Rcs_Dir     = '.' . $Dir_Sep . 'RCS';
+my $Work_Dir    = '.';
+my $Quiet       = 1;                        # RCS quiet mode
+my $nonFatal    = 0;                        # default to fatal
+my $Arc_Ext     = ',v';
+
+#------------------------------------------------------------------
+# RCS object constructor
+#------------------------------------------------------------------
+sub new {
+	my $proto = shift;
+	my $class = ref($proto) || $proto;
+	my $self  = {};
+
+	# provide default values for system stuff
+	$self->{"_BINDIR"}  = \$Rcs_Bin_Dir;
+	$self->{"_QUIET"}   = \$Quiet;
+	$self->{"_RCSDIR"}  = \$Rcs_Dir;
+	$self->{"_WORKDIR"} = \$Work_Dir;
+	$self->{"_ARCEXT"}  = \$Arc_Ext;
+
+	$self->{FILE}      = undef;
+	$self->{ARCFILE}   = undef;
+	$self->{AUTHOR}    = undef;
+	$self->{COMMENTS}  = undef;
+	$self->{DATE}      = undef;
+	$self->{LOCK}      = undef;
+	$self->{ACCESS}    = [];
+	$self->{REVISIONS} = [];
+	$self->{REVINFO}   = undef;
+	$self->{STATE}     = undef;
+	$self->{SYMBOLS}   = undef;
+	bless( $self, $class );
+
+	# Allow user to pass archive file to object constructor
+	# Example: Rcs->new('RCS/diskio.c,v')
+	if (@_) {
+		$self->pathname(shift);
+	}
+
+	return $self;
+}
+
+#------------------------------------------------------------------
+# Use import function to check for 'nonFatal' Tag.
+#------------------------------------------------------------------
+sub import {
+	my $pkg = shift;
+	$nonFatal = 1 if scalar grep /^nonFatal$/, @_;
+	$Quiet    = 0 if scalar grep /^Verbose$/,  @_;
+}
+
+#------------------------------------------------------------------
+# access
+# Access list of archive file.
+#------------------------------------------------------------------
+sub access {
+	my $self = shift;
+
+	if ( not @{ $self->{ACCESS} } ) {
+		_parse_rcs_header($self);
+	}
+
+	# dereference revisions list
+	my @access = @{ $self->{ACCESS} };
+
+	return @access;
+}
+
+#------------------------------------------------------------------
+# arcext
+# Set the RCS archive file extension (default is ',v').
+#------------------------------------------------------------------
+sub arcext {
+	my $self = shift;
+
+	# called as object method
+	if ( ref $self ) {
+		if (@_) { $self->{"_ARCEXT"} = shift }
+		return ref $self->{"_ARCEXT"}
+		  ? ${ $self->{"_ARCEXT"} }
+		  : $self->{"_ARCEXT"};
+	}
+
+	# called as class method
+	else {
+		if (@_) { $Arc_Ext = shift; }
+		return $Arc_Ext;
+	}
+}
+
+#------------------------------------------------------------------
+# arcfile
+# Name of RCS archive file.
+# If not set then return name of working file with RCS
+# extension (',v').
+#------------------------------------------------------------------
+sub arcfile {
+	my $self = shift;
+	if (@_) { $self->{ARCFILE} = shift }
+	return $self->{ARCFILE} || $self->file . $self->arcext;
+}
+
+#------------------------------------------------------------------
+# author
+# Return the author of an RCS revision.
+# If revision is not provided, default to 'head' revision.
+#------------------------------------------------------------------
+sub author {
+	my $self = shift;
+
+	if ( not defined $self->{AUTHOR} ) {
+		_parse_rcs_header($self);
+	}
+	my $revision = shift || $self->head;
+
+	# dereference author hash
+	my %author_array = %{ $self->{AUTHOR} };
+
+	return $author_array{$revision};
+}
+
+#------------------------------------------------------------------
+# bindir
+# Set the bin directory in which the RCS distribution programs
+# reside.
+#------------------------------------------------------------------
+sub bindir {
+	my $self = shift;
+
+	# called as object method
+	if ( ref $self ) {
+		if (@_) { $self->{"_BINDIR"} = shift }
+		return ref $self->{"_BINDIR"}
+		  ? ${ $self->{"_BINDIR"} }
+		  : $self->{"_BINDIR"};
+	}
+
+	# called as class method
+	else {
+		if (@_) { $Rcs_Bin_Dir = shift }
+		return $Rcs_Bin_Dir;
+	}
+}
+
+#------------------------------------------------------------------
+# ci
+# Execute RCS 'ci' program.
+# Make archive filename same as working filename unless
+# specifically set.
+#------------------------------------------------------------------
+sub ci {
+	my $self  = shift;
+	my @param = @_;
+
+	my $ciprog  = $self->bindir . $Dir_Sep . 'ci' . $Exe_Ext;
+	my $rcsdir  = $self->rcsdir;
+	my $workdir = $self->workdir;
+	my $file    = $self->file;
+	my $arcfile = $self->arcfile;
+
+	my $archive_file = $rcsdir . $Dir_Sep . $arcfile;
+	my $workfile     = $workdir . $Dir_Sep . $file;
+	push @param, $archive_file, $workfile;
+	unshift @param, "-q" if $self->quiet;    # quiet mode
+
+	# run program
+	return ( _rcsError "ci program $ciprog not found" ) unless -e $ciprog;
+	return ( _rcsError "ci program $ciprog not executable" )
+	  unless -x $ciprog;
+	system( $ciprog, @param ) == 0 or return ( _rcsError "$?" );
+
+	# re-parse RCS file and clear comments hash
+	_parse_rcs_header($self);
+	$self->{COMMENTS} = undef;
+	return 1;
+}
+
+#------------------------------------------------------------------
+# co
+# Execute RCS 'co' program.
+# Make archive filename same as working filename unless
+# specifically set.
+#------------------------------------------------------------------
+sub co {
+	my $self  = shift;
+	my @param = @_;
+
+	my $coprog  = $self->bindir . $Dir_Sep . 'co' . $Exe_Ext;
+	my $rcsdir  = $self->rcsdir;
+	my $workdir = $self->workdir;
+	my $file    = $self->file;
+	my $arcfile = $self->arcfile;
+
+	my $archive_file = $rcsdir . $Dir_Sep . $arcfile;
+	my $workfile     = $workdir . $Dir_Sep . $file;
+	push @param, $archive_file, $workfile;
+	unshift @param, "-q" if $self->quiet;    # quiet mode
+
+	# run program
+	return ( _rcsError "co program $coprog not found" ) unless -e $coprog;
+	return ( _rcsError "co program $coprog not executable" )
+	  unless -x $coprog;
+	system( $coprog, @param ) == 0 or return ( _rcsError "$?" );
+
+	# re-parse RCS file and clear comments hash
+	_parse_rcs_header($self);
+	$self->{COMMENTS} = undef;
+	return 1;
+}
+
+#------------------------------------------------------------------
+# comments
+#------------------------------------------------------------------
+sub comments {
+	my $self = shift;
+
+	if ( not defined $self->{COMMENTS} ) {
+		_parse_rcs_body($self);
+	}
+
+	return %{ $self->{COMMENTS} };
+}
+
+#------------------------------------------------------------------
+# daterev
+#
+# Returns revisions which were created before a specified date.
+#
+# Method takes one or six arguments.
+#
+# If one argument, then argument is date number.
+#
+# If six arguments, then year (4 digit year), month (1-12), day
+# of month (1-31), hour (0-23), minute (0-59) and second (0-59).
+#------------------------------------------------------------------
+sub daterev {
+
+	my $self = shift;
+	my $target_time;
+
+	# validate arguments
+	unless ( @_ == 1 or @_ == 6 ) {
+		croak "daterev must have either 1 or 6 arguments";
+	}
+
+	# string date passed
+	if ( @_ == 6 ) {
+		my ( $year, $mon, $mday, $hour, $min, $sec ) = @_;
+
+		if ( $year !~ /^\d{4}$/ ) {
+			croak "year (1st param) must be 4 digit number";
+		}
+
+		$mon--;    # convert to 0-11 range
+		$target_time = timegm( $sec, $min, $hour, $mday, $mon, $year );
+	}
+
+	# system date passed
+	else {
+		$target_time = shift;
+
+		if ( $target_time !~ /^\d+$/ ) {
+			croak "system date must be an integer";
+		}
+	}
+
+	if ( not defined $self->{DATE} ) {
+		_parse_rcs_header($self);
+	}
+
+	my @revisions = ();
+	my %dates;
+	my %dates_hash = %{ $self->{DATE} };
+
+	my $revision;
+	foreach $revision ( keys %dates_hash ) {
+		my $date = $dates_hash{$revision};
+		$dates{$date}{$revision} = 1;
+	}
+
+	my $date;
+	foreach $date ( reverse sort keys %dates ) {
+		foreach $revision ( keys %{ $dates{$date} } ) {
+			push @revisions, $revision if $date <= $target_time;
+		}
+	}
+
+	return wantarray ? @revisions : $revisions[0];
+}
+
+#------------------------------------------------------------------
+# dates
+# Return a hash of revision dates, keyed on revision, when called
+# in list mode.
+# Return the most recent date when called in scalar mode.
+#
+# RCS stores dates in GMT.
+# The date values are system dates.
+#------------------------------------------------------------------
+sub dates {
+	my $self = shift;
+
+	if ( not defined $self->{DATE} ) {
+		_parse_rcs_header($self);
+	}
+
+	my %DatesHash  = %{ $self->{DATE} };
+	my @dates_list = sort { $b <=> $a } values %DatesHash;
+	my $MostRecent = $dates_list[0];
+
+	return wantarray ? %DatesHash : $MostRecent;
+}
+
+#------------------------------------------------------------------
+# file
+# Name of working file.
+#------------------------------------------------------------------
+sub file {
+	my $self = shift;
+	if (@_) { $self->{FILE} = shift }
+	return $self->{FILE};
+}
+
+#------------------------------------------------------------------
+# pathname
+# Full name of working file, including path to it and RCS file extension.
+# Sets the location of 'RCS' archive directory.
+#------------------------------------------------------------------
+sub pathname {
+
+	my $self = shift;
+
+	if (@_) {
+		my $filename = shift;
+		if ( $filename =~ m/(.*)$Dir_Sep(.*)/ ) {
+			$self->rcsdir($1);
+			$filename = $2;
+		}
+		else {
+			$self->rcsdir('.');
+		}
+
+		# Strip off archive extension if exists
+		my $arcext = $self->arcext;
+		$filename =~ s/$arcext$//;
+
+		$self->file($filename);
+	}
+	return $self->rcsdir . $Dir_Sep . $self->file;
+}
+
+#------------------------------------------------------------------
+# head
+# Return the head revision.
+#------------------------------------------------------------------
+sub head {
+	my $self = shift;
+
+	if ( not defined $self->{HEAD} ) {
+		_parse_rcs_header($self);
+	}
+	return $self->{HEAD};
+}
+
+#------------------------------------------------------------------
+# lock
+# Return user who has file locked.
+#------------------------------------------------------------------
+sub lock {
+	my $self = shift;
+
+	if ( not defined $self->{LOCK} ) {
+		_parse_rcs_header($self);
+	}
+	my $revision = shift || $self->{HEAD};
+
+	return wantarray ? %{ $self->{LOCK} } : ${ $self->{LOCK} }{$revision};
+}
+
+#------------------------------------------------------------------
+# quiet
+# Set or un-set RCS quiet mode.
+#------------------------------------------------------------------
+sub quiet {
+	my $self = shift;
+
+	# called as object method
+	if ( ref $self ) {
+
+		# set/un-set quiet mode
+		if (@_) {
+			my $mode = shift;
+			croak "Passed parameter must be either '0' or '1'"
+			  unless $mode == 0
+				  or $mode == 1;
+			$self->{"_QUIET"} = $mode;
+			return ref $self->{"_QUIET"}
+			  ? ${ $self->{"_QUIET"} }
+			  : $self->{"_QUIET"};
+		}
+
+		# access quiet mode
+		else {
+			return ref $self->{"_QUIET"}
+			  ? ${ $self->{"_QUIET"} }
+			  : $self->{"_QUIET"};
+		}
+	}
+
+	# called as class method
+	else {
+
+		# set/un-set quiet mode
+		if (@_) {
+			my $mode = shift;
+			croak "Passed parameter must be either '0' or '1'"
+			  unless $mode == 0
+				  or $mode == 1;
+			$Quiet = $mode;
+			return $Quiet;
+		}
+
+		# access quiet mode
+		else {
+			return $Quiet;
+		}
+	}
+}
+
+#------------------------------------------------------------------
+# rcs
+# Execute RCS 'rcs' program.
+# Make archive filename same as working filename unless
+# specifically set.
+#------------------------------------------------------------------
+sub rcs {
+	my $self  = shift;
+	my @param = @_;
+
+	my $rcsprog = $self->bindir . $Dir_Sep . 'rcs' . $Exe_Ext;
+	my $rcsdir  = $self->rcsdir;
+	my $workdir = $self->workdir;
+	my $file    = $self->file;
+	my $arcfile = $self->arcfile;
+
+	my $archive_file = $rcsdir . $Dir_Sep . $arcfile;
+	my $workfile     = $workdir . $Dir_Sep . $file;
+	push @param, $archive_file, $workfile;
+	unshift @param, "-q" if $self->quiet;    # quiet mode
+
+	# run program
+	return ( _rcsError "rcs program $rcsprog not found" )
+	  unless -e $rcsprog;
+	return ( _rcsError "rcs program $rcsprog not executable" )
+	  unless -x $rcsprog;
+	system( $rcsprog, @param ) == 0 or return ( _rcsError "$?" );
+
+	# re-parse RCS file and clear comments hash
+	_parse_rcs_header($self);
+	$self->{COMMENTS} = undef;
+	return 1;
+}
+
+#------------------------------------------------------------------
+# rcsclean
+# Execute RCS 'rcsclean' program.
+#------------------------------------------------------------------
+sub rcsclean {
+	my $self  = shift;
+	my @param = @_;
+
+	my $rcscleanprog = $self->bindir . $Dir_Sep . 'rcsclean' . $Exe_Ext;
+	my $rcsdir       = $self->rcsdir;
+	my $workdir      = $self->workdir;
+	my $file         = $self->file;
+	my $arcfile      = $self->arcfile;
+
+	my $archive_file = $rcsdir . $Dir_Sep . $arcfile;
+	my $workfile     = $workdir . $Dir_Sep . $file;
+	push @param, $archive_file, $workfile;
+
+	# run program
+	return ( _rcsError "rcsclean program $rcscleanprog not found" )
+	  unless -e $rcscleanprog;
+	return ( _rcsError "rcsclean program $rcscleanprog not executable" )
+	  unless -x $rcscleanprog;
+	system( $rcscleanprog, @param ) == 0 or return ( _rcsError "$?" );
+
+	# re-parse RCS file and clear comments hash
+	_parse_rcs_header($self);
+	$self->{COMMENTS} = undef;
+	return 1;
+}
+
+#------------------------------------------------------------------
+# rcsdiff
+# Execute RCS 'rcsdiff' program.
+# Calling in list context returns the output of rcsdiff, while
+# calling in scalar context returns the return status of the
+# rcsdiff program.
+#------------------------------------------------------------------
+sub rcsdiff {
+	my $self  = shift;
+	my @param = @_;
+
+	my $rcsdiff_prog = $self->bindir . $Dir_Sep . 'rcsdiff' . $Exe_Ext;
+	my $rcsdir       = $self->rcsdir;
+	my $arcfile      = $self->arcfile;
+	$arcfile = $rcsdir . $Dir_Sep . $arcfile;
+	my $workfile = $self->workdir . $Dir_Sep . $self->file;
+
+	# un-taint parameter string
+	unshift @param, "-q" if $self->quiet;    # quiet mode
+	my $param_str = join( ' ', @param );
+	$param_str =~ s/([\w-]+)/$1/g;
+
+	return ( _rcsError "rcsdiff program $rcsdiff_prog not found" )
+	  unless -e $rcsdiff_prog;
+	return ( _rcsError "rcsdiff program $rcsdiff_prog not executable" )
+	  unless -x $rcsdiff_prog;
+	open( DIFF, "$rcsdiff_prog $param_str $arcfile $workfile |" )
+	  or return ( _rcsError "Can't fork $rcsdiff_prog: $!" );
+	my @diff_output = <DIFF>;
+
+	# rcsdiff returns exit status 0 for no differences, 1 for differences,
+	# and 2 for error condition.
+	close DIFF;
+	my $status = $?;
+	$status >>= 8;
+	return ( _rcsError "$rcsdiff_prog failed" ) if $status == 2;
+	return wantarray ? @diff_output : $status;
+}
+
+#------------------------------------------------------------------
+# rcsdir
+# Location of 'RCS' archive directory.
+#------------------------------------------------------------------
+sub rcsdir {
+	my $self = shift;
+
+	# called as object method
+	if ( ref $self ) {
+		if (@_) { $self->{"_RCSDIR"} = shift }
+		return ref $self->{"_RCSDIR"}
+		  ? ${ $self->{"_RCSDIR"} }
+		  : $self->{"_RCSDIR"};
+	}
+
+	# called as class method
+	else {
+		if (@_) { $Rcs_Dir = shift }
+		return $Rcs_Dir;
+	}
+}
+
+#------------------------------------------------------------------
+# revdate
+# Return the revision date of an RCS revision.
+# If revision is not provided, default to 'head' revision.
+#
+# RCS stores dates in GMT.  This method will return dates relative
+# to the local time zone.
+#------------------------------------------------------------------
+sub revdate {
+	my $self = shift;
+
+	if ( not defined $self->{DATE} ) {
+		_parse_rcs_header($self);
+	}
+	my $revision = shift || $self->head;
+
+	# dereference date hash
+	my %date_array = %{ $self->{DATE} };
+	my $date_str   = $date_array{$revision};
+
+	return wantarray ? localtime($date_str) : $date_str;
+}
+
+#------------------------------------------------------------------
+# revisions
+#------------------------------------------------------------------
+sub revisions {
+	my $self = shift;
+
+	if ( not @{ $self->{REVISIONS} } ) {
+		_parse_rcs_header($self);
+	}
+
+	# dereference revisions list
+	my @revisions = @{ $self->{REVISIONS} };
+
+	@revisions;
+}
+
+#------------------------------------------------------------------
+# rlog
+# Execute RCS 'rlog' program.
+# Make archive filename same as working filename unless
+# specifically set.
+#------------------------------------------------------------------
+sub rlog {
+	my $self  = shift;
+	my @param = @_;
+
+	my $rlogprog = $self->bindir . $Dir_Sep . 'rlog' . $Exe_Ext;
+	my $rcsdir   = $self->rcsdir;
+	my $arcfile  = $self->arcfile || $self->file;
+
+	# un-taint parameter string
+	my $param_str = join( ' ', @param );
+	$param_str =~ s/([\w-]+)/$1/g;
+
+	my $archive_file = $rcsdir . $Dir_Sep . $arcfile;
+	return ( _rcsError "rlog program $rlogprog not found" )
+	  unless -e $rlogprog;
+	return ( _rcsError "rlog program $rlogprog not executable" )
+	  unless -x $rlogprog;
+	open( RLOG, "$rlogprog $param_str $archive_file |" )
+	  or return ( _rcsError "Can't fork $rlogprog: $!" );
+
+	my @logoutput = <RLOG>;
+	close RLOG;
+	return ( _rcsError "$rlogprog failed" ) if $?;
+	@logoutput;
+}
+
+#------------------------------------------------------------------
+# rcsmerge
+# Execute RCS 'rcsmerge' program.
+#------------------------------------------------------------------
+sub rcsmerge {
+	my $self  = shift;
+	my @param = @_;
+
+	my $rcsmergeprog = $self->bindir . $Dir_Sep . 'rcsmerge' . $Exe_Ext;
+	my $rcsdir       = $self->rcsdir;
+	my $arcfile      = $self->arcfile || $self->file;
+
+	# un-taint parameter string
+	my $param_str = join( ' ', @param );
+	$param_str =~ s/([\w-]+)/$1/g;
+
+	my $archive_file = $rcsdir . $Dir_Sep . $arcfile;
+	return ( _rcsError "rcsmerge program $rcsmergeprog not found" )
+	  unless -e $rcsmergeprog;
+	return ( _rcsError "rcsmerge program $rcsmergeprog not executable" )
+	  unless -x $rcsmergeprog;
+	open( RCSMERGE, "$rcsmergeprog $param_str $archive_file |" )
+	  or return ( _rcsError "Can't fork $rcsmergeprog $!" );
+
+	my @logoutput = <RCSMERGE>;
+	close RCSMERGE;
+	return ( _rcsError "$rcsmergeprog failed" ) if $?;
+	@logoutput;
+}
+
+#------------------------------------------------------------------
+# state
+# If revision is not provided, default to 'head' revision
+#------------------------------------------------------------------
+sub state {
+	my $self = shift;
+
+	if ( not defined $self->{STATE} ) {
+		_parse_rcs_header($self);
+	}
+	my $revision = shift || $self->head;
+
+	# dereference author hash
+	my %state_array = %{ $self->{STATE} };
+
+	return $state_array{$revision};
+}
+
+#------------------------------------------------------------------
+# symbol
+# Return symbol(s) based on revision.
+#------------------------------------------------------------------
+sub symbol {
+	my $self = shift;
+
+	my $sym;
+	my @sym_array;
+
+	if ( not defined $self->{SYMBOLS} ) {
+		_parse_rcs_header($self);
+	}
+	my $revision = shift || $self->head;
+
+	# dereference symbols hash
+	my %symbols = %{ $self->{SYMBOLS} };
+
+	foreach $sym ( keys %symbols ) {
+		my $rev = $symbols{$sym};
+		push @sym_array, $sym if $rev eq $revision;
+	}
+
+	# return only first array element if user wants scalar
+	return wantarray ? @sym_array : $sym_array[0];
+}
+
+#------------------------------------------------------------------
+# symbols
+# Returns hash of all revisions keyed on symbol defined against file.
+#------------------------------------------------------------------
+sub symbols {
+	my $self = shift;
+
+	if ( not defined $self->{SYMBOLS} ) {
+		_parse_rcs_header($self);
+	}
+
+	return %{ $self->{SYMBOLS} };
+}
+
+#------------------------------------------------------------------
+# symrev
+# Returns the revision against which a specified symbol was
+# defined. If the symbol was not defined against any version
+# of this file, 0 is returned.
+#------------------------------------------------------------------
+sub symrev {
+	my $self = shift;
+	my $sym = shift or croak "You must supply a symbol to symrev";
+
+	if ( not defined $self->{SYMBOLS} ) {
+		_parse_rcs_header($self);
+	}
+
+	my %symbols = %{ $self->{SYMBOLS} };
+	my $revision = $symbols{$sym} ? $symbols{$sym} : 0;
+
+	my %matched_symbols =
+	  map { $_ => $symbols{$_} } grep( /$sym/, keys %symbols );
+
+	return wantarray ? %matched_symbols : $revision;
+}
+
+#------------------------------------------------------------------
+# workdir
+# Location of working directory.
+#------------------------------------------------------------------
+sub workdir {
+	my $self = shift;
+
+	# called as object method
+	if ( ref $self ) {
+		if (@_) { $self->{"_WORKDIR"} = shift }
+		return ref $self->{"_WORKDIR"}
+		  ? ${ $self->{"_WORKDIR"} }
+		  : $self->{"_WORKDIR"};
+	}
+
+	# called as class method
+	else {
+		if (@_) { $Work_Dir = shift }
+		return $Work_Dir;
+	}
+}
+
+#------------------------------------------------------------------
+# _parse_rcs_body
+# Private function
+#------------------------------------------------------------------
+sub _parse_rcs_body {
+
+	my $self = shift;
+	local $_;
+
+	my %comments;
+
+	my $rcsdir   = $self->rcsdir;
+	my $file     = $self->file;
+	my $rcs_file = $rcsdir . $Dir_Sep . $file . $self->arcext;
+
+	# parse RCS archive file
+	open RCS_FILE, $rcs_file
+	  or return ( _rcsError "Unable to open $rcs_file: $!" );
+
+	# skip header info and get description
+  DESC: while (<RCS_FILE>) {
+		if (/^desc$/) {
+			$comments{0} = '';
+			$_ = <RCS_FILE>;    # read first line
+			s/^\@//;    # remove leading '@'
+			while (1) {
+				last DESC if /^\@$/;
+				s/\@\@/\@/g;    # RCS replaces single '@' with '@@'
+				$comments{0} .= $_;
+				$_ = <RCS_FILE>;
+			}
+		}
+	}
+
+	# parse revision comments
+	my $revision;
+  REVISION: while (<RCS_FILE>) {
+		if (/^[\d\.]+$/) {
+			chomp( $revision = $_ );
+			$_ = <RCS_FILE>;
+			if (/^log$/) {
+				$comments{$revision} = '';
+				$_ = <RCS_FILE>;    # read first line
+				s/^\@//;    # remove leading '@'
+				while (1) {
+					next REVISION if /^\@$/;
+					s/\@\@/\@/g;    # RCS replaces single '@' with '@@'
+					$comments{$revision} .= $_;
+					$_ = <RCS_FILE>;
+				}
+			}
+		}
+	}
+
+	# loop through 'text' section to avoid capturing bogus info
+	continue {
+		if (/^text$/) {    # 'text' tag should always be there, but check anyway
+			$_ = <RCS_FILE>;    # read first line
+			if ( not /^\@\@$/ )
+			{    # forced revisions have single '@@' in text section
+				while (<RCS_FILE>) {
+					s/\@\@//g;    # RCS replaces single '@' with '@@'
+					last if /\@$/;
+				}
+			}
+		}
+	}
+
+	close RCS_FILE;
+	$self->{COMMENTS} = \%comments;
+}
+
+#------------------------------------------------------------------
+# _parse_rcs_header
+# Private function
+# Directly parse the RCS archive file.
+#------------------------------------------------------------------
+sub _parse_rcs_header {
+
+	my $self = shift;
+	local $_;
+
+	my ( $head,        %lock );
+	my ( @access_list, @revisions );
+	my ( %author,      %date, %state, %symbols );
+
+	my $rcsdir   = $self->rcsdir;
+	my $file     = $self->file;
+	my $rcs_file = $rcsdir . $Dir_Sep . $file . $self->arcext;
+
+	# parse RCS archive file
+	open RCS_FILE, $rcs_file
+	  or return ( _rcsError "Unable to open $rcs_file: $!" );
+	while (<RCS_FILE>) {
+		next if /^\s*$/;     # skip blank lines
+		last if /^desc$/;    # end of header info
+
+		# get head revision
+		if (/^head\s/) {
+			($head) = /^head\s+(.*?);$/;
+			next;
+		}
+
+		# get access list
+		if (/^access$/) {
+			while (<RCS_FILE>) {
+				chomp;
+				s/\s//g;     # remove all whitespace
+				push @access_list, ( split(/;/) )[0];
+				last if /;$/;
+			}
+			next;
+		}
+
+		# get symbols
+		if (/^symbols$/) {
+			while (<RCS_FILE>) {
+				chomp;
+				s/\s//g;     # remove all whitespace
+				my ( $sym, $rev ) = split(/:/);
+				$rev =~ s/;$//;
+				$symbols{$sym} = $rev;
+				last if /;$/;
+			}
+			next;
+		}
+
+		# get locker
+		if (/^locks/) {
+
+			# file not locked
+			if (/;$/) {
+				%lock = ();
+				next;
+			}
+
+			# get user who has file locked
+			while (<RCS_FILE>) {
+				s/\s+//g;    # remove all white space
+				next unless $_;    # skip blank line (now empty string)
+				last if /^;/;      # end of locks
+				my ( $locker, $rev ) = split(/:/);
+				$rev =~ s/;.*//;
+				$lock{$rev} = $locker;
+				last if /;$/;      # end of locks
+			}
+			next;
+		}
+
+		# get all revisions
+		if (/^\d+\.\d+/) {
+			chomp;
+			push @revisions, $_;
+
+			# get author, state and date of each revision
+			my $next_line = <RCS_FILE>;
+			chop( my $author = ( split( /\s+/, $next_line ) )[3] );
+			chop( my $state  = ( split( /\s+/, $next_line ) )[5] );
+			chop( my $date   = ( split( /\s+/, $next_line ) )[1] );
+
+			# store date as date number
+			my ( $year, $mon, $mday, $hour, $min, $sec ) =
+			  split( /\./, $date );
+			$mon--;    # convert to 0-11 range
+			my @date = ( $sec, $min, $hour, $mday, $mon, $year );
+
+			# store value in hash using revision as key
+			$author{$_} = $author;
+			$state{$_}  = $state;
+			$date{$_}   = timegm(@date);
+		}
+	}
+	close RCS_FILE;
+
+	$self->{HEAD}      = $head;
+	$self->{LOCK}      = \%lock;
+	$self->{ACCESS}    = \@access_list;
+	$self->{REVISIONS} = \@revisions;
+	$self->{AUTHOR}    = \%author;
+	$self->{DATE}      = \%date;
+	$self->{STATE}     = \%state;
+	$self->{SYMBOLS}   = \%symbols;
+}
+
+#------------------------------------------------------------------
+# _rcsError
+#------------------------------------------------------------------
+sub _rcsError {
+	my $error_msg = shift;
+
+	not $nonFatal and croak $error_msg;
+	$nonFatal and not $Quiet and carp $error_msg and return 0;
+	$nonFatal and $Quiet and return 0;
+}
+
+1;};
+BEGIN {
+ZUP::RCS->import();
+};
+$INC{'ZUP/RCS.pm'} = "/dev/null";
+our $VERSION = "1.1.2";
+use JSON;
+use Cpanel::Version;
+
+my $token_name;
+my $json;
+my $currversion = Cpanel::Version::getversionnumber();
+
+sub new {
+
+	my $class        = shift;
+	my $parseopts    = shift;
+	my $self         = $class->SUPER::new($parseopts, @_) or return;
+
+	# check to make sure we have the necessary modules, etc.
+	if (not $self->prechecks() ) { return; }
+
+	$self->{cPanel_API} = get_cpanel_api();
+	if (not $self->{cPanel_API}) {
+		$self->errstr("[!] Failed to establish a connection to the cPanel API.");
+		return;
+	}
+	return $self;
+}
+
+# Generates the domains hash:
+# domain => domain-zone-parser-object
+sub gatherdomains {
+
+	my $self = shift;
+
+	if ($self->{opts}->{cpuser}) {
+		$self->cpuser_domains();
+	} elsif ($self->{opts}->{reselleruser}) {
+		$self->reseller_domains();
+	} elsif ($self->{opts}->{ulist}) {
+		$self->userlist_domains();
+	} elsif ($self->{opts}->{domain}) {
+		$self->single_domain();
+	} elsif ($self->{opts}->{domlist}) {
+		$self->multi_domains();
+	}
+}
+
+# Updates the MX settings to 'remote' for the domains in $self->{domains};
+sub set_remote_mx {
+
+	my $self = shift;
+	if ($self->{opts}->{setremotemx}) {
+		my $failed;
+		foreach my $zone (values %{$self->{domains}}) {
+			my $domain   = $zone->getdomainname();
+			my $user     = findowner($domain);
+			my $response = $self->{cPanel_API}->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'setmxcheck', 'user' => $user }, { 'domain' => $domain, 'mxcheck' => 'remote' }, 'json');
+			my $output = from_json($response);
+			if (not $output->{'cpanelresult'}{'data'}[0]{'remote'}) {
+				$failed .= "\t$domain\n";
+			}
+		}
+		if ($failed) {
+			return "[!] Failed to set 'remote' MX on the following domains:\n$failed\n";
+		} else {
+			return "\n";
+		}
+	}
+	return;
+}
+
+# Updates the MX settings to 'local' for the domains in $self->{domains};
+sub set_local_mx {
+
+	my $self = shift;
+	if ($self->{opts}->{setlocalmx}) {
+		my $failed;
+		foreach my $zone (values %{$self->{domains}}) {
+			my $domain   = $zone->getdomainname();
+			my $user     = findowner($domain);
+			my $response = $self->{cPanel_API}->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'setmxcheck', 'user' => $user }, { 'domain' => $domain, 'mxcheck' => 'local' }, 'json');
+			my $output = from_json($response);
+			if (not $output->{'cpanelresult'}{'data'}[0]{'local'}) {
+				$failed .= "\t$domain\n";
+			}
+		}
+		if ($failed) {
+			return "[!] Failed to set 'remote' MX on the following domains:\n$failed\n";
+		} else {
+			return "\n";
+		}
+	}
+	return;
+}
+
+# Returns the full path of the backup file that is generated.
+sub backupzones {
+
+	my $self    = shift;
+	if ($self->{rcspath}) {
+		return $self->rcs_backup($self->{rcspath});
+	} else {
+		return $self->tar_backup();
+	}
+}
+
+# Input :  The path to the rcs binaries
+# Output:  The path to where the RCS archive files are saved.
+sub rcs_backup {
+
+	my $self      = shift;
+	my $rcspath   = shift;
+	my $rcsobj    = ZUP::RCS->new();
+
+	# dir check
+	if (not -d $self->{rcsarcs}) {
+		make_path ($self->{rcsarcs}, { owner => 'root', group => 'root' } ) or $self->{errstr} = "Failed to created '$self->{rcsarcs}' to backup zone data." and return;
+	}
+
+	# initiate rcs object with the proper settings.
+	$rcsobj->bindir($rcspath);
+	$rcsobj->rcsdir ($self->{rcsarcs});
+	$rcsobj->workdir($self->{rcswork});
+
+	foreach my $zone (values %{$self->{domains}}) {
+		my $zonefile = $zone->getzonefile();
+		rcs_backup_file($rcsobj, $zonefile, "ZUP backup for '$zonefile'") or return;
+	}
+
+	return $self->{rcsarcs};
+}
+
+# Input: The domain name to restore from RCS archive. If no input is given, it will use $self->{opts}->{resdomain}
+sub restoredomain {
+
+	my $self   = shift;
+	my $domain = shift || $self->{opts}->{resdomain};
+
+	if (-s "$self->{rcsarcs}/$domain\.db,v") {
+		my $rcsarc = "$self->{rcsarcs}/$domain\.db,v";
+		my $domdb  = "$domain.db";
+		my $rcsobj = ZUP::RCS->new();
+		$rcsobj->bindir ($self->{rcspath});
+		$rcsobj->rcsdir ($self->{rcsarcs});
+		$rcsobj->workdir($self->{rcswork});
+		rcs_backup_file($rcsobj, "/var/named/${domain}.db", "Zup Backup prior to restoredomain") or return "Failed to create latest backup. Not proceeding.";
+
+		$rcsobj->file($domdb);
+		print "[+] RCS archive for '$domain' found: '$rcsarc'.\n";
+		my %comments = $rcsobj->comments;
+		print "The following the revisions exist (the very first revision '1.1' is not listed):\n";
+		foreach my $rev (sort keys %comments) {
+			next if ($rev == '1.1' or $rev == '0');
+			print "\tRevision: $rev\n";
+			print "\tComment : $comments{$rev}";
+		}
+		print "[*] Please enter the revision number you wish to restore (enter 'n' to exit): ";
+		chomp(my $answer = <STDIN>);
+		while (not $comments{$answer}) {
+			if ($answer eq 'n') {
+				return "Not proceeding per request.";
+			}
+			print "[!] Revision entered '$answer' does not exist! Enter a proper value (enter 'n' to exit): ";
+			chomp($answer = <STDIN>);
+		}
+		print "[+] Attempting to restore revision '$answer' now... ";
+		eval {
+			unlink "/var/named/${domain}\.db"; # unlinking the original cause co won't write if the file is writable. 
+			$rcsobj->co('-l', "-r$answer");
+			$rcsobj->rcs("-u$answer");
+		} or print "Failed.\n" and return "RCS checkout process failed!";
+		print "Done.\n";
+		return "Restore process successfully completed for '$domain' from '$rcsarc'.";
+	} else {
+		return "No RCS archive found for '$domain' in '$self->{rcsarcs}'."
+	}
+}
+
+sub rcs_backup_file {
+
+#    return 0;
+	my $rcsobj    = shift;
+	my $zonefile  = shift;
+	my $comment   = shift;
+	my $basefile  = basename($zonefile);
+	my $timestamp = strftime( "%m-%d-%Y %H:%M:%S", localtime( time ) );
+	my $rcsarcs   = $rcsobj->rcsdir();
+	$rcsobj->file($basefile);
+
+	eval {
+		if (-s "$rcsarcs/$basefile,v") {
+			$rcsobj->ci('-l', "-m${comment} at ${timestamp}");
+		} else {
+			$rcsobj->ci('-l', "-t-ZUP Backup of $zonefile");
+		}
+	} or return;
+	return 1;
+}
+
+# The following determine the domains that we will be working on
+sub cpuser_domains {
+
+	my $self    = shift;
+	my $API     = $self->{cPanel_API};
+	my $user    = shift || $self->{opts}->{cpuser};
+	my $domains = $self->{domains};
+	my $failed  = $self->{failed};
+
+	if (-e "/var/cpanel/users/$user") {
+		cpanel_domains($API, $user, $domains, $failed);
+	} else {
+		$self->{errstr} = "The user specified: '$user' does not exist.";
+		return;
+	}
+	return 1;
+}
+
+sub reseller_domains {
+
+	my $self     = shift;
+	my $API      = $self->{cPanel_API};
+	my $reseller = shift || $self->{opts}->{reselleruser};
+	my $domains  = $self->{domains};
+	my $failed   = $self->{failed};
+
+	if (not -s "/var/cpanel/users/$reseller") {
+		$self->{errstr} = "The reseller specified: '$reseller' does not exist.";
+		return;
+	}
+
+	my @cpusers = get_users($API, $reseller);
+	foreach my $cpuser (@cpusers) {
+		cpanel_domains($API, $cpuser, $domains, $failed);
+	}
+	return 1;
+}
+
+sub userlist_domains {
+
+	my $self     = shift;
+	my $API      = $self->{cPanel_API};
+	my $userlist = shift || $self->{opts}->{ulist};
+	my $domains  = $self->{domains};
+	my $failed   = $self->{failed};
+
+	my @users;
+	if (-s $userlist) {
+		open my $userlist_fh, "<", $userlist or return;
+		while(<$userlist_fh>) {
+			chomp $_;
+			cpanel_domains($API, $_, $domains, $failed);
+		}
+		close $userlist_fh;
+	} else {
+		$self->{errstr} = "The userlist specified: '$userlist' does not exist.";
+		return;
+	}
+	return 1;
+}
+
+sub multi_domains {
+
+	my $self     = shift;
+	my $domlist  = shift || $self->{opts}->{domlist};
+
+	my @doms;
+	if (-s $domlist) {
+		open my $domlist_fh, "<", $domlist or return;
+		while (<$domlist_fh>) {
+			chomp $_;
+			$self->single_domain($_);
+		};
+		close $domlist_fh;
+	} else {
+		$self->{errstr} = "The domainlist specified: '$domlist' does not exist.";
+		return;
+	}
+	return 1;
+}
+
+sub single_domain {
+
+	my $self   = shift;
+	my $domain = shift || $self->{opts}->{domain};
+	if ($domain =~ /\.((hostgator|websitewelcome)\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear)\.com)$/) {
+		$self->{errstr} = "You are attempting to make modifications to a Shared/Reseller server's zone file.  Check your Syntax!";
+		return;
+	}
+	my $failed = $self->{failed};
+
+	my $zonefile = "/var/named/${domain}.db";
+	if (-l $zonefile) {
+		$zonefile = readlink $zonefile;
+	}
+	if (-s $zonefile) {
+		$self->{domains}->{$domain} = ZUP::Parser->new($zonefile);
+		if (not $self->{domains}->{$domain}) {
+			$failed->{$domain} = "Failed to initialize ZUP::Parser object. Error: $ZUP::Parser::errstr";
+			delete $self->{domains}->{$domain};
+		}
+		return 1;
+	}
+	$self->{errstr} = "The zone file for the domain specified: '$domain' does not exist.";
+	return;
+}
+
+sub prechecks {
+
+	my $self = shift;
+	my $hostname = Sys::Hostname::hostname;
+
+	if ($currversion >= 11.70 || $hostname =~ /\.((hostgator|websitewelcome)\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear|bluehost|justhost|accountservergroup|arvixe|webserversystems|asmallorange)\.com)$/){
+		require cPanel::PublicAPI;
+	} elsif (eval {require '/usr/local/share/perl5/cPanel/PublicAPI.pm'}) {
+		require '/usr/local/share/perl5/cPanel/PublicAPI.pm';
+		if ( $currversion > 11.64 && $cPanel::PublicAPI::VERSION < 2.2 ) {
+			die "[!] cPanel::PublicAPI out of date, please ensure 2.2 or greater for API Token support";
+		}
+	} else {
+		print "[!] Failed to load the necessary modules for this script to function properly. Please install cPanel::PublicAPI via '/scripts/perlinstaller cPanel::PublicAPI'\n";
+		exit 1;
+	}
+
+	eval {
+		require XML::Simple;
+		1;
+	} or do {
+		$self->errstr("Failed to load the necessary modules for this script to function properly. Please install XML::Simple via '/scripts/perlinstaller XML::Simple'");
+		return;
+	};
+
+	eval {
+		require File::Path;
+		File::Path->import(qw/make_path/);
+		1;
+	} or do {
+		$self->errstr("Failed to load the necessary modules for this script to function properly. Please install File::Path via '/scripts/perlinstaller File::Path'");
+		return;
+	};
+
+	return 1;
+}
+
+sub stale_tokens {
+	my $token_list = `whmapi1 api_token_list --output=json`;
+	my $listjson = from_json($token_list);
+	my $current_time = time(); 
+	if ($currversion >= 11.68){ 
+		foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+			if( $token_name =~ /zup_/ ){
+				my $token_time = $token_name;
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_name`;
+				}
+			}
+		}
+	} else {
+		foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+			if( $token_data->{'name'} =~ /zup_/ ){
+				my $token_time = $token_data->{'name'};
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+				}
+			}
+		}
+	}
+}
+
+sub get_cpanel_api {
+
+	if ( $currversion >= 11.64 ){
+		$token_name = "zup_".time();
+		$json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+		my $token = from_json($json)->{'data'}{'token'};
+		#Remove Stale Tokens, then handle interrupts/end of script.
+		stale_tokens();
+		my $revoked;
+		$SIG{INT} = sub { 
+			unless ($revoked) {
+				$revoked = 1;
+				fork or exec('whmapi1', 'api_token_revoke', "token_name=$token_name");
+			}
+			die "Interrupted"
+		};
+		END{
+			if($token_name){
+				`whmapi1 api_token_revoke token_name=$token_name`
+			}
+		}
+		return cPanel::PublicAPI->new( ssl_verify_mode => '0', api_token => $token );
+	}
+	elsif ( !-e "/root/.accesshash" ) {
+		$ENV{'REMOTE_USER'} = 'root';
+		system('/usr/local/cpanel/bin/realmkaccesshash');
+	}
+	
+	return cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+
+}
+
+sub cpanel_domains {
+
+	my $API     = shift;
+	my $user    = shift;
+	my $domains = shift;
+	my $failed  = shift;
+
+	my $response = $API->cpanel_api2_request('whostmgr', { 'module' => 'DomainLookup', 'func' => 'getbasedomains', 'user' => $user, }, { }, 'json');
+	my $output = from_json($response);
+
+	if (ref($output->{'cpanelresult'}{'data'}) eq 'ARRAY') {
+		foreach my $obj (@{$output->{'cpanelresult'}{'data'}}) {
+			my $domain   = $obj->{'domain'};
+			my $zonefile = "/var/named/${domain}.db";
+			if (-l $zonefile) {
+				$zonefile = readlink $zonefile;
+			}
+			if ( (not exists $domains->{$domain}) and (-s $zonefile) ) {
+				$domains->{$domain} = ZUP::Parser->new($zonefile);
+				if (not $domains->{$domain}) {
+					$failed->{$domain} = "Failed to initialize ZUP::Parser object. Error: $ZUP::Parser::errstr";
+					delete $domains->{$domain};
+				}
+			}
+		}
+	} else {
+		my $domain = $output->{'cpanelresult'}{'data'}{'domain'};
+		my $zonefile = "/var/named/${domain}.db";
+		if (-l $zonefile) {
+			$zonefile = readlink $zonefile;
+		}
+		if ( (not exists $domains->{$domain}) and (-s $zonefile) ) {
+			$domains->{$domain} = ZUP::Parser->new($zonefile);
+			if (not $domains->{$domain}) {
+				$failed->{$domain} = "Failed to initialize ZUP::Parser object. Error: $ZUP::Parser::errstr";
+				delete $domains->{$domain};
+			}
+		}
+	}
+	return 1;
+}
+
+sub get_users {
+
+	my $API      = shift;
+	my $reseller = shift;
+
+	my $resregex = "^$reseller\$";
+	my $response = $API->whm_api('listaccts', { 'searchtype' => "owner", 'search' => $resregex }, 'json');
+	my $output   = from_json($response);
+	my @accounts;
+
+	if (ref($output->{'data'}{'acct'}) eq 'ARRAY') {
+		foreach my $obj (@{$output->{'acct'}}) {
+			my $tempu = $obj->{'user'};
+			push (@accounts, $tempu);
+		}
+	} else {
+		push @accounts, $reseller; # doesn't own anything.
+	}
+
+	@accounts = sort @accounts;
+	return @accounts;
+}
+
+sub get_account_ip {
+
+	my $self   = shift;
+	my $domain = shift;
+	my @files;
+
+	File::Find::find(
+					sub {
+							if (not scalar(@files) and ($_ !~ m/cache/ and $_ !~ m/main/)) {
+								open (my $userdata, "<", $File::Find::name) or die ("Unable to open $File::Find::name\n");
+								if (my $grep = (grep (/\b$domain\b/, <$userdata>))[0]) {
+									push (@files, $File::Find::name);
+								}
+								close($userdata);
+							}
+					},
+					"/var/cpanel/userdata/");
+
+	foreach my $file (@files) {
+		open (my $ud, "<", $file) or die ("Unable to open $file\n");
+		my $grep = (grep (/ip:/, <$ud>))[0];
+		close ($ud);
+
+		if ($grep) {
+			$grep =~ s|ip:||gi;
+			$grep =~ s/^\s+//;
+			$grep =~ s/\s+$//;
+			@files = ();
+			return $grep;
+		}
+	}
+
+	return;
+}
+
+sub findowner {
+
+	my $domain = shift;
+	my $owner;
+
+	#this is what whoowns does
+	open(my $USERDOMAINS, "/etc/userdomains" );
+	while (<$USERDOMAINS>) {
+		if (/^$domain: (\S+)/i) {
+			$owner = $1;
+		}
+	}
+	close($USERDOMAINS);
+
+	if ($owner eq ""){
+		open (my $httpconf, "<", "/usr/local/apache/conf/httpd.conf");
+		my $grep;
+		while (<$httpconf>) {
+			if (/\b$domain\b/i) {
+				while (<$httpconf>){
+					$grep = $_;
+					last if (/documentroot/i);
+				}
+			}
+		}
+		close ($httpconf);
+		
+		if ($grep) {
+			$grep =~ s|documentroot||gi;
+			$grep =~ s/^\s+//;
+			$grep =~ s/\s+$//;
+			$owner = (split(/\//, $grep))[2];
+		}
+	}
+	return $owner;
+}
+
+sub help {
+
+	print "\n[+] ".ZUP::Panel::colorify("Z", "red").ZUP::Panel::colorify("UP", "green")." - ".ZUP::Panel::colorify("Z", "red")."one".ZUP::Panel::colorify("UP", "green")."dater - cPanel\n";
+	print "[+] By Rish - Report bugs at https://projects.hostgator.com/projects/script-zoneupdater\n\n";
+
+	print "This utility allows admins to easily update DNS zone files for domains on a cPanel server without having to manually alter each.\n";
+	print "Please note that you can skip trivial prompts by using '-y', but piping any input to this script is not allowed.\n\n";
+	print ZUP::Panel::colorify("The", "red")." below options determine what domains the script will update: (domain selection options, must specify one)\n\n";
+	print "\t  -u,  --updateuser          update all domains under this ".ZUP::Panel::colorify("user", "green")."\n";
+	print "\t -ul,  --updateuserlist      update all domains under the users listed in specified ".ZUP::Panel::colorify("file", "green")."\n";
+	print "\t  -r,  --updatereseller      update all domains under this ".ZUP::Panel::colorify("reseller", "green")."\n";
+	print "\t  -d,  --updatedomain        update a specific ".ZUP::Panel::colorify("domain", "green")."\n";
+	print "\t -dl,  --updatedomainlist    update all domains specified in the ".ZUP::Panel::colorify("file", "green")."\n\n";
+
+	print ZUP::Panel::colorify("The", "red")." below options determine what is updated in the zone files: (domain update options, must specify atleast one)\n\n";
+	print "\t -s,   --bumpserial          update the serial numbers. No arguments.\n\n";
+
+	print "\t -sns, --setsoaauth          update the authoritative Nameserver in the SOA record (automatically updates the serial).\n";
+	print "\t                             Argument should be a string that contains the new NS to use. Example:\n";
+	print "\t                             'ns1.newprimarydomain.com'\n\n";
+
+	print "\t -sem, --setsoaemail         update the email address in the SOA record (automatically updates the serial).\n";
+	print "\t                             Argument should be a string that contains the new email address to use. ('\@'s are converted to '.'s) Example:\n";
+	print "\t                             'root\@newdomain.com' or 'root.newdomain.com'\n\n";
+
+	print "\t -a,   --setarecords         update the A records (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated list formatted as such:\n";
+	print "\t                             'record => ip/host' - Example:\n";
+	print "\t                             'mail=>67.123.13.3,mail2=>68.122.12.2'\n";
+	print "\t                             ".ZUP::Panel::colorify("Special option", "bold").": You can update the A record for the domain itself by using '\@' as a standin for the record\n\n";
+
+	print "\t-aip,  --updateacctip        update all A records set to the account's IP address to use the new IP (automatically updates the serial).\n";
+	print "\t                             Argument should be a string specifying the new IP:\n";
+	print "\t                             'newip' - Example:\n";
+	print "\t                             '50.23.22.22'\n";
+	print "\t                             Note: this goes by what the cPanel userdata has for the account IP.\n\n";
+
+	print "\t-sip,  --updatespecip        update the IP addresses in A records as specified (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated string specifying the IPs:\n";
+	print "\t                             'oldip1 => newip1, oldip2 => newip2' - Example:\n";
+	print "\t                             '50.23.11.22 => 50.23.22.22, 50.23.11.23 => 50.23.22.23'\n\n";
+
+	print "\t -c,   --setcnamerecords     update the CNAME records  (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated list formatted as such:\n";
+	print "\t                             'record => fqdn' - Example:\n";
+	print "\t                             'mail=>ghs.google.com,docs=>ghs.google.com'\n\n";
+	
+	print "\t-mx,   --setmxrecords        update the MX records (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated list formatted as such:\n";
+	print "\t                             'priority => fqdn' - Example:\n";
+	print "\t                             '1=>ns1.google.com,5=>ns2.google.com,10=>ns3.google.com'\n\n";
+
+	print "\t-ns,   --setnsrecords        update the NS records (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated list as such:\n";
+	print "\t                             'ns1.domain.com, ns2.domain.com'\n";
+	print "\t                             ".ZUP::Panel::colorify("Note", "bold").": If no new SOA auth is specified via the '--setsoaauth' switch, then it is assumed that you want the SOA record to use the first NS listed in the string.\n\n";
+
+	print "\t-spf,  --setspfrecord        update the SPF record (automatically updates the serial).\n";
+	print "\t                             Argument should be the full SPF record as such:\n";
+	print "\t                             'v=spf1 a mx include:hotmail.com ~all'\n\n";
+
+	print "\t-dkim, --setdkimrecord       update the DKIM record (automatically updates the serial).\n";
+	print "\t                             Argument should be the DKIM record given as such:\n";
+	print "\t                             'txt_record_name=>dkim_record' - Example:\n";
+	print "\t                             'default._domainkey=>v=DKIM1\; k=rsa\; p=MHwwDQYJKoZIhvcNAQEBBQADawAwaAJhALYyW31r0Kt4ufPX29cZZ619nKE/Fx01rtdDBggTzgny581S0/KdU5in+iYyJbtuR4shMv0sqvjo14024sG9fjiqh2qBuDRCUm9GHdHyhwjMfLDKCjNvuFNJg8s41fHJkQIDAQAB\;'\n\n";
+
+	print "\t--gapps                      update records to use Google  Apps.\n";
+	print "\t--godaddy                    update records to use Godaddy MX.\n";
+	print "\t--office365                  update records to use Office 365.\n";
+	print "\t--wlive                      update records to use Windows Live. You need to specify the 'hostid' as an argument.\n\n";
+
+	print ZUP::Panel::colorify("Special", "red")." Options:\n";
+	print "\t--reload                     Perform a 'rndc reload' operation after the request is processed.\n";
+	print "\t--setremotemx                Set the MX exchanger to 'remote' for the domain(s).\n";
+	print "\t--setlocalmx                 Set the MX exchanger to 'local' for the domain(s).\n";
+	print "\t--restoredomain              Roll a domain back to a previous version saved in the RCS archive.\n\n";
+	print "[+] ".ZUP::Panel::colorify("Wiki", "green").": https://confluence.endurance.com/display/HGS/ZoneUPdater\n";
+}
+
+sub colorify {
+
+	shift;
+	ZUP::Panel::colorify(@_);
+}
+
+1;
+
+};
+BEGIN {
+ZUP::Panel::Cpanel->import();
+};
+$INC{'ZUP/Panel/Cpanel.pm'} = "/dev/null";
+#  perl-link processed: use ZUP::Panel::Plesk;
+
+BEGIN {
+package ZUP::Panel::Plesk;
+use base qw(ZUP::Panel);
+
+use strict;
+use Data::Dumper;
+use DBI;
+#  perl-link processed: use ZUP::Parser::PleskDB;
+
+BEGIN {
+package ZUP::Parser::PleskDB;
+use base qw(ZUP::Parser);
+
+use File::Temp ();
+use Storable qw (dclone);
+use POSIX qw(strftime);
+use Data::Dumper;
+our $VERSION = "1.1.2";
+our $errstr;
+
+sub new {
+
+	my $class             = shift;
+	my $self              = {};
+	$self->{class}        = $class;
+	$self->{dbh}          = shift; # DB connection.
+	$self->{domain}       = shift;
+	$self->{DNS_RECORDS}  = {};
+	$self->{zone_id}      = undef;
+	$self->{errstr}       = "";
+	$self->{changed}      = 0;
+	$self->{starttime}    = strftime( "%m/%d/%Y %H:%M:%S", localtime( time ) );
+	bless($self, $class);
+
+	if ($self->{errstr}) {
+		$errstr = "Failed to initiate database connection - $self->{errstr}";
+		return;
+	} else {
+		my $querystring = qq^SELECT domains.dns_zone_id FROM domains WHERE domains.name = '$self->{domain}' LIMIT 1;^;
+		my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+		if (my $result = $query->fetchrow_hashref) {
+			$self->{zone_id} = $result->{dns_zone_id};
+		} else {
+			$querystring = qq^SELECT domainaliases.dns_zone_id FROM domainaliases WHERE domainaliases.name = '$self->{domain}' LIMIT 1;^;
+			$query       = $self->{dbh}->prepare($querystring); $query->execute();
+			if (my $result = $query->fetchrow_hashref) {
+				$self->{zone_id} = $result->{dns_zone_id};
+			}
+		}
+		$query->finish;
+		if ($self->{zone_id}) {
+			if (-e "/var/named/run-root/var/$self->{domain}") {
+				$self->{zonefile} = "/var/named/run-root/var/$self->{domain}";
+			} else {
+				$self->{zonefile} = "ZoneID: $self->{zone_id}";
+			}
+			$self->zoneparse();
+		} else {
+			$errstr = "Domain not found - '$self->{domain}'";
+			return;
+		}
+		return $self;
+	}
+}
+
+sub zoneparse {
+
+	my $self    = shift;
+
+	# Default $TTL setting
+	my %record = ( 'ttl' => "86400" );
+	$self->{DNS_RECORDS}->{TTL_record} = \%record;
+	# Our record arrays.
+	$self->{DNS_RECORDS}->{NS_records}    = [];
+	$self->{DNS_RECORDS}->{A_records}     = [];
+	$self->{DNS_RECORDS}->{CNAME_records} = [];
+	$self->{DNS_RECORDS}->{IP6A_records}  = [];
+	$self->{DNS_RECORDS}->{MX_records}    = [];
+	$self->{DNS_RECORDS}->{SRV_records}   = [];
+	$self->{DNS_RECORDS}->{SOA_records}   = [];
+	$self->{DNS_RECORDS}->{PTR_records}   = [];
+	$self->{DNS_RECORDS}->{TXT_records}   = [];
+
+	$self->parse_soa();
+	$self->parse_ns_a_cname();
+	$self->parse_MX();
+	$self->parse_txt();
+	$self->parse_ip6a();
+	$self->parse_srv();
+	$self->parse_ptr();
+	$self->{STOR_RECORDS} = dclone($self->{DNS_RECORDS});
+}
+
+sub savezone {
+
+	my $self = shift;
+
+	if ($self->{changed}) {
+		$self->update_serial();
+	}
+
+	$self->update_soa()        or return;
+	$self->update_ns_a_cname() or return;
+	$self->update_ip6a()       or return;
+	$self->update_mx()         or return;
+	$self->update_txt()        or return;
+	$self->update_srv()        or return;
+	$self->update_ptr()        or return;
+	system("/usr/local/psa/admin/sbin/dnsmng --update $self->{domain}");
+	return 1;
+}
+
+sub parse_soa {
+
+	my $self        = shift;
+	my $querystring = qq^SELECT name, ttl, refresh, retry, expire, minimum, serial, email FROM dns_zone WHERE id = '$self->{zone_id}';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+
+	while (my $result = $query->fetchrow_hashref) {
+		(my $email = $result->{email}) =~ s/\@/./;
+		my %SOA_record = ( 'origin'     => $result->{name}.".", #append a '.' cause plesk doesn't like storing this in the db.
+						   'ttl'        => $result->{ttl},
+						   'class'      => "IN",
+						   'primary'    => "placeholder", # plesk automatically puts the first NS record here.
+						   'email'      => $email,
+						   'serial'     => $result->{serial},
+						   'refresh'    => $result->{refresh},
+						   'retry'      => $result->{retry},
+						   'expire'     => $result->{expire},
+						   'minimumTTL' => $result->{minimum},
+		);
+		push @{ $self->{DNS_RECORDS}->{SOA_records} }, \%SOA_record;
+	}
+}
+
+sub update_soa {
+
+	my $self = shift;
+	foreach my $record (@{ $self->{DNS_RECORDS}->{SOA_records} }) {
+		next if not (keys %$record);
+		(my $origin = $record->{origin}) =~ s/\.$//;
+		(my $email  = $record->{email})  =~ s/\.$//;
+		my $querystring = qq^UPDATE `dns_zone` SET `name` = '$origin', `ttl` = '$record->{ttl}', `refresh` = '$record->{refresh}',^.
+						  qq^`retry` = '$record->{retry}', `expire` = '$record->{expire}', `minimum` = '$record->{minimumTTL}',^.
+						  qq^`serial` = '$record->{serial}', `email` = '$email' WHERE id = '$self->{zone_id}'^;
+		my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+		if ($self->{dbh}->errstr) {
+			$self->{errstr} = "Failed to update SOA record - DBI call failed: ".$self->{dbh}->errstr;
+			return;
+		}
+	}
+	return 1;
+}
+
+sub parse_ns_a_cname {
+
+	my $self        = shift;
+	my $querystring = qq^SELECT type, displayHost, displayVal FROM dns_recs WHERE dns_zone_id = '$self->{zone_id}' AND type IN ('NS', 'A', 'CNAME');^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+
+	while (my $result = $query->fetchrow_hashref) {
+		(my $name   = $result->{displayHost}) =~ s/\.$self->{domain}\.//;
+		my %record = ( 'name'  => $name,
+					   'ttl'   => undef,
+					   'class' => "IN",
+					   'type'  => $result->{type},
+					   'host'  => $result->{displayVal},
+		);
+		if ( uc $result->{type} eq 'NS' ) {
+			push @{ $self->{DNS_RECORDS}->{NS_records} }, \%record;
+		} elsif ( uc $result->{type} eq 'A' ) {
+			push @{ $self->{DNS_RECORDS}->{A_records} }, \%record;
+		} elsif ( uc $result->{type} eq 'CNAME' ) {
+			push @{ $self->{DNS_RECORDS}->{CNAME_records} }, \%record;
+		}
+	}
+}
+
+sub update_ns_a_cname {
+
+	my $self        = shift;
+	my $querystring = qq^DELETE from `dns_recs` WHERE dns_zone_id = '$self->{zone_id}' AND type IN ('NS', 'A', 'CNAME');^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if ($self->{dbh}->errstr) {
+		$self->{errstr} = "Failed to remove old DNS records - DBI call failed: ".$self->{dbh}->errstr;
+		return;
+	}
+
+	foreach my $record (@{ $self->{DNS_RECORDS}->{NS_records} }, @{ $self->{DNS_RECORDS}->{A_records} }, @{ $self->{DNS_RECORDS}->{CNAME_records} }) {
+		next if not (keys %$record);
+		$querystring = qq^INSERT INTO `dns_recs` (`dns_zone_id`, `type`, `displayHost`, `host`, `displayVal`, `val`, `opt`) VALUES ^;
+		if ($record->{name} =~ /$self->{domain}\.$/) {
+			$querystring .= qq^("$self->{zone_id}", "$record->{type}", "$record->{name}", "$record->{name}", "$record->{host}", "$record->{host}", "");^;
+		} else {
+			$querystring .= qq^("$self->{zone_id}", "$record->{type}", "$record->{name}.$self->{domain}.", "$record->{name}", "$record->{host}", "$record->{host}", "");^;
+		}
+		$query = $self->{dbh}->prepare($querystring); $query->execute();
+		if ($self->{dbh}->errstr) {
+			$self->{errstr} = "Failed to insert new records - DBI call failed: ".$self->{dbh}->errstr;
+			return;
+		}
+	}
+	return 1;
+}
+
+sub parse_ip6a {
+
+	my $self        = shift;
+	my $querystring = qq^SELECT type, displayHost, displayVal FROM dns_recs WHERE dns_zone_id = '$self->{zone_id}' AND type = 'AAAA';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+
+	while (my $result = $query->fetchrow_hashref) {
+		(my $name   = $result->{displayHost}) =~ s/\.$self->{domain}\.//;
+		my %record = ( 'name'  => $name,
+					   'ttl'   => undef,
+					   'class' => "IN",
+					   'type'  => $result->{type},
+					   'host'  => $result->{displayVal},
+		);
+		push @{ $self->{DNS_RECORDS}->{IP6A_records} }, \%record;
+	}
+}
+
+sub update_ip6a {
+
+	my $self        = shift;
+	my $querystring = qq^DELETE from `dns_recs` WHERE dns_zone_id = '$self->{zone_id}' AND type = 'AAAA';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if ($self->{dbh}->errstr) {
+		$self->{errstr} = "Failed to remove old IPv6 A records - DBI call failed: ".$self->{dbh}->errstr;
+		return;
+	}
+
+	foreach my $record (@{ $self->{DNS_RECORDS}->{IP6A_records} }) {
+		next if not (keys %$record);
+		$querystring = qq^INSERT INTO `dns_recs` (`dns_zone_id`, `type`, `displayHost`, `host`, `displayVal`, `val`, `opt`) VALUES ^;
+		if ($record->{name} =~ /$self->{domain}\.$/) {
+			$querystring .= qq^("$self->{zone_id}", "$record->{type}", "$record->{name}", "$record->{name}", "$record->{host}", "$record->{host}", "");^;
+		} else {
+			$querystring .= qq^("$self->{zone_id}", "$record->{type}", "$record->{name}.$self->{domain}.", "$record->{name}", "$record->{host}", "$record->{host}", "");^;
+		}
+		$query = $self->{dbh}->prepare($querystring); $query->execute();
+		if ($self->{dbh}->errstr) {
+			$self->{errstr} = "Failed to insert new IPv6 A records - DBI call failed: ".$self->{dbh}->errstr;
+			return;
+		}
+	}
+	return 1;
+}
+
+sub parse_MX {
+
+	my $self        = shift;
+	my $querystring = qq^SELECT type, opt, displayHost, displayVal FROM dns_recs WHERE dns_zone_id = '$self->{zone_id}' AND type = 'MX';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+
+	while (my $result = $query->fetchrow_hashref) {
+		my %record = ( 'name'     => $result->{displayHost},
+					   'ttl'      => undef,
+					   'class'    => "IN",
+					   'priority' => $result->{opt},
+					   'host'     => $result->{displayVal},
+		);
+		push @{ $self->{DNS_RECORDS}->{MX_records} }, \%record;
+	}
+}
+
+sub update_mx {
+
+	my $self        = shift;
+	my $querystring = qq^DELETE from `dns_recs` WHERE dns_zone_id = '$self->{zone_id}' AND type = 'MX';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if ($self->{dbh}->errstr) {
+		$self->{errstr} = "Failed to remove old MX records - DBI call failed: ".$self->{dbh}->errstr;
+		return;
+	}
+
+	foreach my $record (@{ $self->{DNS_RECORDS}->{MX_records} }) {
+		next if not (keys %$record);
+		$querystring = qq^INSERT INTO `dns_recs` (`dns_zone_id`, `type`, `displayHost`, `host`, `displayVal`, `val`, `opt`) VALUES ^.
+					   qq^("$self->{zone_id}", "MX", "$record->{name}", "$record->{name}", "$record->{host}", "$record->{host}", "$record->{priority}");^;
+		$query       = $self->{dbh}->prepare($querystring); $query->execute();
+		if ($self->{dbh}->errstr) {
+			$self->{errstr} = "Failed to insert new MX records - DBI call failed: ".$self->{dbh}->errstr;
+			return;
+		}
+	}
+	return 1;
+}
+
+sub parse_txt {
+
+	my $self        = shift;
+	my $querystring = qq^SELECT type, displayHost, displayVal FROM dns_recs WHERE dns_zone_id = '$self->{zone_id}' AND type = 'TXT';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+
+	while (my $result = $query->fetchrow_hashref) {
+		my %record = ( 'name'  => $result->{displayHost},
+					   'ttl'   => undef,
+					   'class' => "IN",
+					   'host'  => "\"$result->{displayVal}\"",
+		);
+		push @{ $self->{DNS_RECORDS}->{TXT_records} }, \%record;
+	}
+}
+
+sub update_txt {
+
+	my $self        = shift;
+	my $querystring = qq^DELETE from `dns_recs` WHERE dns_zone_id = '$self->{zone_id}' AND type = 'TXT';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if ($self->{dbh}->errstr) {
+		$self->{errstr} = "Failed to remove old TXT records - DBI call failed: ".$self->{dbh}->errstr;
+		return;
+	}
+
+	foreach my $record (@{ $self->{DNS_RECORDS}->{TXT_records} }) {
+		next if not (keys %$record);
+		$querystring = qq^INSERT INTO `dns_recs` (`dns_zone_id`, `type`, `displayHost`, `host`, `displayVal`, `val`, `opt`) VALUES ^.
+					   qq^("$self->{zone_id}", "TXT", "$record->{name}", "$record->{name}", $record->{host}, $record->{host}, "");^;
+		$query       = $self->{dbh}->prepare($querystring); $query->execute();
+		if ($self->{dbh}->errstr) {
+			$self->{errstr} = "Failed to insert new TXT records - DBI call failed: ".$self->{dbh}->errstr;
+			return;
+		}
+	}
+	return 1;
+}
+
+sub parse_ptr {
+
+	my $self        = shift;
+	my $querystring = qq^SELECT type, opt, displayHost, displayVal FROM dns_recs WHERE dns_zone_id = '$self->{zone_id}' AND type = 'PTR';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+
+	while (my $result = $query->fetchrow_hashref) {
+		my %record = ( 'name'  => $result->{displayHost},
+					   'ttl'   => undef,
+					   'class' => "IN",
+					   'host'  => $result->{displayVal},
+					   'sub'   => $result->{opt}, 
+		);
+		push @{ $self->{DNS_RECORDS}->{PTR_records} }, \%record;
+	}
+}
+
+sub update_ptr {
+
+	my $self        = shift;
+	my $querystring = qq^DELETE from `dns_recs` WHERE dns_zone_id = '$self->{zone_id}' AND type = 'PTR';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if ($self->{dbh}->errstr) {
+		$self->{errstr} = "Failed to remove old PTR records - DBI call failed: ".$self->{dbh}->errstr;
+		return;
+	}
+
+	foreach my $record (@{ $self->{DNS_RECORDS}->{PTR_records} }) {
+		next if not (keys %$record);
+		$querystring = qq^INSERT INTO `dns_recs` (`dns_zone_id`, `type`, `displayHost`, `host`, `displayVal`, `val`, `opt`) VALUES ^.
+					   qq^("$self->{zone_id}", "PTR", "$record->{name}", "$record->{name}", "$record->{host}", "$record->{host}", "$record->{sub}");^;
+		$query       = $self->{dbh}->prepare($querystring); $query->execute();
+		if ($self->{dbh}->errstr) {
+			$self->{errstr} = "Failed to insert new PTR records - DBI call failed: ".$self->{dbh}->errstr;
+			return;
+		}
+	}
+	return 1;
+}
+
+sub parse_srv {
+
+	my $self        = shift;
+	my $querystring = qq^SELECT type, opt, displayHost, displayVal FROM dns_recs WHERE dns_zone_id = '$self->{zone_id}' AND type = 'SRV';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+
+	while (my $result = $query->fetchrow_hashref) {
+		my ($pri, $weight, $port) = split (/\s+/, $result->{opt});
+		my %record = ( 'name'     => $result->{displayHost},
+					   'ttl'      => undef,
+					   'class'    => "IN",
+					   'priority' => $pri,
+					   'weight'   => $weight,
+					   'port'     => $port,
+					   'host'     => $result->{displayVal},
+		);
+		push @{ $self->{DNS_RECORDS}->{SRV_records} }, \%record;
+	}
+}
+
+sub update_srv {
+
+	my $self        = shift;
+	my $querystring = qq^DELETE from `dns_recs` WHERE dns_zone_id = '$self->{zone_id}' AND type = 'SRV';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if ($self->{dbh}->errstr) {
+		$self->{errstr} = "Failed to remove old SRV records - DBI call failed: ".$self->{dbh}->errstr;
+		return;
+	}
+
+	foreach my $record (@{ $self->{DNS_RECORDS}->{SRV_records} }) {
+		next if not (keys %$record);
+		my $opt = $record->{priority}." ".$record->{weight}." ".$record->{port};
+		$querystring = qq^INSERT INTO `dns_recs` (`dns_zone_id`, `type`, `displayHost`, `host`, `displayVal`, `val`, `opt`) VALUES ^.
+					   qq^("$self->{zone_id}", "SRV", "$record->{name}", "$record->{name}", "$record->{host}", "$record->{host}", "$opt");^;
+		$query       = $self->{dbh}->prepare($querystring); $query->execute();
+		if ($self->{dbh}->errstr) {
+			$self->{errstr} = "Failed to insert new SRV records - DBI call failed: ".$self->{dbh}->errstr;
+			return;
+		}
+	}
+	return 1;
+}
+
+sub validatezone {
+
+	my $self    = shift;
+	my $namedc  = shift;
+	if (not -d "/root/tmp/") {
+		use File::Path qw(make_path);
+		make_path ("/root/tmp/", { owner => 'root', group => 'root' } ) or $self->{errstr} = "Failed to created '/root/tmp/' to backup zone data." and return;
+	}
+	my $temp_fh = new File::Temp( TEMPLATE => 'zuptmpzoneXXXX', DIR      => '/root/tmp/', SUFFIX   => '.db');
+	$self->SUPER::savezone($temp_fh->filename);
+	return $self->SUPER::validatezone($namedc, $temp_fh->filename);
+}
+
+sub restorezone {
+
+	my $self = shift;
+	$self->{DNS_RECORDS} = $self->{STOR_RECORDS};
+	$self->savezone();
+	return 1;
+}
+
+sub rndcreload {
+
+	my $self   = shift;
+	(my $dom   = $self->{domain}) =~ s/\.$//;
+	my $rndc   = `rndc reload $dom 2>&1`; 
+	if ($? >> 8) {
+		return $rndc;
+	} else {
+		return;
+	}
+}
+
+1;
+
+};
+BEGIN {
+ZUP::Parser::PleskDB->import();
+};
+$INC{'ZUP/Parser/PleskDB.pm'} = "/dev/null";
+our $VERSION = "1.1.2";
+
+sub new {
+
+	my $class        = shift;
+	my $parseopts    = shift;
+	my $self         = $class->SUPER::new($parseopts, @_) or return;
+
+	# check to make sure we have the necessary modules, etc.
+	if (not $self->prechecks() ) { return; }
+
+	$self->init_dbcon() or return;
+	return $self;
+}
+
+# Generates the domains hash:
+# domain => domain-zone-parser-object
+sub gatherdomains {
+
+	my $self = shift;
+
+	if ($self->{opts}->{cpuser}) {
+		$self->cpuser_domains();
+	} elsif ($self->{opts}->{ulist}) {
+		$self->userlist_domains();
+	} elsif ($self->{opts}->{domain}) {
+		$self->single_domain();
+	} elsif ($self->{opts}->{domlist}) {
+		$self->multi_domains();
+	}
+}
+
+# The following determine the domains that we will be working on
+sub cpuser_domains {
+
+	my $self    = shift;
+	my $dbh     = $self->{dbh};
+	my $user    = shift || $self->{opts}->{cpuser};
+	my $domains = $self->{domains};
+	my $failed  = $self->{failed};
+
+	if (my $id = $self->plesk_user_id($user)) {
+		$self->plesk_domains($id, $domains, $failed);
+	} else {
+		$self->{errstr} = "The user specified: '$user' does not exist.";
+		return;
+	}
+	return 1;
+}
+
+sub plesk_user_id {
+
+	my $self = shift;
+	my $user = shift;
+
+	my $querystring = qq^SELECT clients.id FROM clients where login = '$user';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if (my $result  = $query->fetchrow_hashref) {
+		return $result->{id};
+	}
+	return;
+}
+
+sub reseller_domains {
+	# No reseller support plesk, dummy function just to catch unfortunate calls.
+	return;
+}
+
+sub get_account_ip {
+
+	my $self   = shift;
+	my $domain = shift;
+
+	my $querystring = qq^SELECT IP_Addresses.ip_address FROM IP_Addresses INNER JOIN domains ON domains.name = '$domain' OR domains.name = 'www.$domain' INNER JOIN clients ON clients.id=domains.cl_id INNER JOIN ip_pool ON ip_pool.id=clients.pool_id WHERE IP_Addresses.id = ip_pool.ip_address_id;^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if (my $result  = $query->fetchrow_hashref) {
+		return $result->{ip_address};
+	}
+	return;
+}
+
+sub userlist_domains {
+
+	my $self     = shift;
+	my $userlist = shift || $self->{opts}->{ulist};
+	my $domains  = $self->{domains};
+	my $failed   = $self->{failed};
+
+	my @users;
+	if (-s $userlist) {
+		open my $userlist_fh, "<", $userlist or return;
+		while(<$userlist_fh>) {
+			chomp $_;
+			my $id = $self->plesk_user_id($_);
+			$self->plesk_domains($id, $domains, $failed);
+		}
+		close $userlist_fh;
+	} else {
+		$self->{errstr} = "The userlist specified: '$userlist' does not exist.";
+		return;
+	}
+	return 1;
+}
+
+sub multi_domains {
+
+	my $self     = shift;
+	my $domlist  = shift || $self->{opts}->{domlist};
+
+	my @doms;
+	if (-s $domlist) {
+		open my $domlist_fh, "<", $domlist or return;
+		while (<$domlist_fh>) {
+			chomp $_;
+			$self->single_domain($_);
+		};
+		close $domlist_fh;
+	} else {
+		$self->{errstr} = "The domainlist specified: '$domlist' does not exist.";
+		return;
+	}
+	return 1;
+}
+
+sub single_domain {
+
+	my $self   = shift;
+	my $domain = shift || $self->{opts}->{domain};
+	my $failed = $self->{failed};
+
+	$self->{domains}->{$domain} = ZUP::Parser::PleskDB->new($self->{dbh}, $domain);
+	if (not $self->{domains}->{$domain}) {
+		$failed->{$domain} = "Failed to initialize ZUP::Parser::PleskDB object. Error: $ZUP::Parser::PleskDB::errstr";
+		delete $self->{domains}->{$domain};
+	}
+	return;
+}
+
+sub plesk_domains {
+
+	my $self    = shift;
+	my $user_id = shift;
+	my $domains = shift;
+	my $failed  = shift;
+
+	my $querystring = qq^SELECT domains.id, domains.name FROM domains WHERE domains.cl_id = '$user_id' and domains.htype = 'vrt_hst' AND domains.parentDomainId = '0';^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+
+	my @ids;
+	while (my $result = $query->fetchrow_hashref) {
+		push @ids, $result->{id};
+		if ( (not exists $domains->{$result->{name}}) ) {
+			$domains->{$result->{name}} = ZUP::Parser::PleskDB->new($self->{dbh}, $result->{name});
+			if (not $domains->{$result->{name}}) {
+				$failed->{$result->{name}} = "Failed to initialize ZUP::Parser::PleskDB object. Error: $ZUP::Parser::PleskDB::errstr";
+				delete $domains->{$result->{name}};
+			}
+		}
+	}
+
+	# parked domains
+	$querystring = qq^SELECT domainaliases.name FROM domainaliases WHERE domainaliases.dom_id IN (^.join (",", @ids).qq^) AND domainaliases.dns = 'false';^;
+	$query       = $self->{dbh}->prepare($querystring); $query->execute();
+	while (my $result = $query->fetchrow_hashref) {
+		if ( (not exists $domains->{$result->{name}}) ) {
+			$domains->{$result->{name}} = ZUP::Parser::PleskDB->new($self->{dbh}, $result->{name});
+			if (not $domains->{$result->{name}}) {
+				$failed->{$result->{name}} = "Failed to initialize ZUP::Parser::PleskDB object. Error: $ZUP::Parser::PleskDB::errstr";
+				delete $domains->{$result->{name}};
+			}
+		}
+	}
+	return 1;
+}
+
+# this inserts the TXT and MX records from the DNS template into the domain's zone... why? cause plesk
+# call before doing any DNS update calls.
+sub set_remote_mx {
+
+	my $self = shift;
+	if ($self->{opts}->{setremotemx}) {
+		my $failed;
+		foreach my $zone (values %{$self->{domains}}) {
+			my $domain = $zone->getdomainname();
+			my $check  = `/usr/local/psa/bin/mail --off $domain 2>&1`;
+			$check =~ s/\n//g;
+			if ($check !~ /SUCCESS/) {
+				$failed .= "\t$domain: $check\n";
+			}
+		}
+		if ($failed) {
+			return "[!] Failed to set 'remote' MX on the following domains:\n$failed\n";
+		} else {
+			return "\n";
+		}
+	}
+	return;
+}
+
+# this inserts the TXT and MX records from the DNS template into the domain's zone... why? cause plesk
+# call before doing any DNS update calls.
+sub set_local_mx {
+
+	my $self = shift;
+	if ($self->{opts}->{setlocalmx}) {
+		my $failed;
+		foreach my $zone (values %{$self->{domains}}) {
+			my $domain = $zone->getdomainname();
+			my $check  = `/usr/local/psa/bin/mail --on $domain 2>&1`;
+			$check =~ s/\n//g;
+			if ($check !~ /SUCCESS/) {
+				$failed .= "\t$domain: $check\n";
+			}
+		}
+		if ($failed) {
+			return "[!] Failed to set 'local' MX on the following domains:\n$failed\n";
+		} else {
+			return "\n";
+		}
+	}
+	return;
+}
+
+sub restoredomain {
+	return "Restore domain functionality is not supported on Plesk servers.";
+}
+
+sub backupzones {
+
+	my $self   = shift;
+	return $self->tar_backup();
+}
+
+sub init_dbcon {
+
+	my $self = shift;
+	if (-e "/etc/psa/.psa.shadow") {
+		open (FILE, "/etc/psa/.psa.shadow");
+		my $mysqlpass = do { local $/; <FILE> };
+		chomp $mysqlpass;
+		close FILE;
+
+		$self->{dbh} = DBI->connect("DBI:mysql:database=psa;host=localhost","admin",$mysqlpass, { RaiseError => 0, PrintError => 0 }) or $self->{errstr} = "DBI call failed: $DBI::errstr" and return;
+		#$self->{dbh}->trace(2);
+		return 1;
+	} else {
+		$self->{errstr} = "'/etc/psa/.psa.shadow' Missing!";
+		return;
+	}
+}
+
+sub prechecks {
+
+	my $self = shift;
+
+	eval {
+		require File::Path;
+		File::Path->import(qw/make_path/);
+		1;
+	} or do {
+		$self->errstr("Failed to load the necessary modules for this script to function properly. Please install File::Path via 'cpan -i File::Path'");
+		return;
+	};
+
+	return 1;
+}
+
+sub help {
+
+	print "\n[+] ".ZUP::Panel::colorify("Z", "red").ZUP::Panel::colorify("UP", "green")." - ".ZUP::Panel::colorify("Z", "red")."one".ZUP::Panel::colorify("UP", "green")."dater - Plesk\n";
+	print "[+] By Rish - Report bugs at https://projects.hostgator.com/projects/script-zoneupdater\n\n";
+
+	print "This utility allows admins to easily update DNS zones for domains on a Plesk server without having to manually alter each.\n";
+	print "Please note that you can skip trivial prompts by using '-y', but piping any input to this script is not allowed.\n\n";
+	print ZUP::Panel::colorify("The", "red")." below options determine what domains the script will update: (domain selection options, must specify one)\n\n";
+	print "\t  -u,  --updateuser          update all domains under this ".ZUP::Panel::colorify("user", "green")."\n";
+	print "\t -ul,  --updateuserlist      update all domains under the users listed in specified ".ZUP::Panel::colorify("file", "green")."\n";
+	print "\t  -d,  --updatedomain        update a specific ".ZUP::Panel::colorify("domain", "green")."\n";
+	print "\t -dl,  --updatedomainlist    update all domains specified in the ".ZUP::Panel::colorify("file", "green")."\n\n";
+
+	print ZUP::Panel::colorify("The", "red")." below options determine what is updated in the zone files: (domain update options, must specify atleast one)\n\n";
+	print "\t -s,   --bumpserial          update the serial numbers. No arguments.\n\n";
+
+	print "\t -sem, --setsoaemail         update the email address in the SOA record (automatically updates the serial).\n";
+	print "\t                             Argument should be a string that contains the new email address to use. ('\@'s are converted to '.'s) Example:\n";
+	print "\t                             'root\@newdomain.com' or 'root.newdomain.com'\n\n";
+
+	print "\t -a,   --setarecords         update the A records (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated list formatted as such:\n";
+	print "\t                             'record => ip/host' - Example:\n";
+	print "\t                             'mail=>67.123.13.3,mail2=>68.122.12.2'\n";
+	print "\t                             ".ZUP::Panel::colorify("Special option", "bold").": You can update the A record for the domain itself by using '\@' as a standin for the record\n\n";
+
+	print "\t-aip,  --updateacctip        update all A records set to the account's IP address to use the new IP (automatically updates the serial).\n";
+	print "\t                             Argument should be a string specifying the new IP:\n";
+	print "\t                             'newip' - Example:\n";
+	print "\t                             '50.23.22.22'\n";
+	print "\t                             Note: this goes by what IP address the PSA database has for the account.\n\n";
+
+	print "\t-sip,  --updatespecip        update the IP addresses in A records as specified (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated string specifying the IPs:\n";
+	print "\t                             'oldip1 => newip1, oldip2 => newip2' - Example:\n";
+	print "\t                             '50.23.11.22 => 50.23.22.22, 50.23.11.23 => 50.23.22.23'\n\n";
+
+	print "\t -c,   --setcnamerecords     update the CNAME records  (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated list formatted as such:\n";
+	print "\t                             'record => fqdn' - Example:\n";
+	print "\t                             'mail=>ghs.google.com,docs=>ghs.google.com'\n\n";
+	
+	print "\t-mx,   --setmxrecords        update the MX records (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated list formatted as such:\n";
+	print "\t                             'priority => fqdn' - Example:\n";
+	print "\t                             '1=>ns1.google.com,5=>ns2.google.com,10=>ns3.google.com'\n\n";
+
+	print "\t-ns,   --setnsrecords        update the NS records (automatically updates the serial).\n";
+	print "\t                             Argument should be a comma separated list as such:\n";
+	print "\t                             'ns1.domain.com, ns2.domain.com'\n";
+	print "\t                             ".ZUP::Panel::colorify("Note", "bold").": Plesk automatically sets the SOA auth NS to the first NS in the DNS zone.\n\n";
+
+	print "\t-spf,  --setspfrecord        update the SPF record (automatically updates the serial).\n";
+	print "\t                             Argument should be the full SPF record as such:\n";
+	print "\t                             'v=spf1 a mx include:hotmail.com ~all'\n\n";
+
+	print "\t-dkim, --setdkimrecord       update the DKIM record (automatically updates the serial).\n";
+	print "\t                             Argument should be the DKIM record given as such:\n";
+	print "\t                             'txt_record_name=>dkim_record' - Example:\n";
+	print "\t                             'default._domainkey=>v=DKIM1\; k=rsa\; p=MHwwDQYJKoZIhvcNAQEBBQADawAwaAJhALYyW31r0Kt4ufPX29cZZ619nKE/Fx01rtdDBggTzgny581S0/KdU5in+iYyJbtuR4shMv0sqvjo14024sG9fjiqh2qBuDRCUm9GHdHyhwjMfLDKCjNvuFNJg8s41fHJkQIDAQAB\;'\n\n";
+
+	print "\t--gapps                      update records to use Google  Apps.\n";
+	print "\t--godaddy                    update records to use Godaddy MX.\n";
+	print "\t--office365                  update records to use Office 365.\n";
+	print "\t--wlive                      update records to use Windows Live. You need to specify the 'hostid' as an argument.\n\n";
+
+	print ZUP::Panel::colorify("Special", "red")." Options:\n";
+	print "\t--reload                     Perform a 'rndc reload' operation after the request is processed.\n";
+	print "\t--setremotemx                Disable the Mail Service for the domain(s).\n";
+	print "\t--setlocalmx                 Enable the Mail Service for the domain(s).\n\n";
+	print "[+] ".ZUP::Panel::colorify("Wiki", "green").": https://confluence.endurance.com/display/HGS/ZoneUPdater\n";
+}
+
+sub colorify {
+
+	shift;
+	ZUP::Panel::colorify(@_);
+}
+
+1;
+
+};
+BEGIN {
+ZUP::Panel::Plesk->import();
+};
+$INC{'ZUP/Panel/Plesk.pm'} = "/dev/null";
+#  perl-link processed: use ZUP::Logg;
+
+BEGIN {
+package ZUP::Logg;
+
+use strict;
+use POSIX qw(strftime);
+use Fcntl qw/ :flock /;
+our $errstr = "";
+	
+sub new {
+
+	my $class   = shift;
+	my $appname = shift;
+	my $self    = {};
+	$self->{class}         = $class;
+	$self->{logfile}       = undef;
+	bless($self, $class);
+
+	$self->{logfile} = "/var/log/hgtransfer/${appname}.log";
+	eval {
+		unless (-d "/var/log/hgtransfer") {
+			mkdir "/var/log/hgtransfer";
+		}
+		$self->logg("\n\n", 2);
+	} or do {
+		$ZUP::Logg::errstr = "Error opening the log file: $self->{logfile} - $ZUP::Logg::errstr";
+		return;
+	};
+	$self->logg("[*] Logging to $self->{logfile}\n", 1);
+	return $self;
+}
+	
+sub logg {
+	#printonly = 0 -> print to stdout and log
+	#printonly = 1 -> print to stdout only
+	#printonly = 2 -> print only to log
+	my $self      = shift;
+	my $print     = shift;
+	my $printonly = shift;
+
+	open my $fh, ">>", $self->{logfile} or $ZUP::Logg::errstr = "Unable to open logfile: $!" and return;
+	flock ($fh, 2) or $ZUP::Logg::errstr = "Unable to establish flock: $!" and return; #Exclusive Lock
+	if ($printonly != 2) {
+		print $print;
+	}
+	my $timestamp = strftime("%m/%d/%Y %H:%M:%S - ", localtime);
+	if ($printonly != 1) {
+		#remove color codes for log manually cause colorstrip isn't available in the version of ansicolor on the farm.
+		$print =~ s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g;
+		$print =~ s/^\n//;
+		chomp $print;
+		if ($print =~ m/^\s*$/) {
+			print {$fh} "$print\n";
+		} else {
+			print {$fh} "$timestamp$print\n";
+		}
+	}
+	close $fh;
+	return 1;
+}
+
+1;
+};
+BEGIN {
+ZUP::Logg->import();
+};
+$INC{'ZUP/Logg.pm'} = "/dev/null";
+my $logger;
+
+$SIG{INT} = "INT_Handler";
+
+sub main {
+
+	my $srvtype = get_srvtype();
+	exit 1 unless $srvtype;
+
+	my $noprompt = 0;
+	GetOptions ("yes|y" => \$noprompt);
+
+	$|++;
+	my $icheck = check_interactivity();
+
+	zup_runner($noprompt, $icheck, $srvtype);
+}
+
+sub zup_runner {
+
+	my $noprompt = shift;
+	my $icheck   = shift;
+	my $srvtype  = shift;
+
+	$logger = startlog();
+	if (not $icheck) {
+		$logger->logg("Non-interactive terminal detected. Due to the sensitive nature of this tool, the terminal must be interactive to proceed. If you wish to skip the trivial prompts, please use '-y' instead. Aborting!\n", 0);
+		done(1);
+	}
+
+	my $zup;
+	if ($srvtype eq "cpanel") {
+		$zup = ZUP::Panel::Cpanel->new(1, @ARGV);
+	} elsif ($srvtype eq "plesk") {
+		$zup = ZUP::Panel::Plesk->new(1, @ARGV);
+	}
+
+	if (not $zup) {
+		$logger->logg("[!] ZUP initialization failed. Error: $ZUP::Panel::errstr\n", 0);
+		done(1);
+	}
+
+	print "[+] Gathering info... ";
+	$zup->gatherdomains();
+	if ( my $error = $zup->get_errmsg() ) {
+		$logger->logg("\n[!] Failed to gather domain information. Error msg:\n\t$error\n", 0);
+		done(1);
+	}
+	print "Done.\n";
+
+	my ($domains, $failed) = $zup->domain_info();
+	if (keys %{$failed}) {
+		$logger->logg("[!] The following domains will need to be updated manually:\n", 0);
+		foreach my $domain (keys %{$failed}) {
+			my $line = sprintf "\t%25s -- %s\n", $domain, $zup->colorify($failed->{$domain}, "red");
+			$logger->logg($line, 0);
+		}
+	}
+	if (not keys %{$domains}) {
+		$logger->logg("[!] No Valid domains to process. Nothing to do.\n", 0);
+		done(1);
+	}
+
+	print "[+] Please review the following information: \n\n";
+	$logger->logg("Domains ZUP is working on:\n", 2);
+	foreach my $domain (keys %{$domains}) {
+		my $line = sprintf "\t%25s => %s\n", $domain, $zup->colorify($domains->{$domain}->getzonefile(), "green");
+		$logger->logg($line, 0);
+	}
+	print "\nEach of these domains will be updated. Is the above information correct? y/n - ";
+	my $answer;
+	if ($noprompt) {
+		$answer = 'y';
+		$logger->logg("Auto answered by '-y'.\n", 0);
+	} else {
+		chomp ($answer = <STDIN>)
+	}
+	if ($answer ne 'y') {
+		$logger->logg("Admin said the domain info was not correct.\n", 2);
+		done(1);
+	}
+
+	print "[+] Backing up the zone files now...\n";
+	my $backup = $zup->backupzones();
+	if ($backup) {
+		$logger->logg("[+] Zone files successfully backed up to: '".$zup->colorify($backup, "green")."'\n", 0);
+	} else {
+		$logger->logg("[!] Error: ".$zup->colorify($zup->get_errmsg(), "red")."\n", 0);
+		print "[!] Failed to backup the zone files! Proceed anyway? y/n - ";
+		chomp ($answer = <STDIN>);
+		if ($answer ne 'y') {
+			$logger->logg("Admin stopped the program when the backup failed.\n", 2);
+			done(1);
+		}
+		$logger->logg("[!] Admin decided to proceed without backups!\n", 2);
+	}
+	my $remotemx = $zup->set_remote_mx();
+	if ($remotemx) {
+		$logger->logg("[*] Updated MX settings to 'remote'.\n$remotemx", 0);
+	}
+	my $localmx = $zup->set_local_mx();
+	if ($localmx) {
+		$logger->logg("[*] Updated MX settings to 'local'.\n$remotemx", 0);
+	}
+	foreach my $domain (keys %{$domains}) {
+		$logger->logg("[+] Updating '".$zup->colorify($domain, "green")."' zone now...", 0);
+		if (my $return = $zup->processrequest( $domains->{$domain}) ) {
+			print "\n";
+			my @lines = split(/\n/, $return);
+			foreach (@lines) {
+				$logger->logg("\t$_\n", 0);
+			}
+			chomp (my $named_check = `which named-checkzone`);
+			if ($named_check) {
+				$logger->logg("[+] Validating updated zone file via named-checkzone... ");
+				my $check = $domains->{$domain}->validatezone($named_check);
+				if ($check) {
+					$logger->logg("Failed!\n", 0);
+					$logger->logg("[!] Full output:\n$check\n", 0);
+					print "[!] Undo the changes? y/n - ";
+					chomp (my $answer = <STDIN>);
+					if ($answer eq 'y') {
+						$logger->logg("Admin chose to undo the changes on '$domain'.\n", 2);
+						if ($zup->restorezone($domain)) {
+							$logger->logg("[+] Changes successfully undone.\n", 0);
+						}
+					}
+				} else {
+					$logger->logg("Done.\n", 0);
+					my $return = $zup->reloadzone($domains->{$domain});
+					if ($return) { $logger->logg("\t$return\n", 0); }
+				}
+			} else {
+				$logger->logg("[!] Skipping validation checks, cause I couldn't find named-checkzone in the PATH... \n", 0);
+			}
+		} else {
+			$logger->logg(" Failed!\n", 0);
+			$logger->logg("\tError: ".$zup->get_errmsg()."\n")
+		}
+		$logger->logg("[+] Updating named cache... ");
+		$domains->{$domain}->update_named_cache($domain);
+		$logger->logg("Done.\n", 0);		
+	}
+	done(0);
+}
+
+sub startlog {
+
+	my $logger = ZUP::Logg->new("zup");
+	if (not $logger) {
+		print "[!] Failed to start logging. Error:\n$ZUP::Logg::errstr\n";
+		exit 1;
+	}
+	if (exists $ENV{'RUSER'}) {
+		$logger->logg("[+] ZUP started by '$ENV{'RUSER'}'\n", 2);
+	} else {
+		$logger->logg("[+] ZUP started by 'unknown' (ruser is not set!)\n", 2);
+	}
+	return $logger;
+}
+
+sub INT_Handler {
+
+	$logger->logg("\n[!] Interrupt caught...\n", 2);
+	done(1);
+}
+
+sub done {
+
+	my $ret = shift;
+	$logger->logg("[+] ZUP Run completed.\n", 2);
+	exit $ret;
+}
+
+sub check_interactivity {
+
+	# if stdin is not open to a terminal it means someone is piping input to the script.
+	if (not -t STDIN) {
+		return 0;
+	}
+	return 1;
+}
+sub get_srvtype {
+
+	if (-s "/usr/local/cpanel/cpanel") {
+		return "cpanel";
+	} elsif (-s "/etc/psa/.psa.shadow") {
+		return "plesk";
+	} else {
+		print "[!] Unknown server type! Please use this script on servers with either cPanel or Plesk installed.\n";
+		print "[*] You will find more information on the Confluence: https://confluence.endurance.com/display/HGS/ZoneUPdater\n";
+		return;
+	}
+}
+
+__PACKAGE__->main unless caller;
+
+1;
+} # end runner

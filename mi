@@ -1,0 +1,1171 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+###########
+# mi (Migrations Info)
+# This is a script to show information from a cPanel account,
+#   a group of cPanel accounts or a backup file.
+# http://confluence.endurance.com/display/HGS/Migrations%3A+TransferUserinfo
+# https://stash.endurance.com/projects/HGADMIN/repos/minfo/browse
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+
+#-------- Precheck project -------------------
+#Done:
+#Database users that exist on more than one database, will not transfer over correctly.
+#subdomains of parked domains, which Plesk does not support.
+#piping to a script.
+#Cron jobs will not transfer over correctly.
+#Plesk can do aliases, but it doesn't allow an alias to be added to more than one email address.  So for example, sales@somedomain.com may be aliased to joe@somedomain.com and bill@somedomain.com in cPanel, but it can only go to one of them in Plesk.
+#Some database stored procedures will not transfer over correctly.
+
+#Check for:
+#Webmail settings will not transfer over correctly.
+#Some email settings may not transfer over correctly.
+#SSLs won't transfer automatically.
+
+
+#------------------------------------------------------------------
+use LWP::UserAgent;
+use URI::Escape;
+use Getopt::Long;
+use Cwd;
+use Sys::Hostname;
+use Term::ANSIColor qw(:constants);
+use strict;
+use JSON;
+use Cpanel::Version;
+
+my $reseller;
+my $plesk;    # 0 = cPanel, 1 = Plesk
+my @userlist; # Array of usernames;
+my @users;    # Array of user objects each of which contain all of the account details for that user.
+my $time = time;
+my $noaddons   = 0;    #0=Show addon domain info.      1=Don't show addon domain info.
+my $help       = 0;    #0=Don't show help.             1=Show help and exit.
+my $all        = 0;    #0=Don't use all users.         1=Show finished reply for all users on the server.
+my $noreseller = 0;    # Has no effect because the $reseller_flag below defaults to 0.  Can be removed as soon as users no longer need the warning.
+my $reseller_flag = 0; #0=Don't look up reseller clients.  1=Look up reseller clients
+my $showconflicts = 0; #0=Normal Userinfo              1=Only show Domain name conflicts between an archive and the server.
+my $showdbs    = 0;    #0=Normal Userinfo              1=Show detailed database info.
+my $preplesk   = 0;    #0=Normal Userinfo              1=Show Plesk pretransfer checks.
+my $email      = 0;    #0=Normal Userinfo              1=Show email addresses in this account.
+GetOptions ('noaddons'      => \$noaddons,
+            'preplesk'      => \$preplesk,
+            'email'         => \$email,
+            'all'           => \$all,
+            'help'          => \$help,
+            'noreseller'    => \$noreseller,
+            'reseller'      => \$reseller_flag,
+            'showconflicts' => \$showconflicts,
+            'showdbs'       => \$showdbs);
+
+if ($help == 1) {
+     showhelp();
+     exit 0;
+}
+
+# Find out if we're on a cPanel server or a Plesk server.
+if (-e "/etc/psa/.psa.shadow") {
+     $plesk = 1;
+}else { #If the password file doesn't exist, this must be a cPanel server.  Run the cPanel methods.
+     $plesk = 0;
+}
+### TOKEN SUPPORT ###
+my $token_name;
+my $token;
+my $json;
+my $currversion;
+if ( $plesk == 0 ){
+	$currversion = Cpanel::Version::getversionnumber();
+}
+if ( $currversion >= 11.64 ){
+        $token_name = "hgtool_".time();
+        $json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+        $token = JSON::from_json($json)->{'data'}{'token'};
+        ###Clean up token before end
+        END{
+                if($token_name){
+                        `whmapi1 api_token_revoke token_name=$token_name`
+                }
+        }
+	{
+		my $revoked;
+		$SIG{INT} = sub {
+			unless ($revoked) {
+				$revoked = 1;
+				`whmapi1 api_token_revoke token_name=$token_name`;
+			}
+			die "Interrupted";
+		}
+			
+	}
+        ###Remove stale tokens
+	stale_tokens();
+}
+### END TOKEN SUPPORT ###
+
+if (!dependency_check()) { # If a dependency is out of date or missing, then exit.
+     exit 1;
+}
+
+#---------------- Build the User List ----------------------------
+if ($all == 1) {
+     find_all_usernames(\@userlist);
+}else {
+     # Check for required arguments (-1 means no arguments).
+     if ($#ARGV == 0) {                  #If the user provided an argument, then
+          my $filesize = -s $ARGV[0];    #  check to see if there's a file with that name.
+          if ($filesize > 0 && ! -d $ARGV[0] && $ARGV[0] !~ /cpmove-/ && $ARGV[0] !~ /backup-/) { #If our file has size and it is not a directory, then treat it like a user list.
+               eval {
+                    open (INFILE, $ARGV[0]);
+                    @userlist = <INFILE>;
+                    close INFILE;
+               } or do {
+                    print "Error reading file $ARGV[0]\n";
+                    exit 1;
+               };
+               foreach my $tmpline (@userlist) { #Remove extra newlines.
+                    chomp($tmpline);       #Remove newlines.
+                    $tmpline =~ s/\s+//;   #Remove leading spaces.
+                    $tmpline =~ s/\s+$//;  #Remove trailing spaces.
+               }
+          }else {
+               push (@userlist, $ARGV[0]);   #If there's no file with the name of the argument, then assume that the argument is a username.
+          }
+     }else {
+          my $username = findusername();     #Try to find out the username from the current directory.
+          chomp($username);
+          if (length($username) == 0) {
+               showhelp();
+               exit 1;
+          }else {
+               push (@userlist, $username);
+          }
+     }
+}
+
+@userlist = sort(@userlist);
+
+
+#-------- Create an object for each user, populating each with all of the details ---------
+my $ud; #Placehoder for a user object.
+foreach my $line (@userlist) {
+     if (length($line) > 0 && $line ne "." && $line ne ".." && $line ne "./" && $line ne "../") {
+          print "Gathering information for user $line\n";
+          if ($line =~ /backup-/ || $line =~ /cpmove-/) {
+               $ud = cpbdata->new($line, $email); #$email is used as the full extraction flag since we'll need homedir.tar if we're checking email.
+          }else {
+               $ud = Userdata->new("localhost", $line, undef, $token);
+          }
+          if ($ud->{error} < 10) {
+               push (@users, $ud);
+               #$ud->cpanel_lookup_diskusage();
+               print "Looking up disk usage\n";
+               $ud->lookup_diskusage();
+               $ud->lookup_db_info();
+               #$ud->dump();
+     #     }else {
+               #exit 1;                               #Since this account failed on the Userdata instantiation, skip it.
+          }
+      }
+}
+
+if (scalar(@users) < 1) {
+     print "No valid users found.\n";
+     exit 1;
+}
+
+# ----------- If there's one user that owns a bunch of other users, then replace our user list with the entire client userlist -------------
+if (ref($users[0]) eq "Userdata" && !$plesk) { #Look for reseller clients only if it's a cPanel and not a backup.
+     $reseller = $users[0];  #Empty the @users array and put its 1 element into $reseller.
+     $reseller->cpanel_lookup_clients();
+     if (scalar(@users) == 1 && $reseller_flag == 1 && $plesk == 0) {  #If there's one user, then check to see if it owns clients.
+          if (scalar(@{$reseller->{clients}}) > 0) { #If this is a reseller (i.e. owns clients), then re-populate @userlist and @users with the client list.
+               @userlist = ();                       #Empty the @userlist array and make sure it only containss the single user that is in @users.
+               push(@userlist, $users[0]->{username});
+               foreach my $line (@{$reseller->{clients}}) { #loop through the clients, adding each one to @users and @userlist.
+                    chomp ($line);
+                    if ($line ne $users[0]->{username}) { #If the current client is the reseller, then skip because it is already in the list.
+                         print "Gathering information for user $line\n";
+                         my $ud = Userdata->new("localhost", $line, undef, $token);
+                         if ($ud->{'error'} < 10) {
+                              push (@users, $ud);
+                              push (@userlist, $line);
+                              $ud->lookup_diskusage();
+                              $ud->lookup_db_info();
+                         }
+                    }
+               }
+          }
+     }
+}
+
+
+## --------- Now we have our final array of @users. ---------------
+if ($showconflicts == 1) { # --showconflicts flag was used.  Show username and domain name conflicts.
+     my $conflictflag = 0;
+     foreach my $user (@users) {
+         if (does_user_exist($user->{username}) > 0 && $user->{class} eq "cpbdata") {
+              print "Username conflict: $user->{username}\n";
+         }
+         if (does_domain_exist($user->{primarydomain}) == 1 && $user->{class} eq "cpbdata") {
+              print "Domain conflict: $user->{primarydomain}\n";
+              $conflictflag = 1;
+         }
+         foreach my $addon (@{$user->{addons}}) {
+              my $tempaddon = $addon;               #i.e. mydomain.com:mydomain.primary.com
+              $tempaddon =~ s/:.*//;                #i.e. mydomain.com
+              if (does_domain_exist($tempaddon) == 1 && $user->{class} eq "cpbdata") {
+                   print "Domain conflict: $tempaddon\n";
+                   $conflictflag = 1;
+              }
+         }
+         foreach my $subdomain (@{$user->{subdomains}}) {
+              if (does_domain_exist($subdomain) == 1 && $user->{class} eq "cpbdata") {
+                   print "Domain conflict: $subdomain\n";
+                   $conflictflag = 1;
+              }
+         }
+         foreach my $parked (keys %{$user->{parked_parkeddir}}) {
+              if (does_domain_exist($parked) == 1 && $user->{class} eq "cpbdata") {
+                   print "Domain conflict: $parked\n";
+                   $conflictflag = 1;
+              }
+         }
+     }
+     if ($conflictflag == 0) {
+          print "No domain conflicts found.\n";
+     }
+}elsif ($email == 1) {            # --showdbs flag was used.  Show detailed database info.
+     foreach my $user (@users) {
+          $user->lookup_email_info();
+          foreach my $email (keys %{$user->{email_path} }) {
+               print $email . " " . $user->{email_path}{$email} . " " . $user->{email_pass}{$email} . "\n";
+          }
+     }     
+}elsif ($showdbs == 1) {            # --showdbs flag was used.  Show detailed database info.
+     foreach my $user (@users) {
+          #$user->lookup_db_info();
+          printf ("%-25s %10s %5s\n", "Database", "Size", "Tables");
+          foreach my $database (@{$user->{dblist_name}}) {
+               if (-l "/var/lib/mysql/$database") {
+                    printf (CYAN . "%-25s". RESET . " %10s %5s\n", $database, $user->{dblist_size}{$database}, $user->{dblist_tables}{$database});
+               }else{
+                    printf ("%-25s %10s %5s\n", $database, $user->{dblist_size}{$database}, $user->{dblist_tables}{$database});
+               }
+          }
+     }
+}elsif ($preplesk == 1) { # --preplesk flag was used.  Show pre-transfer checks for a Plesk transfer.
+     if ($plesk) {
+          print "Please run the Plesk prechecks on the cPanel server.\n";
+     }else {
+          preplesk_checks(\@users);
+     }
+}else {
+     #-------- We have gathered all of the user information.  Now let's show the information to the user. ---------
+     my $reseller_disk_usage = 0;
+     my $domaincount         = 0;
+     my $sslcount            = 0;
+     my $databasecount       = 0;
+     my $inodecount          = 0;
+     foreach my $user (@users) {      #Loop through the users to show account details and gather some summary info.
+          show_acct_info($user);              #Dump the details for an account.
+          $reseller_disk_usage = $reseller_disk_usage + $user->{totaldiskusage}; #Keep a sum of disk usage.
+          $databasecount = $databasecount + $user->{databases};                  #Keep a sum of databases.
+          foreach my $addon (@{$user->{addons}}) {                               #Count the addons.
+               $domaincount++;
+          }
+          $domaincount++;                                                        #Add 1 to the count for the primary domain.
+          if (scalar(@{$user->{sslcerts}}) > 0) {
+               $sslcount++;
+          }
+          $inodecount = $inodecount + $user->{inodes};
+     }
+     $reseller_disk_usage = $users[0]->to_units($reseller_disk_usage); # Then convert to the units that are the most readable.
+     $inodecount =~ s/(^[-+]?\d+?(?=(?>(?:\d{3})+)(?!\d))|\G\d{3}(?=\d))/$1,/g; 
+     print "Total disk usage for all of the listed accounts: $reseller_disk_usage\n";
+     print "Total inodes for all of the listed accounts:     $inodecount\n";
+     print "Total accounts:     " . scalar(@users) . "\n";
+     print "Total domains:      $domaincount\n";
+     print "Total databases:    $databasecount\n";
+     if ($sslcount > 0) {
+          print "Total SSL Certs:    $sslcount\n";
+     }
+     if ($reseller->{resellerquota} && $reseller->{resellerbandwidth}) {
+          print "Reseller quota:     $reseller->{resellerquota} ($reseller->{totaldiskalloc} allocated)\n";
+          print "Reseller bandwidth: $reseller->{resellerbandwidth} ($reseller->{totalbwalloc} allocated)\n";
+     }
+}
+
+#-------------------- Show any necessary warnings -----------------------
+
+if (is_shared_server()) {
+     my $cpucount = count_cpus();
+     if ($cpucount < 8 && $cpucount > 0) {
+          print RED . "****** Warning ****** This server only has $cpucount cpus.  We generally do not transfer onto a server with less than 8 cpus.\n" . RESET;
+     }
+}
+
+# Check for the deprecated --noreseller flag.
+if ($noreseller) {
+     print YELLOW . "Notice: --noreseller is deprecated and has no effect.  Default behavior is now to not include reseller clients.  If you want to include reseller clients, use --reseller.\n" . RESET;
+}
+
+# Warn if a cPanel has reseller clients but --reseller wasn't used.
+if (ref($users[0]) eq "Userdata" && scalar(@{$users[0]->{clients}}) > 1 && scalar(@users) == 1 && $reseller_flag == 0) {
+     print YELLOW . "Notice: This account has reseller clients.  To include them, use the --reseller switch.\n" . RESET;
+}
+
+# Warn about any symlinked databases.
+if (!$showdbs) { #Only check if we didn't already list the databases.
+     check_mysql_symlinks(\@users);
+}
+
+check_for_codeguard(\@users);
+
+exit(0);
+
+#-----------------------------------------------------------------
+#------------------------ Subroutines ----------------------------
+#-----------------------------------------------------------------
+
+# Check for the .codeguard directory in each account.
+# Input:  Reference to the array of users
+# Output: Notice is printed for any account containing a .codeguard directory.
+sub check_for_codeguard {
+     my $users = shift;
+     foreach my $user (@{$users}) {
+          my $codeguard_dir = "/" . $user->{partition} . "/" . $user->{username} . "/.codeguard";
+          if (-d $codeguard_dir) {
+               print YELLOW . "Notice: " . $user->{username} . " appears to have codeguard.\n" . RESET;
+          }
+     }
+}
+
+# Check to see if any databases in /var/lib/mysql are symlinks.  If so, print a warning.
+sub check_mysql_symlinks {
+     my $users = shift;
+     foreach my $user (@{$users}) {
+          foreach my $database (@{$user->{dblist_name}}) {
+               if (-l "/var/lib/mysql/$database") {
+                    print YELLOW . "Notice: Database " . CYAN . $database . YELLOW . " is symlinked.\n" . RESET;
+               }
+          }
+     }
+}
+
+# Perform prechecks for known problems when migrating to Plesk.
+# Input:  Reference to an array of userdata objects.
+# Output: Info. and warnings are printed.
+sub preplesk_checks {
+     my $users = $_[0];
+     my $flag;
+     foreach my $user (@{$users}) {
+          $flag = 0;
+          $user->lookup_db_info();
+          print $user->{username} . ":\n";
+          #---------- Database User Check ---------- Plesk doesn't support a user assigned to more than one database.
+          print "Checking for one database per user...         ";
+          foreach my $key (keys %{$user->{userlist_dbs}}) { #Loop through the database user hash looking for any that are assigned to more than one database.
+               if ($user->{userlist_dbs}{$key} > 1) {
+                    if (!$flag) {print "\n";}
+                    $flag = 1;                              #Flag that we found a datbase user who is assigned to more than one db.
+                    print YELLOW . "Database user: " . $key . " is assigned to more than one datbase (" . $user->{userlist_dbs}{$key} . ").  A database user can only be assigned to one database in Plesk.\n" . RESET;
+               }
+          }
+          if (!$flag) {print GREEN . "[OK]\n" . RESET;}
+          #---------- Subdomain of parked domain check ---------- Plesk doesn't support a subdomain of a parked domain.
+          $flag = 0;
+          print "Checking for subdomains of parked domains...  ";
+          if (scalar(keys %{$user->{parked_parkeddir}}) > 0 && scalar(keys %{$user->{subdomain_subdomaindir}}) > 0) {
+               foreach my $parked (keys %{$user->{parked_parkeddir}}) { # Loop through the parked domains.
+                    foreach my $sub (keys %{$user->{subdomain_subdomaindir}}) { # Loop through the subdomains looking for a sub of the current parked.
+                        if (issubdomain($sub, $parked)) {
+                             if (!$flag) {print "\n";}
+                             $flag = 1;
+                             print RED . "$sub is a subdomain of the parked domain $parked.  Plesk does not support this.\n" . RESET;
+                        }
+                    }
+               }
+          }
+          if (!$flag) {print GREEN . "[OK]\n" . RESET;}
+          #---------- Email piped to programs ------------------ Plesk doesn't support email piped to a program.
+          $flag = 0;
+          print "Checking for forwarders piped to programs...  "; 
+          if (haspipe("/etc/valiases/" . $user->{primarydomain})) {       #Check the primary domain.
+               if (!$flag) {print "\n";}
+               $flag = 1;
+               print RED . $user->{primarydomain} . " has one or more forwarders to a program.  This is not supported in Plesk.\n" . RESET;
+          }
+          foreach my $addon (keys %{$user->{addon_addondir}}) {           #Check the addon domains.
+               if (haspipe("/etc/valiases/" . $addon)) {
+                    if (!$flag) {print "\n";}
+                    $flag = 1;
+                    print RED . $addon . " has one or more forwarders to a program.  This is not supported in Plesk.\n" . RESET;
+               }
+          }
+          foreach my $parked (keys %{$user->{parked_parkeddir}}) {          #Check the parked domains.
+               if (haspipe("/etc/valiases/" . $parked)) {
+                    if (!$flag) {print "\n";}
+                    $flag = 1;
+                    print RED . $parked . " has one or more forwarders to a program.  This is not supported in Plesk.\n" . RESET;
+               }
+          }
+          if (!$flag) {print GREEN . "[OK]\n" . RESET;}
+          #---------- Aliases to multiple emails ------------------ An alias in Plesk can only be directed to one email address.
+          $flag = 0;
+          print "Checking for multiple aliases...              ";
+          if (multiple_aliases("/etc/valiases/" . $user->{primarydomain})) {       #Check the primary domain.
+               if (!$flag) {print "\n";}
+               $flag = 1;
+               print RED . $user->{primarydomain} . " has at least one email alias going to > 1 email address.  This is not supported in Plesk.\n" . RESET;
+          }
+          foreach my $addon (keys %{$user->{addon_addondir}}) {           #Check the addon domains.
+               if (multiple_aliases("/etc/valiases/" . $addon)) {
+                    if (!$flag) {print "\n";}
+                    $flag = 1;
+                    print RED . $addon . " has at least one email alias going to > 1 email address.  This is not supported in Plesk.\n" . RESET;
+               }
+          }
+          foreach my $parked (keys %{$user->{parked_parkeddir}}) {          #Check the parked domains.
+               if (multiple_aliases("/etc/valiases/" . $parked)) {
+                    if (!$flag) {print "\n";}
+                    $flag = 1;
+                    print RED . $parked . " has at least one email alias going to > 1 email address.  This is not supported in Plesk.\n" . RESET;
+               }
+          }
+          if (!$flag) {print GREEN . "[OK]\n" . RESET;}
+          #------------- Cron jobs ------------------------------- Cron jobs will have to be manually set up on Plesk 
+          print "Checking for crons...                         ";
+          if (has_crons($user->{username}) == 1) {
+               print YELLOW . "\nUsername " . $user->{username} . " appears to have one or more crons.  These will need to be set up manually on Plesk.\n" . RESET;
+          }else {
+               print GREEN . "[OK]\n" . RESET;
+          }
+          #------------- DEFINER in a database ------------------- May indicate a stored procedure w/the cPanel username that will need to be manually updated.
+          print "Checking for DEFINER in db (please wait...)   ";
+          if (check_db_definer($user) == 1) {
+               print RED . "\nUsername " . $user->{username} . ": Found \"DEFINER\" in a database.  This could indicate stored procedures in one or more\n";
+               print "databases with a cPanel username that needs to be manually updated.\n" . RESET
+          }else {
+               print GREEN . "[OK]\n" . RESET;
+          }
+          #----------------------   Horde   ---------------------- Check to see if this user is using Horde since it won't transfer automatically.
+          print "Checking for Horde...                         ";
+          if (check_for_horde($user) == 1) {
+               print YELLOW . "\nUsername " . $user->{username} . " appears to be using Horde.  Horde info. will not transfer.\n" . RESET;
+          }else {
+               print GREEN . "[OK]\n" . RESET;
+          }
+          #-----------------------  SSL   ------------------------ Check to see if this user is using an SSL certificate.
+          print "Checking for an SSL certificate...            ";
+          if (scalar(@{$user->{sslcerts}}) > 0) {
+               print YELLOW . "\nUsername " . $user->{username} . " appears to be using an SSL certificate.  This will need to be installed manually.\n" . RESET;
+          }else {
+               print GREEN . "[OK]\n" . RESET;
+          }
+          #------------------------  MX   ------------------------ Check to see if this user has any custom MX records.
+          print "Checking for custom MX records...             ";
+          my $custom_domain;
+          if (check_custom_mx($user, \$custom_domain) == 1) {
+               print YELLOW . "\nUsername " . $user->{username} . " appears to be using one or more custom MX records.  The known domain is $custom_domain.\n" . RESET;
+          }else {
+               print GREEN . "[OK]\n" . RESET;
+          }
+     }
+}
+
+# Check a user's zone files for custom MX records.
+# Input:  Userdata object.
+# Output: 0 = No custom records
+#         1 = Custom records.  Also, $custom_domain is populated with the domain found.
+#        -1 = Error
+sub check_custom_mx {
+     my $ud_user       = $_[0];
+     my $custom_domain = $_[1];
+     my @domains       = ();
+     my $found         = 0;
+     build_domain_list($ud_user, \@domains);                           # List all domains in this account.
+     foreach my $domain (@domains) {
+          eval {                                                       # Check the current zone file for custom MX records.
+               open (my $INFILE, "/var/named/$domain.db") || die;
+               while (my $line = <$INFILE>) {
+                    if ($line =~ /mx.*aspmx.*google\.com/i) {          # Google Apps
+                         $found            = 1;
+                         ${$custom_domain} = $domain;
+                    }
+                    if ($line =~ /mx.*smtp\.secureserver.net/i) {      # Godaddy email
+                         $found            = 1;
+                         ${$custom_domain} = $domain;
+                    }
+                    if ($line =~ /mx.*\.outlook\.com/i) {              # Office 365
+                         $found            = 1;
+                         ${$custom_domain} = $domain;
+                    }
+                    if ($line =~ /mx.*\.hotmail\.com/i) {              # Windows Live
+                         $found            = 1;
+                         ${$custom_domain} = $domain;
+                    }
+               }
+               close $INFILE;
+          };
+          if ($@) {
+               print "Error running \"mysql -ss -e \"select share_owner from turba_shares;\" horde\". $!. $@\n";
+               return -1
+          }
+          if ($found) {                                                # If custom MX found, then jump out of the loop.
+               last;
+          }
+     }
+     return $found;
+}
+
+# Input:  Username
+# Output: 0 = User is not using Horde
+#         1 = User is using Horde
+#        -1 = Error
+sub check_for_horde {
+     my $ud_user   = $_[0];
+     my @hordelist = ();
+     my @acctlist  = ();
+     eval { #Load the info. from horde into an array.
+          open (my $INFILE, "mysql -ss -e \"select share_owner from turba_shares;\" horde |") || die;
+          while (my $line = <$INFILE>) {
+               $line =~ s/.*\@//;
+               $line =~ s/\n//g;
+               push (@hordelist, $line);
+          }
+          close $INFILE;
+     };
+     if ($@) {
+          print "Error running \"mysql -ss -e \"select share_owner from turba_shares;\" horde\". $!. $@\n";
+          return -1
+     }
+     # @hordelist now has all of the domains and usernames from horde.turba_shares.
+     # Now let's build a complete list of domains from the user's account.
+     push (@acctlist, $ud_user->{username});
+     build_domain_list($ud_user, \@acctlist);
+
+     # We now have a populated @hordelist and a populated @acctlist to compare.
+     my $found = 0; #Initialize found flag to false.
+     foreach my $acct (@acctlist){
+          chomp($acct);
+          foreach my $horde (@hordelist){
+              chomp($horde);
+              if ($acct eq $horde) {
+                  $found = 1; #We've found a duplicated line.  Therefore, this user has an entry in the Horde database.
+              }
+          }
+     }
+     return $found;
+}
+
+# Build a full list of domains for a user into one array.
+# Input:  A reference to a Userdata object.
+#         An array reference to populate.
+# Output: A reference to an array with the primary domain, all addon domains, and all parked domains.
+sub build_domain_list {
+     my $ud_user = $_[0];
+     my $array   = $_[1];
+     push (@{$array}, $ud_user->{primarydomain});
+     foreach my $addon (keys %{$ud_user->{addon_addondir}}) {
+          push (@{$array}, $addon);
+     }
+     foreach my $parked (keys %{$ud_user->{parked_parkeddir}}) {
+          push (@{$array}, $parked);
+     }
+}
+
+# Determine whether or not an of a user's databases contain the word "DEFINER".  If so, there could be a
+#  stored procedure that contains the cPanel username that will need to be manually updated.
+# Input:  Username
+# Output: 0 = No definer found
+#         1 = Definer found.
+#        -1 = Error
+sub check_db_definer {
+     my $ud_user = $_[0];
+     $ud_user->lookup_db_info();
+     foreach my $db (@{$ud_user->{dblist_name}}) { #Loop through this user's databases.
+          my $flag = 0;
+          eval {
+               open (my $INFILE, "mysqldump $db |") || die;
+               while (my $line = <$INFILE>) {      #Loop through the dump of one database searching for a line with "DEFINER".
+                    if ($line =~ /DEFINER/) {  #If the current line has "DEFINER" then flag it and exit the loop.
+                         $flag = 1;
+                    }
+               }
+               close $INFILE;
+          };
+          if ($@) {
+               print "Error running \"mysqldump $db\". $!. $@\n";
+               return -1
+          }
+          if ($flag == 1) {return 1;}      #If we found "DEFINER", return the result that we found it.
+     }
+     return 0;
+}
+
+# Determine whether or not a username has any crons.
+# Input:  Username
+# Output: 0 = No Cron
+#         1 = Cron
+#        -1 = Error
+sub has_crons {
+     my $username = $_[0];
+     my $output = `crontab -u $username -l 2>&1`;
+     if ($output =~ /user.*unknown/) {
+          return -1
+     }
+     if ($output =~ /^no crontab for/) {
+          return 0;
+     }
+     if ($output =~ /[^\s]+ +[^\s]+ +[^\s]+ +[^\s]+ +[^\s]+ +[^\s]+/) { #If it looks like a crontab line, then return an affirmative.
+          return 1;
+     }
+     return -1; #Don't recognize the output.  Return an error.
+}
+
+
+
+# Find out if an email alias file has an alias that goes to > 1 email address.
+# Filename
+# Output: 0 = No pipe.
+#         1 =    pipe.
+#        -1 = Error.
+sub multiple_aliases {
+     my $filename = $_[0];
+     my $flag = 0;
+     eval {
+          open (my $INFILE, $filename);
+          while (my $line = <$INFILE>) {
+               if ($line =~ /,/) {  #If the current line has a "," then flag it.
+                    $flag = 1;
+                    last;
+               }
+          }
+          close $INFILE;
+     }or do {
+          print "Error opening $filename\n";
+          $flag = -1;
+     };
+     return $flag;
+}
+
+# Find out if a file contains the | character.
+# This is used to check email alias files for email addresses that are piped to programs.
+# Input:  Filename
+# Output: 0 = No pipe.
+#         1 =    pipe.
+#        -1 = Error.
+sub haspipe {
+     my $filename = $_[0];
+     my $flag = 0;
+     eval {
+          open (my $INFILE, $filename);
+          while (my $line = <$INFILE>) {
+               if ($line =~ /\|/) {  #If the current line has a |, flag it.
+                    $flag = 1;
+                    last;
+               }
+          }
+          close $INFILE;
+     }or do {
+          print "Error opening $filename\n";
+          $flag = -1;
+     };
+     return $flag;
+}
+
+# Count the number of cpus on the local machine.
+# Input:  Nothing
+# Output: # of cpus or -1 if there's an error.
+sub count_cpus {
+     my $filename = "/proc/cpuinfo";
+     my @cpuinfo;
+     eval {
+          open (my $INFILE, $filename);
+          @cpuinfo = <$INFILE>;                     #Sluuuuurp
+          close $INFILE;
+     } or do {
+          print "Error reading the file $filename while counting processors.\n";
+          return -1;
+     };
+     if (@cpuinfo) {
+          @cpuinfo = grep(/processor/, @cpuinfo);
+          if (scalar(@cpuinfo)<1) {
+               print "Error 1 while extracting the number of cpus out of $filename.\n";
+               return -1;
+          }else {
+               return scalar(@cpuinfo);
+          }
+     }else{
+          print "Error 2 while extracting the number of cpus out of $filename.\n";
+          return -1;
+     }
+}
+
+#Find out if a username exists on the server.
+#Input: username
+#Output: 0 = User does not exist.
+#        Any other value = User does exist.
+sub does_user_exist {
+     my $user = $_[0];
+     my $ud = Userdata->new("localhost", $user, undef, $token);
+     if (length($ud->{'primarydomain'}) > 0) {
+          return $ud;
+     }else {
+          return 0;
+     }
+}
+
+#Find out if a domain name exists on the server.
+#Input:  Domain name (i.e. mydomain.com)
+#Output: 0 = Domain does not exist.
+#        1 = Domain does exist.
+#        2 = Error
+sub does_domain_exist {
+     my $domain = $_[0];
+     my @file;
+     eval { #Read /etc/userdomains file from the archive into @file.
+          open (my $INFILE, "/etc/userdomains");
+          @file = <$INFILE>;
+          close $INFILE;
+     } or do {
+          print "Error opening /etc/userdomains\n";
+          return 2;
+     };
+     foreach my $line (@file) {
+          chomp($line);
+          $line =~ s/:.*//;            #$line has "domain.com: user".  So let's chop off the ": user"
+          if ($line eq $domain) {
+               return 1;               #Found a match return a 1 to indicate that the domain is on this server.
+          }
+     }
+     return 0;                         #No match found.  Return a 0.
+}
+
+
+sub show_acct_info {
+     my $user = $_[0];
+     if ($plesk == 1) {
+          plesk_show_acct_info($user);
+     }else {
+          cpanel_show_acct_info($user);
+     }
+}
+
+sub cpanel_show_acct_info {
+     my $user = $_[0];
+     print "User:        " . $user->{username} . "\n";
+     print "Primary Dom: " . $user->{primarydomain} . "\n";
+     print "Partition:   " . $user->{partition} . "\n";
+     print "IP:          " . $user->{ip} . " (";
+     if ($user->{dedicatedip}) {
+          print "dedicated)\n";
+     }else{
+          print "shared)\n";
+     }
+     print "Owner:       " . $user->{owner} . "\n";
+     print "Plan:        " . $user->{plan} . "\n";
+     print "NS1:         " . $user->{ns1} . "\n";
+     print "NS2:         " . $user->{ns2} . "\n";
+     print "NS1IP:       " . $user->{ns1ip} . "\n";
+     print "NS2IP:       " . $user->{ns2ip} . "\n";
+     print "Databases:   " . $user->{databases} . "\n";
+     print "Inodes:      ";
+     print_inodes($user->{inodes});
+     print "MySQL usage: " . $user->{mysqldiskusage} . " " .  $user->{mysqlunits} . "\n"; 
+     if (ref($user) eq "Userdata") {
+          print "Disk usage:  " . $user->{diskusage} . " " . $user->{diskunits};
+          if ($user->{diskpercent} eq "100") {
+               print RED;
+          }
+          print " (" . $user->{diskpercent} . "% of $user->{disklimit})\n" . RESET;
+          print "Bandwidth:   " . $user->{bandwidthusage} . " " . $user->{bandwidthunits};
+          if ($user->{bandwidthpercent} eq "100") {
+               print RED; 
+          }
+          print " (" . $user->{bandwidthpercent} . "% of $user->{bandwidthlimit})\n" . RESET;
+     }else{
+          print "Disk usage:  " . $user->{diskusage} . " " . $user->{diskunits} . "\n";
+     }
+     if ($noaddons == 0) { 
+          if (scalar(keys %{$user->{parked_parkeddir}}) > 0) {
+               print "Parked domains:\n";
+               foreach my $parked (keys %{$user->{parked_parkeddir}}) {
+                    print $parked . " - " . $user->{parked_parkeddir}{$parked} . "\n";
+               }
+          }
+          print "Addons:\n";
+          my $index = 0;
+          foreach my $addon (@{ $user->{addons} }) {
+               $addon =~ s/:.*//;
+               print $addon . " - " . @{ $user->{addondirs}}[$index] . "\n";
+               $index = $index + 1;
+          }
+          print "Subdomains:\n";
+          my $index = 0;
+          foreach my $subdomain (@{ $user->{subdomains} }) {
+               print $subdomain . " - " . @{ $user->{subdomaindirs}}[$index] . "\n";
+               $index = $index + 1;
+          }
+     }
+     if (scalar(@{$user->{sslcerts}}) > 0) {
+          print "************ SSL ************\n";
+          my $index = 0;
+          foreach my $ssl (@{$user->{sslcerts}}) {
+               print "$ssl\n";
+               print @{$user->{sslstart}}[$index] . "\n";
+               print @{$user->{sslend}}[$index] . "\n";
+               print @{$user->{sslstatus}}[$index] . "\n";
+               $index = $index + 1;
+          }
+          print "*****************************\n";
+     }
+     print "Temporary URL:  http://" . $user->{ip} . "/~" . $user->{username} . "\n";
+     print "Hosts line:     " . $user->{ip} . " " . $user->{primarydomain} . " www." . $user->{primarydomain} . "\n\n";
+}
+
+sub plesk_show_acct_info {
+     my $user = $_[0];
+     print "FTP User:        " . $user->{ftpuser} . "\n";
+     print "FTP Pass:        " . $user->{ftppass} . "\n";
+     print "Plesk User:      " . $user->{username} . "\n";
+     print "Plesk password:  " . $user->{pleskpass} . "\n";
+     print "Primary Dom:     " . $user->{primarydomain} . "\n";
+     print "Temp URL:        http://" . $user->{ip} . ":8880/sitepreview/http/" . $user->{primarydomain} . "\n";
+     print "IP:              " . $user->{ip} . " (";
+     if ($user->{dedicatedip}) {
+          print "dedicated)\n";
+     }else{
+          print "shared)\n";
+     }
+     print "NS1:             " . $user->{ns1} . "\n";
+     print "NS2:             " . $user->{ns2} . "\n";
+     print "NS1IP:           " . $user->{ns1ip} . "\n";
+     print "NS2IP:           " . $user->{ns2ip} . "\n";
+     print "Hosts file line: " . $user->{ip} . " " . $user->{primarydomain} . " www." . $user->{primarydomain} . "\n";
+     print "Databases:       " . $user->{databases} . "\n";
+     print "Inodes:          ";
+     print_inodes($user->{inodes});
+     print "Disk usage:      " . $user->{diskusage} . " " . $user->{diskunits} . "\n";
+     my $totaldiskusage = $user->to_units($user->{totaldiskusage});
+     print "Total usage:     " . $totaldiskusage . "\n";
+     if ($noaddons == 0) {
+          if (scalar(keys %{$user->{parked_parkeddir}}) > 0) {
+               print "Parked domains (a.k.a. domain aliases):\n";
+               foreach my $parked (keys %{$user->{parked_parkeddir}}) {
+                    print $parked . " - " . $user->{parked_parkeddir}{$parked} . "\n";
+               }
+          }
+          print "Addons:\n";
+          my $index = 0;
+          foreach my $addon (@{ $user->{addons} }) {
+               $addon =~ s/:.*//;
+               print $addon . " - " . @{ $user->{addondirs}}[$index] . "\n";
+               $index = $index + 1;
+          }
+          print "Subdomains:\n";
+          my $index = 0;
+          foreach my $subdomain (@{ $user->{subdomains} }) {
+               print $subdomain . " - " . @{ $user->{subdomaindirs}}[$index] . "\n";
+               $index = $index + 1;
+          }
+     }
+     print "\n";
+}
+
+# Print an inodes line with coloring based on the number of inodes, etc.
+# Input:  Number of inodes
+# Output: Inodes line is printed with appropriate coloring and formatting.
+sub print_inodes {
+     my $inodes = shift;
+     my $formatted_inodes = $inodes;
+     $formatted_inodes =~ s/(^[-+]?\d+?(?=(?>(?:\d{3})+)(?!\d))|\G\d{3}(?=\d))/$1,/g;
+     if ($inodes > 300000) {
+          print RED . $formatted_inodes . "\n" . RESET;
+     }elsif ($inodes > 100000) {
+          print YELLOW . $formatted_inodes . "\n" . RESET;
+     }else{
+          print $formatted_inodes . "\n";
+     }
+}
+
+sub showhelp {
+     print "mi\n";
+     print "Usage: mi <username> [--noaddons] [--reseller] [--all] [--help]\n";
+     print "       mi <cPanel Backup> [--noaddons] [--showconflicts] [--help]\n\n";
+     print "       --noaddons      - Don't show addon domains or subdomains.\n";
+     print "       --reseller      - Look up reseller clients.\n";
+     print "       --all           - Show the user information for all users on the server.\n";
+     print "       --showdbs       - Show database details.\n";
+     print "       --showconflicts - Show users and domains from backups that are already on the server.\n";
+     print "       --preplesk      - Plesk pretransfer checks.\n";
+     print "       --email         - List email accounts.\n";
+     print "       --help          - Show this help information.\n";
+}
+
+# Find all of the usernames on a server.
+# Input: An array to put the usernames into, passed by reference.
+# Output: Populated array.
+sub find_all_usernames {
+     my $userarray = $_[0]; #User array passed from caller
+     my @users;          #User array populated by the mysql statement
+     #---------------- ToDo: Check for a shared server and don't list all users if we're on one -----------------
+     if (-e "/etc/psa/.psa.shadow") { #If it's a Plesk server, use the Plesk code to find the usernames.
+          my $mysqlpass = read_mysql_password(); #Grab MySQL password.
+          @users = `mysql -ss -u'admin' -p'$mysqlpass' -e"select sys_users.login from hosting inner join sys_users on hosting.sys_user_id=sys_users.id inner join domains on domains.id=hosting.dom_id where domains.webspace_id=0;" psa`;
+          if (($? >> 8) > 0) {     #Check the return code, and exit if the external call failed.
+               return ($? >> 8);
+          }
+          foreach my $user (@users) {
+               chomp($user);
+               push (@{$userarray}, $user);
+          }
+     }else {
+          #cPanel code to list usernames.
+          if (is_shared_server() == 1) {
+               print "Cannot print a user information for all users on a shared server.\n";
+               return 1;
+          }else {
+               @users = `ls -1 /var/cpanel/users`; #List the users in /var/cpanel/users.
+               if (($? >> 8) > 0) {                #Check the return code, and exit if the external call failed.
+                    return ($? >> 8);
+               }
+               foreach my $user (@users) {         #Go through the list, remove "." and ".." entries, and add the rest to the array.
+                    chomp($user);
+                    if ($user ne "." && $user ne ".." && $user ne "rvadmin") {
+                         push (@{$userarray}, $user);
+                    }
+               }
+          }
+     }
+}
+
+# Do sanity checks for a gator server
+# Input:  A Userdata object passed by reference. i.e. gator_sanity_check(\$myuserobj);
+# Output: 0=OK, 1=Fail
+sub gator_sanity_check {
+     my $userobj  = $_[0];
+     my $owner    = ${$userobj}->{owner};
+     my $plan     = ${$userobj}->{plan};
+     my $username = ${$userobj}->{username};
+     unless ($plan =~ /^Business$/ || $plan =~ /^Baby Croc$/ || $plan =~ /^Hatchling$/) {
+          print "The plan for $username ($plan) does not appear to be a valid plan for this server\n";
+          return 1;
+     }
+     unless ($owner eq "root" || $owner eq "fbf") { #Make sure owner is root or fbf.  fbf is for Free Blog Factory servers such as gator1227.
+          print "The owner for $username is $owner, but it should be root.\n";
+          return 1;
+     }
+     if (length($username) == 0) { #grepping with a blank username will cause the whole script to hang.  Check that before grepping.
+          print "Username is blank while doing a sanity check.\n";
+          return 1;
+     }
+     my $temp = `grep $username /var/cpanel/resellers`; #We are interested in the return value of this command.  
+     if (($? >> 8) == 0) {     #If the return code is 0, then the username was found in the resellers file.
+          print "Please ensure that the user $username does not have reseller privileges since this is a shared server.\n";
+          return 1;
+     }
+     return 0;
+}
+
+# Do sanity checks for a gator server
+# Input:  A Userdata object passed by reference. i.e. gator_sanity_check(\$myuserobj);
+# Output: 0=OK, 1=Fail
+sub reseller_sanity_check { 
+     my $userobj  = $_[0];
+     my $owner    = ${$userobj}->{owner};
+     my $plan     = ${$userobj}->{plan};
+     my $username = ${$userobj}->{username};
+     my $ownerobj = Userdata->new("localhost", $owner, undef, $token);
+     if ($ownerobj == 1) {
+          print "The user $username is owned by $owner, but $owner does not appear to be on the server\n";
+          return 1;
+     }
+     if ($plan =~ /^Business$/ || $plan =~ /^Baby Croc$/ || $plan =~ /^Hatchling$/) {
+          print "The plan for $username ($plan) should not be used on a reseller server\n";
+          return 1;
+     }
+     if ($owner eq "root") {
+          print "Please make sure $username is not owned by root since it\'s a reseller server.\n";
+          return 1;
+     }
+     return 0;
+}
+
+#Determine whether or not this is a shared server.
+# Input: nothing
+# Output: 0=no  1=yes it is a shared server.
+sub is_shared_server {
+     my $hostname = hostname;
+     chomp($hostname);
+     if ($hostname =~ /\.(hostgator\.(com(\.(tr|br))?|in)|(websitewelcome|webhostsunucusu|ehost(s)?|ideahost|hostclear)\.com|websitedns\.in|prodns\.com\.br)$/) {
+          return 1;
+     }
+     return 0;
+}
+
+#Determine whether or not this is a gator server.
+# Input: nothing
+# Output: 0=no  1=yes it is a gator server.
+sub is_gator_server {
+     my $hostname = hostname;
+     chomp($hostname);
+     if ($hostname =~ /\.(hostgator\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear)\.com)$/) {
+          return 1;
+     }
+     return 0;
+}
+
+#Determine whether or not this is a reseller server.
+# Input: nothing
+# Output: 0=no  1=yes it is a reseller server.
+sub is_reseller_server {
+     my $hostname = hostname;
+     chomp($hostname);
+     if ($hostname =~ /\.((websitewelcome|webhostsunucusu)\.com|websitedns\.in|prodns\.com\.br)$/) {
+          return 1;
+     }
+     return 0;
+}
+
+
+# Find out the cPanel username
+# Input: Nothing.  Info. is obtained from the current directory path.
+# Output: username if the current dir is in a user's home dir.
+#         If not, error is printed and "" is returned.
+sub findusername {
+     my $dir = getcwd();     #Look up the dir which contains the username.
+     if (-e "/etc/psa/.psa.shadow") { #If it's a Plesk server, use the Plesk code to find the username.
+          my $mysqlpass = read_mysql_password(); #Grab MySQL password.
+          my $user = `mysql -ss -u'admin' -p'$mysqlpass' -e"select sys_users.login from sys_users inner join hosting on hosting.sys_user_id=sys_users.id where hosting.www_root = '$dir' limit 1;" psa`;
+          if (($? >> 8) > 0) {     #Check the return code, and exit if the external call failed.
+               return ($? >> 8);
+          }
+          chomp($user);
+          if (length($user) == 0) {
+               print "It looks like your current directory is not a document root.\n";
+               print "Please run it from one of the following document root directories:\n";
+               my @output = `mysql -t -u'admin' -p'$mysqlpass' -e"select domains.name as Domain, hosting.www_root as 'Document Root' from domains inner join hosting on domains.id=hosting.dom_id;" psa`; #Look up the A record for NS1
+               foreach my $line (@output) { #Show the output from the failed command.
+                    print $line;
+               }
+          }
+          return $user;
+     }else { #If the password file doesn't exist, this must be a cPanel server.  Run the cPanel methods.
+          if ($dir !~ /\/home\d?\// || length($dir) < 8) {
+               #print "Please run from the user's home directory.\n";
+               return "";
+          }
+          $dir =~ s/\/home\d?\///;   #Remove the part of the dir before and after the username.
+          $dir =~ s/\/.*//;
+          return $dir;
+     }
+}
+
+# Read the root MySQL password on Plesk.
+# Input:  Nothing
+# Output: The MySQL password if all goes well
+#         "" if there was a problem.
+sub read_mysql_password {
+     my $mysqlpass;
+     eval {                                           #Read the mysql password.
+          open (my $INFILE, "/etc/psa/.psa.shadow");
+          $mysqlpass = <$INFILE>;                     #Sluuuuurp
+          close $INFILE;
+     } or do {
+          print "Error reading the MySQL password from /etc/psa/.psa.shadow\n";
+          return "";
+     };
+     chomp($mysqlpass);
+     return $mysqlpass;
+}
+
+#Determine whether of not a subdomain is a subdomain of the corresponding domain.
+# Input:  Subdomain
+#         Domain
+# Output: 0 = No
+#         1 = Yes
+sub issubdomain {
+     my $sub     = $_[0];
+     my $domain  = $_[1];
+     my $testsub = $sub;
+     if ($testsub =~ /\*/) { #If it contains a wildcard, consider it not a subdomain for our purposes.  mvdomain doesn't support wildcard subdomains.
+          return 0;
+     }
+     $testsub =~ s/$domain$//;
+     if ($testsub =~ /\.$/) {
+          return 1;
+     }else {
+          return 0;
+     }
+}
+
+# Check for dependencies.
+# Input:  $plesk global variable
+# Output: 1=Success, 0=Fail
+sub dependency_check {
+     #************** Check for xfermodules ****************
+     if (eval {require "/root/bin/xfermodules.pm";}) {  #Is xfermodules available?
+          require "/root/bin/xfermodules.pm";           #Yes, load it.
+          if ($xfermodules::VERSION lt "1.23") {
+               print "This server appears to have an outdated version of the transfers modules.\n";
+               print "Update with: ".YELLOW."yum update ESO-utils\n".RESET;
+               return 0;
+          }
+     }else{
+          if (! -s "/root/bin/xfermodules.pm") {
+               print "The transfers modules do not appear to be on this server.\n";
+               print "Install with: ".YELLOW."yum install ESO-utils\n".RESET;
+               return 0;
+          }else{
+               $|++;
+               print RED . "Error while trying to load xfermodules.pm\n".RESET;
+               delete $INC{'/root/bin/xfermodules.pm'};
+               require "/root/bin/xfermodules.pm";
+               return 0;
+          }
+     }
+     #************** Check for JSON ****************
+     if (!eval {require JSON;} && $plesk == 0) { #JSON is needed by the Userdata module within xfermodules.pm.
+          print "the JSON perl module does not appear to be on this server.\n";
+          print "Please install it or have a level 2 admin install it if this is a shared/reseller server.\n";
+          print "Install with: ".YELLOW."/scripts/perlinstaller JSON\n".RESET;
+          return 0;
+     }
+     return 1;
+}
+
+sub stale_tokens {
+        ###Remove stale tokens
+        my $token_list = `whmapi1 api_token_list --output=json`;
+        my $listjson = from_json($token_list);
+        my $current_time = time();
+	if ($currversion >= 11.68){
+		foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+                	if( $token_name =~ /hgtool_/ ){
+				my $token_time = $token_name;
+                        	$token_time =~ s/\D//g;
+                        	if ( ($token_time + 432000) < $current_time ){
+					print "Revoking token";
+                                	#Token is 5 days older than now, removing.
+                                	`whmapi1 api_token_revoke token_name=$token_name`;
+				}
+                        }
+                }
+        } else {
+		foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+			if( $token_data->{'name'} =~ /hgtool_/ ){
+				my $token_time = $token_data->{'name'};
+                                $token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+                                        #Token is 5 days older than now, removing.
+                                        `whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+				}
+                        }
+                }
+        }
+}

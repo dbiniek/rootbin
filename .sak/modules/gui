@@ -1,0 +1,644 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife - Main GUI Library
+#|
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash
+#- @subpackage GUI
+
+##################################################################
+##################################################################
+#
+# Widget Functions (Message boxes, Input boxes, etc.)
+#
+
+# This library cannot be used in CLI mode
+sak_cli_mode && return 0
+# Include all software gui libraries
+for MOD in "${SAK_MOD_DIR}"/soft/*/gui; do
+  . "${MOD}"
+done || return 1
+
+#+ Displays a message during an operation.
+#| @param string $title Message box title.
+#- @param string $message Message.
+sak_infobox() {
+  local title="$1" msg="$2"
+  shift; shift
+  "${SAK_DIALOG[@]}" \
+    --title "$title" \
+    --infobox "\n$msg" "$@"
+}
+
+#+ Display a message with a short pause.
+#| @param string $title Message box title.
+#- @param string $message Message.
+sak_waitbox() {
+  local wait="$1" title="$2"
+  shift; shift
+  "${SAK_DIALOG[@]}" \
+    --title "$title" \
+    --nocancel \
+    --pause "$*" \
+    10 45 "$wait"
+}
+
+#+ Displays a file/dir select box.
+#| Browsing begins from current durectory.
+#- @return bool True on success. False otherwise.
+sak_path_input() {
+  local RET status=0 dir="$PWD"
+
+  while :; do
+    RET=`"${SAK_DIALOG[@]}" \
+      --title "Select a Directory" \
+      --dselect "$dir" \
+      20 70`
+
+    case "$?" in
+      0) break ;;
+      127)
+        sak_sigwincheck && continue
+        sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+      255) sak_escaped ;;
+      *) return 1 ;;
+    esac
+  done
+
+  # If it's still not a directory (e.g. pipe, non-existant) bail out
+  if [[ ! -d "$RET" ]]; then
+    sak_waitbox 5 "Error" "Not a valid file or directory:\n\n  $RET"
+    return 1
+  fi
+
+  # Append the paths array with our new path
+  SAK_PATHS[${#SAK_PATHS[@]}]="$RET"
+  return 0
+}
+
+##################################################################
+##################################################################
+#
+# Menus
+#
+
+#+ Main ncurses menu loop.
+#- @return bool True signals script to show menu again. False will cause exit.
+sak_menu_main() {
+  local RET extra="" msize extramenu IFS=$'\t'
+
+  # Toggles the "Rescan" button
+  if [[ "x$SAK_TARGETS_MOD" == "x1" ]]; then
+    extra="--extra-button"
+  fi
+
+  if [[ "${#SAK_SOFTWARE[@]}" -gt "0" ]]; then
+    extramenu=$'L\tList Detected Software\tO\tMass Operations'
+    msize=7
+  else
+    extramenu=""
+    msize=5
+  fi
+  RET=`"${SAK_DIALOG[@]}" \
+    --extra-label "Rescan" \
+    $extra \
+    --cancel-label "Exit" \
+    --title "Main Menu" \
+    --menu "Press ESC on any menu to exit.\n\n\Z1NOTE\Zn: \ZuThis graphical version is deprecated and will be removed soon.\ZU\n\nPlease consider using \Z4sak-cli\Zn." \
+    0 45 $msize \
+    $extramenu \
+    T "Targets (Users, Dirs...)"`
+
+  case "$?" in
+    0) ;;
+    1) return 1 ;; # Cancel
+    3) sak_get_installations 1 # Rescan
+       return 0 ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  while :; do
+    case "$RET" in
+      L) sak_menu_list || break ;;
+      O) sak_menu_opts || break ;;
+      T) sak_menu_targets || break ;;
+      *) break ;;
+    esac
+  done
+
+  return 0
+}
+
+#+ List software found under targets.
+#| @uses sak_list_installations
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_list() {
+  local RET i=20 l m w=80 installs IFS=$'\n'
+
+  installs="$(sak_list_installations)"
+
+  # Find our max size
+  while read -r; do
+    let "l = ${#REPLY} + 20"
+    [[ "$l" -gt "$m" ]] &&
+      m="$l"
+  done <<< "$installs"
+
+  # Adjust for our screen size
+  if [[ "$COLUMNS" -gt "0" ]]; then
+    if [[ "$COLUMNS" -le "80" ]]; then
+      w="$COLUMNS"
+    else
+      if [[ "$COLUMNS" -lt "200" ]]; then
+        let "w = COLUMNS - 20"
+      else
+        let "w = COLUMNS - 40"
+      fi
+    fi
+  fi
+
+  # Reduce size to max line width if we have plenty of space
+  [[ "$w" -gt "$m" ]] && let "w = m"
+
+  if [[ "$LINES" -gt "0" ]]; then
+    if [[ "$LINES" -le "30" ]]; then
+      let "i = LINES - 8"
+    else
+      if [[ "$LINES" -lt "50" ]]; then
+        let "i = LINES - 10"
+      else
+        let "i = LINES - 12"
+      fi
+    fi
+  fi
+
+  [[ "$[ $i - 6 ]" -gt "${#SAK_SOFTWARE[@]}" ]] && i="${#SAK_SOFTWARE[@]}"
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --ok-label "Select" \
+    --extra-button \
+    --extra-label "Rescan" \
+    --cancel-label "Back" \
+    --title "Software List" \
+    --menu "Working Directory:\n$PWD" \
+    0 "$w" "$i" \
+    $installs`
+
+  case "$?" in
+    0) ;;
+    3) sak_get_installations 1 # Rescan
+       return 0 ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  sak_menu_install_opts "$[$RET-1]"
+
+  return 0
+}
+
+#+ Individual Operations.
+#| sak_menu_install_opts INDEX
+#| @param int $index    Software install index.
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_install_opts() {
+  local RET c i="$1" vuln soft path ver IFS=$'\t'
+
+  # Required because we need the index for some functions
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  # For specifically supported software, we display that software menu instead
+  # the return is so that the rest of this function is not executed
+  while :; do
+    case "$soft" in
+      wordpress) sak_menu_wp_opts "$i" || return ;;
+      joomla) sak_menu_jos_opts "$i" || return ;;
+      *) break ;;
+    esac
+  done
+
+  # For coloring
+  case "$vuln" in
+   -1) c="\Z8Unknown"    ;; # Unknown    = White
+    0) c="\Z2Secure"     ;; # Secure     = Green
+    1) c="\Z0\ZbOutdated";; # Outdated   = Black
+    2) c="\Z1Vulnerable" ;; # Vulnerable = Red
+  esac
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --cancel-label "Back" \
+    --title "Installation Operations" \
+    --menu "Software: $(sak_soft_name ${soft}) $ver\nStatus:   $c\Zn\nPath:     $path" \
+    0 0 0 \
+    B "Backups..." \
+    R "Replace Core Install Files" \
+    I "Show File Differences" \
+    O "Show Orphaned Files"`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  while :; do
+    case "$RET" in
+      B) sak_menu_backups "$i" "" || break ;;
+      R) sak_menu_core_replace "$i" || break ;;
+      I) sak_menu_core_diff "$i" || break ;;
+      O) sak_core_orphans "$i" 1 || break ;;
+      *) break ;;
+    esac
+  done
+
+  return 1
+}
+
+#+ Universal Backup Menu.
+#| sak_menu_backups INDEX DATABASE
+#| @param int $index    Software install index.
+#| @param string $db  Database name.
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_backups() {
+  local i="$i" db="$2" noexcludes=0 msg RET
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  while :; do
+    if [[ "$noexcludes" -eq "1" ]]; then
+      msg="\Z1OFF\Zn"
+    else
+      msg="\Z2ON\Zn"
+    fi
+
+    RET=`"${SAK_DIALOG[@]}" \
+      --extra-label "Excludes" \
+      --extra-button \
+      --cancel-label "Back" \
+      --title "Backup Operations" \
+      --menu "Large file exclusions: $msg" \
+      0 45 0 \
+      C "Backup Core Files..." \
+      A "Backup ALL Files..." \
+      D "Backup Database..."`
+
+    case "$?" in
+      0) ;;
+      3) let "noexcludes=( noexcludes + 1 ) % 2";
+         continue ;;
+      127)
+        sak_sigwincheck && return 0
+        sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+      255) sak_escaped ;;
+      *) return 1 ;;
+    esac
+
+    case "$RET" in
+      C) sak_core_backup "$i" ;;
+      A) sak_file_backup "$path" "" "" "$noexcludes" "*" ;;
+      D) sak_data_backup "$db" "$path" ;;
+      *) break ;;
+    esac
+  done
+
+  return 1
+}
+
+#+ Mass Operations
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_opts() {
+  local RET
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --cancel-label "Back" \
+    --title "Mass Installation Operations" \
+    --menu "" \
+    0 35 0 \
+    O "Software..."`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  while :; do
+    case "$RET" in
+      O) sak_menu_opts_soft || break ;;
+      *) break ;;
+    esac
+  done
+
+  return 0
+}
+
+#+ Mass Software Options
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_opts_soft() {
+  local RET
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --cancel-label "Back" \
+    --title "Mass Software Operations" \
+    --menu "" \
+    0 45 2 \
+    R "Replace Core Install Files" \
+    D "Show File Differences"`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  while :; do
+    case "$RET" in
+      R) sak_menu_core_replace || break ;;
+      D) sak_menu_core_diff    || break ;;
+      *) break ;;
+    esac
+  done
+
+  return 1
+}
+
+#+ Core file replacement.
+#| sak_menu_core_replace [INDEX]
+#| @uses sak_core_replace
+#| @param int $index    Software install index.
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_core_replace() {
+  local i="$1" vuln soft path ver
+
+  if [[ -z "$i" ]]; then
+    mesg="Are you sure you wish to replace the\
+    core files on ${#SAK_SOFTWARE[@]} install(s)?"
+  else
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+    printf -v mesg "Are you sure you wish to replace the core files at\n%s ?" "$path"
+  fi
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --title "Are You Sure? (TM)" \
+    --yesno "$mesg" \
+    8 45`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  if [[ -z "$@" ]]; then
+    for i in ${!SAK_SOFTWARE[@]}; do
+      sak_core_replace "$i" || return 1
+    done
+  else
+    sak_core_replace "$i" || return 1
+  fi
+
+  return 1
+}
+
+#+ Core file differences.
+#| sak_menu_core_diff [INDEX]
+#| @uses sak_core_diff
+#| @param int $index    Software install index.
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_core_diff() {
+  local i="$1"
+
+  if [[ -z "$@" ]]; then
+    for i in ${!SAK_SOFTWARE[@]}; do
+      sak_core_diff "$i"
+    done
+  else
+    sak_core_diff "$i"
+  fi
+
+  return 1
+}
+
+#+ Core orphans option menu.
+#| sak_menu_core_orphans INDEX
+#| @uses sak_core_orphans
+#| @param int $index    Software install index.
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_core_orphans() {
+  local i="$1" f ft opt RET IFS=$' \t\n'
+
+  [[ "${SAK_ORPHAN_OPTS[0]}" -eq "1" ]] && f="on" || f="off"
+  [[ "${SAK_ORPHAN_OPTS[1]}" -eq "1" ]] && ft="on" || ft="off"
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --cancel-label "Back" \
+    --title "Core Orphan Options" \
+    --checklist "Choose your options:" \
+    0 65 0 \
+    F "Filter typical files (e.g. .htaccess)" $f \
+    T "Filter top-level files" $ft`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  SAK_ORPHAN_OPTS=()
+  for opt in $RET; do
+    case "$opt" in
+      *F*) SAK_ORPHAN_OPTS[0]=1 ;;
+      *T*) SAK_ORPHAN_OPTS[1]=1 ;;
+    esac
+  done
+
+  sak_core_orphans "$i"
+  return 1
+}
+
+#+ Target editing.
+#| @uses sak_menu_targets_user
+#| @uses sak_menu_targets_path
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_targets() {
+  local RET
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --cancel-label "Back" \
+    --title "Targets Menu" \
+    --menu "" \
+    0 35 3 \
+    U "Users" \
+    D "Directories" \
+    R "Resellers"`
+
+  case "$?" in
+    0) ;;
+    1) return 1 ;;# Cancel
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  # Mad hacks
+  while :; do
+    case "$RET" in
+      U) sak_menu_targets_user || break ;;
+      D) sak_menu_targets_path || break ;;
+      R)
+        #sak_menu_targets_reseller || break
+        sak_wait_message 10 "Sorry!" "\nThis option is not currently functional.\nPlease use the --reseller switch instead."
+        break
+        ;;
+      *) break ;;
+    esac
+  done
+
+  return 0
+}
+
+#+ User target editing.
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_targets_user() {
+  local i=45 user users RET IFS=$' \t\n'
+
+  users="`sak_list_users`"
+
+  # Throw an error if we don't detect valid users
+  if [[ -z "$users" ]]; then
+    sak_waitbox 5 "Error" "No valid users found on this system (UID > 500)"
+    return 1
+  fi
+
+  if [[ "$LINES" -gt "0" ]]; then
+    if [[ "$LINES" -le "30" ]]; then
+      let "i = LINES - 12"
+    else
+      if [[ "$LINES" -lt "50" ]]; then
+        let "i = LINES - 14"
+      else
+        let "i = LINES - 16"
+      fi
+    fi
+  fi
+
+  if [[ "$[ $i - 12 ]" -gt "${#SAK_UIDS[@]}" ]]; then
+    let "i = ${#SAK_UIDS[@]} + 1"
+  fi
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --cancel-label "Back" \
+    --extra-button \
+    --extra-label "Sort" \
+    --title "User Selection" \
+    --checklist "UP/DN, PGUP/PGDN to scroll.\nSPACE to select.\nHOME/END for top/bottom." \
+    0 45 $i \
+    $users`
+
+  case "$?" in
+    0) ;;
+    3) # This is magic
+      let "SAK_USER_SORT = ( 2 - ${SAK_USER_SORT:-0} ) % 2 + 1";
+      return 0 ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  local -a users=() # Repurposing this variable
+  i=0
+  for user in $RET; do
+    user=${user//\"/}
+    users[((i++))]=${SAK_UIDS[$user]}
+  done
+  SAK_USERS=(${users[@]});
+  SAK_TARGETS_MOD=1
+
+  return 1
+}
+
+#+ Directory target editing.
+#- @return bool True to redisplay menu. False to finish/cancel.
+sak_menu_targets_path() {
+  local i path paths RET IFS=$' \t\n'
+
+  paths="$(sak_list_paths)"
+
+  if [[ -z "$paths" ]]; then
+    if "${SAK_DIALOG[@]}" \
+      --title "Notice" \
+      --yesno \
+      "There are currently no directory targets.\n\nWould you like to add one?" \
+      8 45; then
+      sak_path_input || return 1 # If cancel is selected
+      return 0
+    fi
+    return 1
+  else
+    i="${#SAK_PATHS[@]}"
+
+    if [[ "$i" -gt "20" ]]; then
+      i=20
+    fi
+
+    RET=`"${SAK_DIALOG[@]}" \
+      --extra-button \
+      --extra-label "Add" \
+      --cancel-label "Back" \
+      --ok-label "Done" \
+      --title "Directory Selection" \
+      --checklist "Press SPACE to check/uncheck Directories. Uncheck to Remove." \
+      0 45 $i \
+      $paths`
+  fi
+
+  case "$?" in
+    0) ;;
+    3) # Add
+      sak_path_input
+      return 0
+      ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  local -a paths=()
+  i=0
+  for path in $RET; do
+    let "path=${path//\"/} - 1"
+    paths[((i++))]="${SAK_PATHS[$path]}"
+  done
+  SAK_PATHS=("${paths[@]}");
+  SAK_TARGETS_MOD=1
+
+  return 1
+}

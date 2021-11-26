@@ -1,0 +1,803 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# cPDBs
+# Utility script to manipulate Databases via cPanel's API and Plesk's CLI.
+# https://stash.endurance.com/projects/HGADMIN/repos/cpdbs/browse
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+#
+# Rishwanth Y
+#
+# Version History:
+# 0.2 - added --importdb functionality
+# 0.3 - updated output checks on import.
+# Pushed to 1.0 - updated script's output checks, and updated for myimport module use.
+# 1.1 - updated code per Jordan M's review.
+# 1.2 - Updated to use cPanel's API module.
+# 1.3 - Added --dbinfo switch
+# 1.4 - added --dbimport
+# 1.5 - updated error output to show more info
+# 1.6 - fixed myimport dependency check to make sure that a myimport object can be constructed, etc
+# 1.7 - Added listdbusers, to get a full list of db users for a cpanel account.
+#
+
+use strict;
+use Getopt::Long qw (:config pass_through);
+use Term::ANSIColor;
+use Data::Dumper;
+use JSON;
+use Sys::Hostname;
+
+print "\n";
+#initialize stuff depending on what type of server we are on.
+
+my $isPlesk = 0;
+my $isCpanel = 0;
+my $ohnoes = 0;
+my $rootmysql;
+my $apic;
+my $sqlimport;
+
+my %userhash; #Hash array that maps the first 8 characters of usernames to full usernames.
+my $createdb;
+my @plcreatedb;
+my @importdb;
+my $deletedb;
+my @plcreatedbuser;
+my @createdbuser;
+my $deletedbuser;
+my @pldeletedbuser;
+my @adduser;
+my @deluser;
+my $listdbusers;
+my @dbinfo;
+my @dbimport;
+my $help;
+my $token_name;
+my $token;
+my $json;
+my $currversion;
+my $hostname = Sys::Hostname::hostname;
+
+GetOptions (
+	'createdb=s'          => \$createdb,
+	'plcreatedb=s{2}'     => \@plcreatedb,
+	'importdb=s{2}'       => \@importdb,
+	'deletedb=s'          => \$deletedb,
+	'createdbuser=s{2}'   => \@createdbuser,
+	'deletedbuser=s'      => \$deletedbuser,
+	'adduser=s{2}'        => \@adduser,
+	'deluser=s{2}'        => \@deluser,
+	'dbinfo=s{1,2}'       => \@dbinfo,
+	'listdbusers=s{1}'    => \$listdbusers,
+	'plcreatedbuser=s{3}' => \@plcreatedbuser,
+	'pldeletedbuser=s{2}' => \@pldeletedbuser,
+	'dbimport=s{3}'       => \@dbimport,
+	'help'                => \$help
+);
+
+if ( -s "/etc/psa/.psa.shadow" ){
+
+	open my $version_fh, '<', '/usr/local/psa/version';
+	my $version = do { local $/; <$version_fh> };
+	close $version_fh;
+	chomp $version;
+
+	open my $mysqlpass_fh, '<', '/etc/psa/.psa.shadow';
+	my $mysqlpass = do { local $/; <$mysqlpass_fh> };
+	close $mysqlpass_fh;
+	chomp $mysqlpass;
+
+	print "[*] Plesk server detected: ".color("green").$version.color("reset")."\n";
+	$isPlesk = 1;
+	$rootmysql = "mysql -uadmin -p\'$mysqlpass\'"; 
+
+} elsif ( -s "/usr/local/cpanel/cpanel"){
+
+	my $version = `/usr/local/cpanel/cpanel -V`;
+	chomp $version;
+	print "[*] cPanel server detected: ".color("green").$version.color("reset")."\n";
+	$rootmysql = "mysql -uroot";
+	$isCpanel = 1;
+	$currversion = +(split /\./,`cat /usr/local/cpanel/version`)[1];
+
+	if (eval {require cPanel::PublicAPI;} || $currversion >= 70 || $hostname =~ /\.((hostgator|websitewelcome)\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear|bluehost|justhost|accountservergroup|arvixe|webserversystems|asmallorange)\.com)$/) {
+		require cPanel::PublicAPI;
+		if ($currversion >= 64 && $cPanel::PublicAPI::VERSION < 2.2){
+			die "[!] cPanel::PublicAPI out of date, please ensure 2.2 or greater for API Token support";
+		} elsif ($currversion >= 64 ) { 
+			#Clean up the API Token before exit
+			END{
+				if($token_name){
+					`whmapi1 api_token_revoke token_name=$token_name`
+				}
+			}
+			#Remove stale tokens
+			stale_tokens();
+			{
+				my $revoked;
+				$SIG{INT} = sub { 
+					unless ($revoked) {
+						$revoked = 1;
+						fork or exec('whmapi1', 'api_token_revoke', "token_name=$token_name");
+					}
+					die "Interrupted"
+				};
+			}
+			#Generate the token
+			$token_name = "cpdb_".time();
+			$json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+			$token = from_json($json)->{'data'}{'token'};
+			$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0', api_token => $token );
+		} else {
+			if ( !-s "/root/.accesshash" ) {
+				$ENV{'REMOTE_USER'} = 'root';
+				system('/usr/local/cpanel/bin/realmkaccesshash');
+			}
+			$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+		}
+	} else {
+		print "[!] Failed to load the necessary modules for this script to function properly. Please install cPanel::PublicAPI via '/scripts/perlinstaller cPanel::PublicAPI'\n";
+		exit 1;
+	}
+
+} elsif (not $help) {
+	print "[!] Neither cPanel nor Plesk detected. I can not do anything on this server.\n";
+	exit 1;
+}
+
+my $hasmyimport = 0;	
+if (-e "/root/bin/myimport.pm"){
+	use lib '/root/bin'
+} else {
+	$hasmyimport = 0;
+}
+
+if (eval {require myimport;}) {
+	require myimport;
+	if ( myimport->can('new') ) {
+		$hasmyimport = 1;
+	} else {
+		$hasmyimport = 0;
+	}
+}
+
+#Signals
+$SIG{'INT'} = 'INT_Handler';
+
+if (@ARGV || $help) {
+	help();
+}
+
+sub help {
+
+	print "cPDBs version 1.8\n";
+	print "By Rish, please submit bugs at https://jira.endurance.com/\n\n";
+	print "Usage: cpdbs [options]:\n\n";
+	if ($isCpanel){
+		print "cPanel options:\n";
+		print "       --dbinfo <cPanel username> <database name>\n";
+		print "         This will print out database information as so:\n";
+		print "         Database '[Dbname]' - users that have access:\n"; 
+		print "                 [Dbusers assigned to db]\n";
+		print "         Note: if the database name is omitted, it will process all of the databases on the cPanel account.\n\n";
+		print "       --listdbusers <cPanel username>\n";
+		print "         This will print a list of all of the database users currently configured on the cPanel account.\n\n";
+		print "       --createdb <database name to be created>\n";
+		print "         NOTE: give it the full DB name, as in <cpanelusername>_<dbname>.\n";
+		print "         For now I have decided to not allow \"_\"s in the db name... cause that is not proper naming convention anyway!\n";
+		print "       --deletedb <database name to be removed>\n";
+		print "       --createdbuser <database username to be created> <password for the user>\n";
+		print "         NOTE: give it the full DB username, as in <cpanelusername>_<dbusername>.\n";
+		print "       --deletedbuser <database username to be removed>\n";
+		print "       --adduser <database username> <database name to add the user to>\n";
+		print "       --deluser <database username> <database name to remove the user from>\n\n";
+		print "       DBimport:\n";
+		print "       --dbimport <dbname> <dbpass> <sqlfile>\n";
+		print "         The following steps are taken when this switch is passed (the script moves forward, even if it fails on any single step:\n";
+		print "             Creates the database with the specified <dbname>.\n";
+		print "             Creates a dbuser with the same name as the database, and the specified password.\n";
+		print "             Assigns dbuser to the database.\n";
+		print "             Imports the sqlfile to the specified database.\n\n";
+	} elsif ($isPlesk) {
+		print "Plesk options:\n";
+		print "       --plcreatedb <database name to be created> <domain name under which this db needs to be setup>\n";
+		print "       --deletedb <database name to be removed>\n";
+		print "       --plcreatedbuser <database username> <password for the user> <database the user is supposed to be added to>\n";
+		print "       --pldeletedbuser <database username> <the database the user is currently assigned to>\n\n";
+	} else {
+		print "[!] Neither cPanel nor Plesk detected. This script will not function on this server. Please handle the tasks by other means.\n\n";
+		exit 1;
+	}
+
+	print "Import option:\n";
+        print "       --importdb <dbname> <sqlfile>\n";
+        print "         Imports the database file into the database name given (uses the myimport module).\n";
+
+	exit 1;
+}
+
+main();
+
+sub main {
+
+	if (scalar(@dbinfo) && $isCpanel) {
+		cpdbinfo(@dbinfo);
+	}
+	if ($listdbusers && $isCpanel) {
+		cplistusers($listdbusers);
+	}
+
+	if (scalar(@plcreatedb) == 2 && $isPlesk) {
+		plcreatedb(@plcreatedb);
+	}
+
+	if ($createdb && $isCpanel){
+		createdb($createdb);
+	}
+
+	if (scalar(@importdb) == 2){
+       		if ($hasmyimport){
+	               	importdb(@importdb);
+        	} else {
+	       	        print "[!] myimport module not loaded - The import options have been disabled.\n";
+        	}
+	}
+
+	if ($deletedb){
+		if ($isPlesk) {
+			pldeletedb($deletedb);
+		} else {
+			deletedb($deletedb);
+		}
+	}
+
+	if (scalar(@createdbuser) == 2 && $isCpanel){
+		createdbuser(@createdbuser);
+	}
+
+	if (scalar(@plcreatedbuser) == 3 && $isPlesk) {
+		plcreatedbuser(@plcreatedbuser);
+	}
+
+	if ($deletedbuser && $isCpanel){
+		deletedbuser($deletedbuser);
+	}
+
+	if (scalar(@pldeletedbuser) == 2 && $isPlesk){
+		pldeletedbuser(@pldeletedbuser);
+	}
+
+	if (scalar(@adduser) && $isCpanel){
+		adddbuser(@adduser);
+	}
+
+	if (scalar(@deluser) && $isCpanel){
+		deldbuser(@deluser);
+	}
+
+	if (scalar(@dbimport) == 3 and $isCpanel) {
+		createdb($dbimport[0]);
+		createdbuser($dbimport[0], $dbimport[1]);
+		adddbuser($dbimport[0], $dbimport[0]);
+		importdb($dbimport[0], $dbimport[2]);
+	}
+
+	if (!$createdb && !$listdbusers && !scalar(@dbinfo) && !scalar(@importdb) && !$deletedb && !scalar(@createdbuser) && !$deletedbuser && !scalar(@adduser) && !scalar(@deluser) && !scalar(@plcreatedb) 
+            && !scalar(@plcreatedbuser) && !scalar(@pldeletedbuser) && !scalar(@dbimport) && $#ARGV == -1) {
+		help();
+	}
+}
+
+sub createdb {
+
+	my $database = shift; # Database name as it was passed from the admin.
+	# $cpuser is the cPanel username as it was passed from the admin.
+	# $dbname is the database name without the prefix.
+	my ($cpuser, $dbname) = split(/_/, $database);
+	my $longcpuser;  # The full cPanel username regardless of whether it is > 8 characters or not.
+	my $shortcpuser; # The cpanel username truncated to 8 characters if necessary.
+	if (length($cpuser)>8) {
+		$longcpuser  = $cpuser;
+		$shortcpuser = substr($cpuser,0,8);
+		print color("yellow")."[!] Truncating the username.  The database name will be ";
+                print color("cyan")."$shortcpuser\_$dbname".color("yellow")." (not $longcpuser\_$dbname).\n".color("reset");
+	}else{
+		$longcpuser  = lookup_long_username($cpuser);
+		$shortcpuser = $cpuser;
+	}
+
+	if (isValidDB("$longcpuser\_$dbname")) {
+		if (!dbexists("$shortcpuser\_$dbname")) {
+			my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'MysqlFE', 'func' => 'createdb', 'user' => $longcpuser}, { 'db' => "$shortcpuser\_$dbname"}, 'json');
+			my $output = from_json($response);
+
+			if ($output->{'cpanelresult'}{'error'}){
+				print "[!] Database: '$shortcpuser\_$dbname' creation failed.\n";
+				print "$output->{'cpanelresult'}{'error'}\n"
+			} elsif (dbexists("$shortcpuser\_$dbname")) {
+				print "[+] Database: '$shortcpuser\_$dbname' was successfully created according to cPanel.\n";
+			} else {
+				print "[!] cPanel said the database was created, but it is not created per MySQL... This might just be a parsing issue, please check manually.\n";
+			}
+		} else {
+			print "[!] Database: '$shortcpuser\_$dbname' already exists on the server.\n";
+		}
+	}
+}
+
+sub cplistusers {
+
+	my $cpuser = shift;
+	if (not -e "/var/cpanel/users/$cpuser") {
+		print "[!] '$cpuser' is not a valid cPanel username.\n";
+		return 0;
+	}
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'MysqlFE', 'func' => 'listusers', 'user' => $cpuser, }, { }, 'json');
+	my $output   = from_json($response);
+
+	print "Database users under cPanel user '$cpuser':\n";
+	if (ref($output->{'cpanelresult'}{'data'}) eq 'ARRAY') {
+		foreach my $db (@{$output->{'cpanelresult'}{'data'}}) {
+			print "\t$db->{'user'}\n";
+		}
+	} else {
+		my $db = $output->{'cpanelresult'}{'data'};
+		print "\t$db->{'user'}\n";
+	}
+}
+
+sub cpdbinfo {
+
+	my $cpuser = shift;
+	my $dbname = shift;
+
+        # Make sure dbname has the short prefix and not the long prefix.
+        my $_dbname = $dbname;
+        $_dbname =~ s/.*_//; # Remove the prefix from the db name if there is one.
+        if (length($cpuser)>8) {
+                $dbname = substr($cpuser,0,8) . "\_$_dbname";
+        }else{
+                $dbname = "$cpuser\_$_dbname";
+        }
+
+	if (not -e "/var/cpanel/users/$cpuser") {
+		print "[!] '$cpuser' is not a valid cPanel username.\n";
+		return 0;
+	}
+	if (!dbexists($dbname)){
+		print "[!] Database '$dbname' does not exist.\n";
+		return 0;
+	}
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'MysqlFE', 'func' => 'listdbs', 'user' => $cpuser, }, { 'regex' => $dbname }, 'json');
+	my $output   = from_json($response);
+
+	if (ref($output->{'cpanelresult'}{'data'}) eq 'ARRAY') {
+		foreach my $db (@{$output->{'cpanelresult'}{'data'}}) {
+			print "\nDatabase: '$db->{'db'}'. Size: $db->{'sizemeg'} MB. Users that have access:\n";
+			if (ref($db->{'userlist'}) eq 'ARRAY') {
+				foreach my $dbuser (@{$db->{'userlist'}}) {
+					print "\t$dbuser->{'user'}\n";
+				}
+			} else {
+				print "\t$db->{'userlist'}->{'user'}\n";
+			}
+		}
+	} else {
+		my $db = $output->{'cpanelresult'}{'data'};
+		print "\nDatabase: '$db->{'db'}'. Size: $db->{'sizemeg'} MB. Users that have access:\n";
+		if (ref($db->{'userlist'}) eq 'ARRAY') {
+			foreach my $dbuser (@{$db->{'userlist'}}) {
+				print "\t$dbuser->{'user'}\n";
+			}
+		} else {
+			print "\t$db->{'userlist'}->{'user'}\n";
+		}
+	}
+}
+
+sub plcreatedb {
+
+	my ($dbname, $domain) = @_;
+	my $output = `/usr/local/psa/bin/database --create \'$dbname\' -domain \'$domain\' -type mysql 2>&1`;
+	chomp $output;
+
+	if (!$output) {
+		print "[+] Database successfully created: '$dbname' - under Domain: '$domain'\n";
+		return 1;
+	} else {
+		print "[!] Failed to created database, '$dbname'. Errors from Plesk:\n";
+		print "$output\n";
+		return 0;
+	}
+}
+
+sub pldeletedb {
+
+	my $dbname = shift;
+	my $output = `/usr/local/psa/bin/database --remove \'$dbname\' 2>&1`;
+	chomp $output;
+
+	if (!$output) {
+		print "[+] Database successfully removed: '$dbname'\n";
+		return 1;
+	} else {
+		print "[!] Database removal failed: '$dbname'. Errors from Plesk:\n";
+		print "$output\n";
+		return 0;
+	}
+}
+
+sub plcreatedbuser {
+
+	my ($dbuser, $pass, $dbname) = @_;
+	my $output = `/usr/local/psa/bin/database --update \'$dbname\' -add_user \'$dbuser\' -passwd \'$pass\' -passwd_type plain 2>&1`;
+	chomp $output;
+
+	if (!$output) {
+		print "[+] Database user: '$dbuser' created successfully with password: '$pass', under the database: '$dbname'\n";
+		return 1;
+	} else {
+		print "[!] Failed to create and add database user: $dbuser. Errors from Plesk:\n";
+		print "$output\n";
+		return 0;
+	}
+}
+
+sub pldeletedbuser {
+
+	my ($dbuser, $dbname) = @_;
+	my $output = `/usr/local/psa/bin/database --update \'$dbname\' -remove_user \'$dbuser\' 2>&1`;
+	chomp $output;
+
+	if (!$output) {
+		print "[+] Database user: '$dbuser' successfully removed from database: '$dbname'\n";
+		return 1;
+	} else {
+		print "[!] Failed to remove databased user '$dbuser'. Errors from Plesk:\n";
+		print "$output\n";
+		return 0;
+	}
+}
+
+sub importdb {
+
+	my $database = shift;
+	my $dbfile = shift;
+
+	# $database is the database with the prefix as it was passed from the admin.
+	# $cpuser is the cPanel username as it was passed from the admin.
+	# $dbname is the database name without the prefix.
+	my ($cpuser, $dbname) = split(/_/, $database);
+	my $longcpuser;  # The full cPanel username regardless of whether it is > 8 characters or not.
+	my $shortcpuser; # The cpanel username truncated to 8 characters if necessary.
+	if (length($cpuser)>8) {
+		$longcpuser  = $cpuser;
+		$shortcpuser = substr($cpuser,0,8);
+		print color("yellow")."[!] Truncating the username.  The database name will be ";
+                print color("cyan")."$shortcpuser\_$dbname".color("yellow")." (not $longcpuser\_$dbname).\n".color("reset");
+	}else{
+		$longcpuser  = lookup_long_username($cpuser);
+		$shortcpuser = $cpuser;
+	}
+	
+	if (-s $dbfile && ! -d $dbfile){
+		if (isValidDB("$longcpuser\_$dbname") && dbexists("$shortcpuser\_$dbname")){
+			print "[*] Attempting to import $dbfile to $shortcpuser\_$dbname...\n";
+			$sqlimport = myimport->new("$shortcpuser\_$dbname", $dbfile, 0, 0);
+			$sqlimport->check_and_import();
+		} else {
+			print "[!] '$shortcpuser\_$dbname' is not a database I can work with.\n";
+			return 0;
+		}
+	} else {
+		print "[!] '$dbfile' does not exist or is 0byte. Import not happening.\n";
+	}
+}
+
+sub INT_Handler {
+
+	if (defined $sqlimport) {
+		$sqlimport->interrupt();
+	}
+	exit(1);
+}
+
+sub userexists {
+
+	my $dbuser = shift;
+	my $check = `$rootmysql -ss -e"SELECT user FROM mysql.user WHERE user=\'$dbuser\';"`;
+
+	if ($check){
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub isValidDB{
+
+	my $database = shift;
+	my ($cpuser, $dbname) = split(/_/, $database);
+
+	if ($isCpanel) { 	
+		if ( !-e "/var/cpanel/users/$cpuser" ) {
+			print "[!] '$cpuser' cPanel user does not exist.\n";
+			return 0;
+		}
+	}
+
+	if (!baddbs($database) && ($database =~ m{[\x00\r\n.\/]})) {
+		print "[!] '$database' is not a valid name for a database.\n";
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+sub dbexists {
+
+	my $dbname = shift;
+
+	my $test = `$rootmysql -ss -e"show databases like '$dbname';"`;
+	if ($test eq "") {
+		return 0;
+	}
+
+	return 1;
+}
+
+sub baddbs {
+	#makes sure that the name given is not a database that is important to the server.
+	my $u = $_[0];
+	my @badnames = qw / mysql roundcube horde information_schema cphulkd eximstats modsec leechprotect /;
+	return exists {map { $_ => 1 } @badnames}->{$u};
+}
+
+sub deletedb {
+
+        my $database = shift; # Database name as it was passed from the admin.
+        # $cpuser is the cPanel username as it was passed from the admin.
+        # $dbname is the database name without the prefix.
+        my $dbname;
+        my ($cpuser, @dbname) = split(/_/, $database);
+        if ( scalar(@dbname) > 1 ) {
+            my $count = 0;
+            foreach my $part ( @dbname ) {
+                if ( $count == 0 ) {
+                    $dbname .= $part;
+                } else {
+                    $dbname .= "_$part";
+                }
+                $count++;
+            }  
+        } else {
+            $dbname = $dbname[0];
+        }
+        my $longcpuser;  # The full cPanel username regardless of whether it is > 8 characters or not.
+        my $shortcpuser; # The cpanel username truncated to 8 characters if necessary.
+        if (length($cpuser)>8) {
+                $longcpuser  = $cpuser;
+                $shortcpuser = substr($cpuser,0,8);
+                print color("yellow")."[!] Truncating the username.  The database name will be ";
+                print color("cyan")."$shortcpuser\_$dbname".color("yellow")." (not $longcpuser\_$dbname).\n".color("reset");
+        }else{
+                $longcpuser  = lookup_long_username($cpuser);
+                $shortcpuser = $cpuser;
+        }
+	if (isValidDB("$longcpuser\_$dbname")) {
+		if (dbexists("$shortcpuser\_$dbname")) {
+			my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'MysqlFE', 'func' => 'deletedb', 'user' => $longcpuser}, { 'db' => "$shortcpuser\_$dbname" }, 'json');
+			my $output = from_json($response);
+
+			if ($output->{'cpanelresult'}{error}) {
+				print "[!] Database: '$shortcpuser\_$dbname' deletion failed:\n";
+				print "$output->{'cpanelresult'}{'data'}[0]{'result'}\n";
+			} else {
+				print "[+] Database: '$shortcpuser\_$dbname' deleted successfully.\n";
+			}
+		} else {
+			print "[!] Database: '$shortcpuser\_$dbname' does not exist on the server. Nothing to delete.\n";
+		}
+	}
+}
+
+sub createdbuser {
+
+        # $cpuser is the cPanel username as it was passed from the admin.
+        # $dbuser is the database username without the prefix.
+        my ($cpuser, $dbuser) = split(/_/, $_[0]);
+	my $dbpass = $_[1];
+        my $longcpuser;  # The full cPanel username regardless of whether it is > 8 characters or not.
+        my $shortcpuser; # The cpanel username truncated to 8 characters if necessary.
+        if (length($cpuser)>8) {
+                $longcpuser  = $cpuser;
+                $shortcpuser = substr($cpuser,0,8);
+                print color("yellow")."[!] Truncating the username.  The database username will be ";
+                print color("cyan")."$shortcpuser\_$dbuser".color("yellow")." (not $longcpuser\_$dbuser).\n".color("reset");
+        }else{
+                $longcpuser  = lookup_long_username($cpuser);
+                $shortcpuser = $cpuser;
+        }
+
+	if (userexists("$shortcpuser\_$dbuser")){
+		print "[!] '$shortcpuser\_$dbuser' already exists on the server. Please try a different username.\n";
+		return 0;
+	}
+
+	if (length("$shortcpuser\_$dbuser") > 16){
+		print "[!] '$shortcpuser\_$dbuser' is longer than 16 characters. Please shorten this.\n";
+		return 0;
+	}
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'MysqlFE', 'func' => 'createdbuser', 'user' => $longcpuser}, { 'dbuser' => "$shortcpuser\_$dbuser", 'password' => $dbpass }, 'json');
+	my $output = from_json($response);
+	if ($output->{'cpanelresult'}{error}) {
+		print "[!] $output->{'cpanelresult'}{error}\n";
+	} else {
+		print "[+] Database user: '$shortcpuser\_$dbuser' created successfully with the password: '$dbpass'\n";
+	}
+}
+
+sub deletedbuser {
+
+	my ($cpuser, $dbuser) = split(/_/, $_[0]);
+	#$dbuser is the database username without the prefix as it was passed from the admin.
+	#$cpuser is the cPanel username as it was passed from the admin.
+        my $longcpuser;  # The full cPanel username regardless of whether it is > 8 characters or not.
+        my $shortcpuser; # The cpanel username truncated to 8 characters if necessary.
+        if (length($cpuser)>8) {
+                $longcpuser  = $cpuser;
+                $shortcpuser = substr($cpuser,0,8);
+                print color("yellow")."[!] Truncating the username.  The database username will be ";
+                print color("cyan")."$shortcpuser\_$dbuser".color("yellow")." (not $longcpuser\_$dbuser).\n".color("reset");
+        }else{
+                $longcpuser  = lookup_long_username($cpuser);
+                $shortcpuser = $cpuser;
+        }
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'MysqlFE', 'func' => 'deletedbuser', 'user' => $longcpuser}, { 'dbuser' => "$shortcpuser\_$dbuser" }, 'json');
+
+	my $output = from_json($response);
+	if ($output->{'cpanelresult'}{error}) {
+		print "[!] $output->{'cpanelresult'}{error}\n";
+		return 0;
+	} else {
+		print "[+] Database user: '$shortcpuser\_$dbuser' deleted successfully.\n";
+	}
+}
+
+sub adddbuser {
+
+	my ($cpuser, $dbuser) = split(/_/, $_[0]);
+	my $database = $_[1];
+	$database =~ s/.*_//;
+	#$dbuser is the database username without the prefix as it was passed from the admin.
+	#$cpuser is the cPanel username as it was passed from the admin.
+        my $longcpuser;  # The full cPanel username regardless of whether it is > 8 characters or not.
+        my $shortcpuser; # The cpanel username truncated to 8 characters if necessary.
+        if (length($cpuser)>8) {
+                $longcpuser  = $cpuser;
+                $shortcpuser = substr($cpuser,0,8);
+                print color("yellow")."[!] Truncating the username.  The database username will be ";
+                print color("cyan")."$shortcpuser\_$dbuser".color("yellow")." (not $longcpuser\_$dbuser).\n".color("reset");
+        }else{
+                $longcpuser  = lookup_long_username($cpuser);
+                $shortcpuser = $cpuser;
+        }
+
+	if (!userexists("$shortcpuser\_$dbuser")){
+		print "[!] Provided username: '$shortcpuser\_$dbuser' does not exist on the server.\n";
+		return 0;
+	}
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'MysqlFE', 'func' => 'setdbuserprivileges', 'user' => $longcpuser}, { 'db' => $database, 'dbuser' => "$shortcpuser\_$dbuser", 'privileges' => 'ALL' }, 'json');
+	my $output = from_json($response);
+	if ($output->{'cpanelresult'}{'error'}){
+		print "[!] Database user: '$shortcpuser\_$dbuser' was not added to '$shortcpuser\_$database':\n";
+		print "$output->{'cpanelresult'}{'error'}\n";
+	} else {
+		print "[+] Database user: '$shortcpuser\_$dbuser' was added to '$shortcpuser\_$database' successfully.\n";
+	}
+}
+
+sub deldbuser {
+
+	my ($cpuser, $dbuser) = split(/_/, $_[0]);
+	my $database = $_[1];
+	$database =~ s/.*_//;
+	#$dbuser is the database username without the prefix as it was passed from the admin.
+	#$cpuser is the cPanel username as it was passed from the admin.
+        my $longcpuser;  # The full cPanel username regardless of whether it is > 8 characters or not.
+        my $shortcpuser; # The cpanel username truncated to 8 characters if necessary.
+        if (length($cpuser)>8) {
+                $longcpuser  = $cpuser;
+                $shortcpuser = substr($cpuser,0,8);
+                print color("yellow")."[!] Truncating the username.  The database username will be ";
+                print color("cyan")."$shortcpuser\_$dbuser".color("yellow")." (not $longcpuser\_$dbuser).\n".color("reset");
+        }else{
+                $longcpuser  = lookup_long_username($cpuser);
+                $shortcpuser = $cpuser;
+        }
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'MysqlFE', 'func' => 'revokedbuserprivileges', 'user' => $longcpuser}, { 'db' => $database, 'dbuser' => "$shortcpuser\_$dbuser" }, 'json');
+	my $output = from_json($response);
+	if ($output->{'cpanelresult'}{'error'}){
+		print "[!] Database user: '$shortcpuser\_$dbuser' was not removed from '$shortcpuser\_$database':\n";
+		print $output->{'cpanelresult'}{'error'}."\n";
+	} else {
+		print "[+] Database user: '$shortcpuser\_$dbuser' was removed from '$shortcpuser\_$database' successfully.\n";
+	}
+}
+
+# Look up the long username.
+# This can be used to either check for a username confilict of find out the
+# long username from the short username.
+# Input:  Username (normally short version but can be long version)
+# Output: Long username if user exists.
+#         undef = No conflicting user exists.
+sub lookup_long_username {
+     my $user = shift;
+     if (!keys %userhash) {
+          populate_userhash();
+     }
+     my $chopped; #Username chopped down to 8 characters max.
+     if (length($user)>8) {
+          $chopped = substr($user,0,8);
+     }else{
+          $chopped = $user;
+     }
+     return $userhash{$chopped};
+}
+
+# Populate a hash of usernames.  Only the first 8 characters are used
+#  because that is what determines username conflicts when database prefixing is on.
+# Input:  Nothing (except /var/cpanel/users)
+# Output: Global variable %userhash is populated.
+sub populate_userhash {
+     my $dh;
+     if (!opendir($dh, "/var/cpanel/users")) {
+          print "Error listing users while checking for a conflicting user.\n";
+          return;
+     }
+     while (my $user = readdir($dh)) {
+          my $chopped = $user;
+          if (length($chopped)>8) {
+               $chopped = substr($user,0,8);
+          }
+          $userhash{$chopped} = $user;
+     }
+     closedir $dh;
+}
+
+sub stale_tokens {
+        my $token_list = `whmapi1 api_token_list --output=json`;
+        my $listjson = from_json($token_list);
+        my $current_time = time(); 
+        if ($currversion >= 11.68){ 
+                foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+                        if( $token_name =~ /cpdb_/ ){
+                                my $token_time = $token_name;
+                                $token_time =~ s/\D//g;
+                                if ( ($token_time + 432000) < $current_time ){
+                                        #Token is 5 days older than now, removing.
+                                        `whmapi1 api_token_revoke token_name=$token_name`;
+                                }
+                        }
+                }
+        } else {
+                foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+                        if( $token_data->{'name'} =~ /cpdb_/ ){
+                                my $token_time = $token_data->{'name'};
+                                $token_time =~ s/\D//g;
+                                if ( ($token_time + 432000) < $current_time ){
+                                        #Token is 5 days older than now, removing.
+                                        `whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+                                }
+                        }
+                }
+        }
+}

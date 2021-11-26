@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# lip: eechter: Searches logs on cPanel server for last IP to login for a user.  Will search logs for last X number of entries specified by user.
+#
+# v0.1: 05/2011: eechter: Initial release searches cPanel, FTP, and SSH logs.
+# v0.2: 01/2013: eechter: Added archived log searches, checks for cPanel tokens since log entries are different, and changed method to getopts for user input.
+
+# INITIALIZE VARIABLES
+USER=
+NUM_LAST=1
+OPTERR=0
+
+# DEFINE COLORS
+RED='\e[1;31m'
+BLUE='\e[1;34m'
+CYAN='\e[1;36m'
+YELLOW='\e[1;33m'
+NC='\e[0m'
+
+# DEFINE LOGS
+LOG_CPANEL="/usr/local/cpanel/logs/access_log"
+LOG_CPANEL_ARCHIVES=( $LOG_CPANEL $(\ls -t /usr/local/cpanel/logs/archive/access_log-[0-9]*-[0-9]*.gz 2>/dev/null) )
+LOG_FTP="/var/log/messages"
+LOG_FTP_BLUEHOST="/var/log/ftp.log"
+LOG_FTP_ARCHIVES=( $LOG_FTP $LOG_FTP_BLUEHOST $(\ls -t /var/log/messages{.,-}* 2>/dev/null) )
+LOG_SSH="/var/log/messages"
+LOG_SSH_BLUEHOST="/var/log/secure"
+LOG_SSH_ARCHIVES=( $LOG_SSH $LOG_SSH_BLUEHOST $(\ls -t /var/log/messages{.,-}* 2>/dev/null) )
+
+# DEFINE ARRAYS
+PROTO=( cPanel FTP SSH )
+ENTRIES=()
+
+usage () {
+
+   cat << EOF
+
+   Usage: lip -u <username> [-hla]
+
+   OPTIONS:
+     -h    Show this message
+     -u    Username
+     -l    Number of last entries to return if available
+     -a    Search archived logs
+
+EOF
+}
+
+search_log () {
+   PROTO=$1
+   LOG=$2
+   ARCHIVE=$3
+   GREP="grep"
+   CAT="cat"
+
+   if [[ "$ARCHIVE" -eq "1" ]]; then
+      if [[ "$LOG" == *.gz* ]]; then
+         GREP="zgrep"
+         CAT="zcat"
+     fi
+   fi
+
+   if [ "$PROTO" == "cPanel" ]; then
+      TOKENS=$(awk -F"=" /xsrftokens/'{print $2}' /var/cpanel/cpanel.config)
+      if [[ "$TOKENS" -eq "1" ]]; then
+         #EXAMPLE OUTPUT "12/26/2010:02:14:30 216.110.94.228"
+         PROTO_LAST_ENTRY=$($GREP -o -E ".*- $USER .*cpsess[0-9]{10}/frontend/.*/index.html .*200 0.{0}" $LOG 2>/dev/null | sort | uniq -f 6 | awk -F"[ ,[]" '{print $5, $1}' | tail -$NUM_LAST | tac)
+      else
+         PROTO_LAST_ENTRY=$($GREP " $USER " $LOG 2>/dev/null | grep "\"\"" | grep 200 | awk -F"[ ,[]" '{print $5, $1}' | uniq -w16 | tail -$NUM_LAST | tac)
+      fi
+      SINCE_DATE=$($CAT $LOG 2>/dev/null | head -1 | awk -F"[ ,[,:]" '{print $5,$6":"$7":"$8}' | xargs -0 -I {} date -d "{}" "+%b %d %T")
+   elif [ "$PROTO" == "FTP" ]; then
+      #EXAMPLE OUTPUT "May 25 20:11:40 (?@216.110.94.228)"
+      PROTO_LAST_ENTRY=$($GREP "$USER is now logged in" $LOG 2>/dev/null | awk '{print $1"/"$2"/"$3 " " $6}' | uniq | tail -$NUM_LAST | tac)
+      SINCE_DATE=$($CAT $LOG 2>/dev/null | head -1 | awk '{print $1, $2, $3}')
+   elif [ "$PROTO" == "SSH" ]; then
+      #EXAMPLE OUTPUT "May 26 09:35:52 216.110.94.228"
+      PROTO_LAST_ENTRY=$($GREP -E "Accepted (password|publickey) for $USER" $LOG 2>/dev/null | awk '{print $1"/"$2"/"$3 " " $11}' | uniq | tail -$NUM_LAST | tac)
+      SINCE_DATE=$($CAT $LOG 2>/dev/null | head -1 | awk '{print $1, $2, $3}')
+   fi
+}
+
+get_date_ip () {
+   if [[ "$DATE" != "" && "$1" == "cPanel" ]]; then
+      DATE=$(echo $DATE | awk -F: '{print $1,$2":"$3":"$4}' | xargs -0 -I {} date -d "{}" "+%b %d %T")
+   elif [[ "$1" == "FTP" || "$1" == "SSH" ]]; then
+      DATE=$(echo $DATE | awk -F/ '{print $1,$2,$3}')
+      if [ "$1" == "FTP" ]; then
+         IP=$(echo "$IP" | awk -F"[),@]" '{print $2}')
+      fi
+   fi
+}
+
+# GET USER OPTIONS
+while getopts "hu:l:a:q" OPTION; do
+   case $OPTION in
+      h)
+         usage
+         exit 1
+         ;;
+      u)
+         USER=$OPTARG
+         ;;
+      l)
+         NUM_LAST=$OPTARG
+         ;;
+      a)
+         ARCHIVE=1
+         ;;
+      q)
+         quiet=1
+         ;;
+   esac
+done
+
+# inputs aren't read correctly so you can't get it to run archive at all as far as I can tell. Hard turning archive on - jlavoy 10/18/16
+ARCHIVE=1
+
+if [[ -z "$USER" || -z "$(getent passwd $USER)" ]]; then
+   if [[ $quiet -eq 1 ]]; then
+      exit 1;
+   else
+      echo -e "\nYou must specify a valid user with the "-u" flag"
+      usage
+   fi
+elif [[ "$NUM_LAST" != "1" && ! "$NUM_LAST" =~ ^[0-9]+$ ]] ; then
+   echo -e "\nYou must specify an integer with the "-l" flag"
+   usage
+else
+   echo -ne "\nUser: ${RED}$USER${NC}\n"
+   for PROTO in "${PROTO[@]}"; do
+      if [[ "$ARCHIVE" -eq "0" ]]; then
+         eval LOG=\$$(echo LOG_${PROTO} | tr '[:lower:]' '[:upper:]')
+         search_log $PROTO $LOG $ARCHIVE
+         ENTRIES+=( "$PROTO_LAST_ENTRY" )
+      else
+         eval LOG_UPPER=\( \${$(echo LOG_${PROTO}_ARCHIVES | tr '[:lower:]' '[:upper:]')[@]} \)
+         for LOG in "${LOG_UPPER[@]}"; do
+            if [[ "${#ENTRIES[@]}" -lt "$NUM_LAST" ]]; then
+               search_log $PROTO $LOG $ARCHIVE
+               if [[ -n $PROTO_LAST_ENTRY ]]; then
+                  ENTRIES+=( "$PROTO_LAST_ENTRY" )
+               fi
+            else
+               break
+            fi
+         done
+      fi
+      echo -ne "\nLast $NUM_LAST login(s) to $PROTO since $SINCE_DATE\n"
+      if [[ -z "${ENTRIES[@]}" && "$ARCHIVE" -eq "1" ]]; then
+         echo -ne "No $PROTO entries found\n"
+      fi
+      ENTRY_COUNT=1
+      for ENTRY in "${ENTRIES[@]}"; do
+         while read DATE IP; do
+            get_date_ip $PROTO
+            if [ -z "$IP" ]; then
+               echo -ne "No $PROTO entries found\n"
+            elif [[ "$ENTRY_COUNT" -le "$NUM_LAST" ]]; then
+               echo -ne "${CYAN}$IP${NC} on ${YELLOW}$DATE${NC}\n"
+            fi
+         ((ENTRY_COUNT++))
+         done <<< "$ENTRY"
+      done
+      ENTRIES=()
+   done
+   echo -ne "\n"
+fi

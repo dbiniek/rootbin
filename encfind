@@ -1,0 +1,511 @@
+#!/usr/bin/perl
+#################################################################
+# encfind.pl - Michael Karr
+# Small utility to find possible malicious shells/injections.
+#
+# Git: http://git.toolbox.hostgator.com/encfind
+# Wiki: https://gatorwiki.hostgator.com/Security/EncFind
+# 
+# Please submit all bug reports at http://bugs.hostgator.com
+#
+# (c) 2012 - HostGator.com, LLC.
+#################################################################
+
+{ # start main package
+package main;
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Cwd;
+
+$| = 1; #turn on autoflush of stdout
+
+my %args = (
+    json => 0,
+    progress => 1,
+    display => 1,
+    modified_after => 0,
+    directory => cwd(),
+    filter => '\.security',
+);
+
+GetOptions (
+    'json' => \$args{json},
+    'progress=s' => \$args{progress},
+    'display=s' => \$args{display},
+    'modified-after=s' => \$args{modified_after},
+    'directory=s' => \$args{directory},
+    'filter=s' => \$args{filter},
+);
+
+if (!$args{json}) {
+    print "encfind.pl - Michael Karr\n\n";
+} else {
+    $args{progress} = 0;
+    $args{display} = 0;
+}
+
+if (!-t STDOUT) {
+    $args{progress} = 0;
+}
+
+my $encf = EncFind::Finder->new(
+    directory => $args{directory},
+    progress => $args{progress},
+    display => $args{display},
+    modified_after => $args{modified_after},
+    filter => $args{filter},
+);
+
+my $encr = $encf->search();
+
+if ($args{json}) {
+    $encr->json();
+}
+
+exit 0;
+} # end main package
+
+
+BEGIN { # start class EncFind::Finder
+package EncFind::Finder;
+
+use strict;
+use warnings;
+
+use Carp;
+
+use File::Find;
+use File::Slurp;
+use File::stat;
+
+use MIME::Base64;
+use Compress::Zlib;
+
+use Term::ReadKey;
+use Term::ANSIColor;
+
+sub new {
+    my($class, %params) = @_;
+    
+    for my $i (qw(directory progress display modified_after filter)) {
+        if (!exists($params{$i})) {
+            croak "Attribute '$i' not passed to constructor.";
+        }
+            
+        if (!defined($params{$i})) {
+            croak "Attribute '$i' not defined.";
+        }
+    }
+    
+    my $self = {
+        directory => $params{directory},
+        progress => $params{progress},
+        display => $params{display},
+        modified_after => $params{modified_after},
+        filter => $params{filter},
+    };
+    
+    bless($self, $class);
+    return $self;
+}
+
+sub search {
+    my $self = shift;
+    
+    if ($self->{display}) {
+        print "Current working directory: $self->{directory}\n\n";
+    }
+    
+    my $matches = EncFind::MatchList->new();
+    
+    find({
+        no_chdir => 1,
+        wanted => sub {
+            if (!($File::Find::name =~ /$self->{filter}/)) {
+                if ($File::Find::name =~ /^.*?\.(php[0-9]?|inc|[a-z]?html?|tm?pl|dat)$/s) { # if it matches the file extensions we want
+                    if (my $fs = stat($File::Find::name)) {
+                        if ($fs->ctime >= $self->{modified_after}) {
+                            $self->matchfile($File::Find::name, sub {$matches->add(@_)});
+                        }
+                    }
+                }
+            }
+        }
+    }, $self->{directory});
+    
+    return $matches;
+}
+
+sub matchfile {
+    my ($self, $file, $add) = @_;
+    
+    print MK::Utility::trim_to_term($file) if $self->{progress};
+
+    if (defined(my $text = read_file($file, err_mode => 'quiet'))) {
+        my $tree_r = parse_tree($text);
+        my $matches_r = filter_flatten_tree($tree_r);
+        
+        for my $match (@{$matches_r}) {
+            my $encm = EncFind::Match->new(
+                file => $file,
+                match => ${$match}[0],
+                decoded => ${$match}[1],
+            );
+            
+            &{$add}($encm);
+        }
+
+        if ($self->{display}) {
+            if (scalar (@{$matches_r}) > 0) {
+                print "\r".(" " x MK::Utility::get_wchar())."\r";
+                print color 'bold';
+                print "Matches found in file: $file\n\n";
+                print color 'reset';
+                
+                for my $match (@{$matches_r}) {
+                    my $output = ${$match}[0];
+                    $output =~ s/[^[:punct:]a-zA-Z0-9 ]//g;
+                    print MK::Utility::trim_to_term("Match: $output\n");
+                    
+                    for my $decoded (@{${$match}[1]}) {
+                        my $output = $decoded;
+                        $output =~ s/[^[:punct:]a-zA-Z0-9 ]//g;
+                        
+                        print MK::Utility::trim_to_term("Decoded: $output\n");
+                    }
+                }
+                
+                print "\n";
+            }
+        }
+    }
+    
+    print "\r".(" " x MK::Utility::get_wchar())."\r" if $self->{progress};
+}
+
+sub parse_tree {
+    my ($text, $parent) = @_;
+    my @tree;
+    
+    while ($text =~ /(eval|gzdecode|gzinflate|gzuncompress|base64_decode|str_rot13)\s?\(/g) { # find beginning of method
+        my $keyword = $1;
+        my $spos = pos($text);
+        my $depth = 1;
+        
+        # find the matching paren and capture text between the two
+        
+        while (($depth > 0) && ($text =~ /\G(?:.|\n|\r)*?(\(|\))/g)) {
+            if ($1 eq "(") {
+                $depth++;
+            } elsif ($1 eq ")") {
+                $depth--;
+            }
+        }
+        
+        if ($depth > 0) { # we ran into a missmatch, fail
+            last;
+        }
+        
+        my $epos = pos($text);
+        my $innertext = substr($text, $spos, $epos - $spos - 1);
+        
+        # build current method node
+        
+        my %node = (key => $keyword, text => $innertext, parent => $parent);
+        
+        # recursivly parse the children
+        
+        $node{children} = parse_tree($innertext, \%node);
+        
+        # if we don't have any children, we may be further encoded, try to decode
+        
+        if (scalar @{$node{children}} == 0) {
+            unless ($node{text} =~ /^\$[a-zA-Z0-9_]+/) { # ignore variables
+                # walk back up to the parent to un-wrap the encoding
+                
+                my $curnode = \%node;
+                my $dectext = $curnode->{text};
+                
+                while ((defined($curnode)) && !(exists $curnode->{decoded})) {
+                    #print "Dectext: $dectext\n";
+                    #print "Key: $curnode->{key}\n";
+                    
+                    if ($curnode->{key} eq "base64_decode") {
+                        $dectext = decode_base64($dectext);
+                    } elsif ($curnode->{key} eq "gzinflate") {
+                        my ($i, $istatus) = inflateInit(WindowBits => -Compress::Zlib::MAX_WBITS());
+                        my ($inflated, $ostatus) = $i->inflate($dectext);
+                        $dectext = $inflated;
+                    } elsif ($curnode->{key} eq "gzuncompress") {
+                        my $uncompressed = uncompress($dectext);
+                        $dectext = $uncompressed;
+                    } elsif ($curnode->{key} eq "str_rot13") {
+                        $dectext =~ tr[a-zA-Z][n-za-mN-ZA-M];
+                    }
+                    
+                    $curnode = $curnode->{parent};
+                }
+                
+                # decoding may have returned something unreadable, or the exact same thing
+                # we don't care about it in that case
+                
+                if (defined ($dectext)) {
+                    if ($dectext ne $node{text}) {
+                        if (percentunprintable($dectext) < 15) {
+                            $node{decoded} = $dectext;
+                        }
+                    }
+                }
+                
+                # if we decoded to something useful, restart the recursive parse on the decoded string
+                
+                if (defined($node{decoded})) {
+                    $node{children} = parse_tree($node{decoded}, \%node);
+                }
+            }
+        }
+        
+        push (@tree, \%node);
+    }
+    
+    return \@tree;
+}
+
+sub percentunprintable {
+    my ($text) = @_;
+    my $blength = length($text);
+    $text =~ s/[^[:punct:]a-zA-Z0-9\s]//g;
+    my $alength = length($text);
+    
+    if ($blength > 0) {
+        return (($blength - $alength) / $blength) * 100;
+    } else {
+        return 100;
+    }
+}
+
+sub filter_flatten_tree {
+    my ($tree_r) = @_;
+    my @flat;
+    
+    for my $node (@{$tree_r}) {
+        if ($node->{key} eq "eval") {
+            unless (($node->{text} =~ /\$_(GET|POST|REQUEST)/) || (scalar @{$node->{children}})) { # ignore evals unless they have request variables or children
+                next;
+            }
+        } elsif ($node->{key} =~ /gzdecode|gzinflate|gzuncompress/) { # ignore first level decompress entries
+            next;
+        } else {
+            unless ((scalar @{$node->{children}})) {
+                next;
+            }
+        }
+        
+        my $raw = "$node->{key}($node->{text})";
+        my @subnodes = @{$node->{children}};
+        my @decoded;
+        
+        while (defined(my $subnode = pop(@subnodes))) {
+            if (scalar @{$subnode->{children}}) {
+                push (@subnodes, @{$subnode->{children}});
+            } else {
+                if (defined($subnode->{decoded})) {
+                    push (@decoded, $subnode->{decoded});
+                } else {
+                    my $text = "$subnode->{key}($subnode->{text})";
+                    my $parent = $subnode->{parent};
+                    
+                    while (defined($parent)) {
+                        $text = "$parent->{key}($text)";
+                        $parent = $parent->{parent};
+                    }
+                    
+                    if ($text ne $raw) {
+                        push (@decoded, "$subnode->{key}($subnode->{text})");
+                    }
+                }
+            }
+        }
+        
+        push (@flat, [$raw, \@decoded]);
+    }
+    
+    return \@flat;
+}
+
+1;
+} # end class EncFind::Finder
+
+
+BEGIN { # start class EncFind::Match
+package EncFind::MatchList;
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+
+sub new {
+    my($class) = @_;
+    
+    my $self = {
+        files => {},
+    };
+    
+    bless($self, $class);
+    return $self;
+}
+
+sub add {
+    my ($self, $match_r) = @_;
+    
+    push (@{${$self->{files}}{$match_r->{file}}}, {
+        match => $match_r->{match},
+        decoded => $match_r->{decoded},
+    });
+}
+
+sub json {
+    my $self = shift;
+    
+    if (eval { require JSON }) {
+        JSON->import(-convert_blessed_universally);
+        print(JSON->new->allow_blessed->convert_blessed->encode($self->{files})."\n");
+    } else {
+        print "Error: Perl module 'JSON' not found. Please install to get JSON output.\n";
+    }
+}
+
+1;
+} # end class EncFind::Match
+
+
+BEGIN { # start class EncFind::Match
+package EncFind::Match;
+
+use strict;
+use warnings;
+
+use Carp;
+
+sub new {
+    my($class, %params) = @_;
+        
+    for my $i (qw(file match decoded)) {
+        if (!exists($params{$i})) {
+            croak "Attribute '$i' not passed to constructor.";
+        }
+            
+        if (!defined($params{$i})) {
+            croak "Attribute '$i' not defined.";
+        }
+    }
+    
+    my $self = {
+        file => $params{file},
+        match => $params{match},
+        decoded => $params{decoded},
+    };
+    
+    bless($self, $class);
+    return $self;
+} 
+
+1;
+} # end class EncFind::Match
+
+BEGIN { # start package MK::Utility
+package MK::Utility;
+
+use strict;
+use warnings;
+
+use Carp;
+
+# package globals
+
+my %term;
+
+# accessors for term size
+
+no strict;
+
+for my $i (qw(wchar hchar wpixels hpixels)) {    
+    *{"get_$i"} = sub {
+        if (!$term{$i}) {
+            ($wchar, $hchar, $wpixels, $hpixels) = get_term_size();
+            
+            %term = (
+                wchar => $wchar,
+                hchar => $hchar,
+                wpixels => $wpixels,
+                hpixels => $hpixels,
+            );
+        }
+        
+        return $term{$i};
+    };
+}
+
+use strict;
+
+# subs
+
+sub get_term_size {
+    if (!-t STDOUT) {
+        return (160, 80, 960, 400); # somewhat workable defaults
+    } elsif (eval { require Term::ReadKey }) {
+        return _get_term_size_readkey();
+    } else {
+        return _get_term_size_ioctl();
+    }
+}
+
+sub _get_term_size_ioctl {
+    {
+        local ($^W) = 0;
+        eval "require 'sys/ioctl.ph';" or eval "require 'asm/ioctls.ph';";
+    }
+    
+    # if TIOCGWINSZ is not defined in our ioctl headers, go ahead and assume we are using linux
+    unless(defined(&TIOCGWINSZ)) {
+        eval 'sub TIOCGWINSZ () {0x5413;}';
+    }
+    
+    open(TTY, "+</dev/tty") or croak "No tty: $!";
+    
+    my $winsize = '';
+    unless (ioctl(TTY, &TIOCGWINSZ, $winsize)) {
+        croak sprintf "$0: ioctl TIOCGWINSZ (%08x: $!)\n", &TIOCGWINSZ;
+    }
+    
+    my ($hchar, $wchar, $wpixels, $hpixels) = unpack('S4', $winsize);
+    return ($wchar, $hchar, $wpixels, $hpixels);
+}
+
+sub _get_term_size_readkey {
+    my ($wchar, $hchar, $wpixels, $hpixels) = Term::ReadKey::GetTerminalSize();
+    return ($wchar, $hchar, $wpixels, $hpixels);
+}
+
+sub trim_text {
+    my ($text, $col) = @_;
+    
+    if ((length($text)) > $col) {
+        return substr($text,0,(($col-3)/2))."...".substr($text,-(($col-3)/2));
+    }
+    
+    return $text;
+}
+
+sub trim_to_term {
+    my ($text) = @_;
+    
+    return trim_text($text, get_wchar());
+}
+
+1;    
+} # end package MK::Utility

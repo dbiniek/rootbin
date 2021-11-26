@@ -1,0 +1,214 @@
+#!/bin/bash
+###########
+# 
+# check for ip in kernel routing table, firewall, cphulkd brutes, cphulkd blacklist, and ipsets.
+# https://confluence.endurance.com/display/HGS/IsNulled
+# https://stash.endurance.com/projects/HGADMIN/repos/isnulled
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2017 - HostGator.com, LLC
+###########
+# v0.1: 11/2008: jmay: Initial Release for IP, /24 and /16
+# v0.2: 10/2010: ncuster: Fixed greps to only drop IPs that are blocked
+# v0.3: 11/2012: rheckel: Added firewall, cphulkd brutes, IP verification, and cphulkd blacklist checks.
+# v0.4: 12/2015: jlong: added ipdrop_global ipset check, cphulkd login_track check.
+# v0.5: 05/2017: jlavoy: cleanup
+
+echo "[+] Is Nulled v0.5 By HostGator"
+ip=$1
+ip_bin='/sbin/ip'
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+RESET='\033[0m'
+
+function print() {
+    if [[ ! -z $1 ]]; then
+        printf "[${GREEN}*${RESET}] $*\n"
+    fi
+}
+function error() {
+    if [[ ! -z $1 ]]; then
+        printf "[${RED}!!!${RESET}] $*\n"
+    fi
+}
+
+function use() { 
+    echo "Usage: $0 <IP Address> <y|n>*** " ; 
+    echo "   *** y only if you want it to auto remove!" ; 
+    exit 2 ; 
+}
+
+if [[ ! $ip =~ [0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3} ]]; then
+    error "$ip is not a valid IP address";
+    use;
+fi
+
+classA=$(awk -F. '{print $1".0.0.0/8"}' <<< $ip )
+classB=$(awk -F. '{print $1"."$2".0.0/16"}' <<< $ip )
+classC=$(awk -F. '{print $1"."$2"."$3".0/24"}' <<< $ip )
+
+remove=false
+if [[ ${2} == '--clean' ]] ; then
+    remove=true
+    echo "*** Enabling Removal! ***"
+elif [[ ${2} == 'y' ]]; then
+    remove=true
+    echo "*** Enabling Removal! ***"
+fi
+
+function isnulled_preflight() {
+    local ip=$1;
+    if $ip_bin addr show |grep -E "^\s+inet" |awk '{print $2}' |awk -F/ '{print $1}' |grep -q "^$ip$"; then
+        error " $ip is one of this machine's service IPs."
+        exit 1
+    fi
+}
+
+function isnulled_check() {
+    local ip=$1;
+    local remove=$2;
+    if $ip_bin route |grep -E -q "^(blackhole|unreachable) $ip "; then
+        error " $ip NULLED by: /sbin/route or /sbin/ip route."
+        if $remove; then
+            $ip_bin route del unreachable $ip 2>/dev/null
+            $ip_bin route del blackhole $ip 2>/dev/null
+            print " $ip has been REMOVED from: /sbin/route or /sbin/ip route."
+        fi
+    else
+        print " $ip not blocked in routing table"
+    fi
+
+    if iptables -L INPUT -n |grep -E -q "^(DROP|RESET|REJECT).*$ip\s"; then
+        error " $ip NULLED by: /sbin/iptables -- INPUT line: "
+        iptables -L INPUT -n |grep -E "^(DROP|RESET|REJECT).*$ip\s"
+        if $remove; then
+            for line in $(iptables -L INPUT -n --line |grep -E "(DROP|RESET|REJECT).*$ip\s" |awk '{print $1}'); do
+                iptables -D INPUT $line;
+            done
+            print " $ip has been REMOVED from: /sbin/iptables"
+        fi
+    else 
+        print " $ip not blocked in iptables"
+    fi
+
+    messagesCount=$(grep -E -c "kernel.*SRC=$ip\s" /var/log/messages);
+    if [[ $messagesCount -gt 0 ]]; then
+        error " $ip was found to be logged by the firewall $messagesCount times!";
+    else
+        print " $ip not blocked in syslog"
+    fi
+}
+
+function firewall_check() {
+    local ip=$1;
+    local remove=$2;
+    if [[ -f /etc/firewall/conf/ipdrop_global ]]; then
+        if grep -q $ip /etc/firewall/conf/ipdrop_global; then
+            error " $ip BLOCKED by ipdrop_global"
+            if $remove; then
+                sed -i "/$ip/D" /etc/firewall/conf/ipdrop_global
+                ipset del ipdrop_global $ip
+                print " $ip has been REMOVED from: /etc/firewall/conf/ipdrop_global" 
+            fi
+        fi
+    else
+        print " $ip not blocked in firewall config"
+    fi
+}
+
+function firewall_local_check() {
+    local ip=$1;
+    local remove=$2;
+    if [[ -f /etc/firewall/conf/ipdrop_local ]]; then
+        if grep -q $ip /etc/firewall/conf/ipdrop_local; then
+            error " $ip BLOCKED by ipdrop_local"
+            if $remove; then
+                sed -i "/$ip/D" /etc/firewall/conf/ipdrop_local
+                ipset del ipdrop_local $ip
+                print " $ip has been REMOVED from: /etc/firewall/conf/ipdrop_local" 
+            fi
+        fi
+    else
+        print " $ip not blocked in local firewall config"
+    fi
+}
+
+function cphulkd_check() {
+    local ip=$1;
+    local remove=$2;
+    if [[ -f /var/lib/mysql/cphulkd/brutes.MYI ]]; then
+        if mysql cphulkd -e 'SELECT IP FROM brutes' -B | grep -q $ip; then
+            error " ${1} BLOCKED by cphulkd brutes table";
+            if $remove; then
+                mysql cphulkd -e "DELETE FROM brutes WHERE IP = '$ip'"
+                print " $ip Has been REMOVED from the brutes table"
+            fi
+        fi
+    else
+        print " $ip not blocked in cphulk brutes"
+    fi
+}
+
+function logintrack_check() {
+    local ip=$1;
+    local ip=$(awk -F/ '{print $1}' <<< $ip );
+    local remove=$2;
+    local padded_ip=$(echo -n "00000000000000000000FFFF"; printf '%02X' ${ip//./ } ; echo)
+    if [[ -f /var/lib/mysql/cphulkd/login_track.MYI ]]; then
+    	if mysql cphulkd -e "select hex(ADDRESS) from login_track where hex(ADDRESS) = '$padded_ip';" -B | grep -q $padded_ip; then
+            error " $ip BLOCKED by cphulkd login_track table.";
+            if $remove; then
+			    mysql cphulkd -e "DELETE FROM login_track where hex(ADDRESS) = '$padded_ip';"
+			    print " $ip Has been REMOVED from the cphulkd login_track table"
+            fi
+		fi
+    else
+        print " $ip not blocked in cphulkd logintrack"
+	fi
+}		
+	
+function blacklist_check() {
+    local ip=$1;
+    local remove=$2;
+    if [[ -f /var/lib/mysql/cphulkd/blacklist.MYI ]]; then
+        if mysql cphulkd -e 'SELECT IP FROM blacklist' -B | grep -q $ip; then
+            error " $ip BLOCKED by cphulkd blacklist table.";
+            if $remove; then
+                mysql cphulkd -e "DELETE FROM blacklist WHERE IP = '$ip'"
+                echo "[+] $ip Has been REMOVED from the cphulkd blacklist table"
+            fi
+        fi
+    else
+        print " $ip not blocked in cphulkd blacklist"
+    fi
+}
+
+function ipset_check() {
+    local ip=$1;
+    local remove=$2;
+    for ipset in ipdrop ipdrop-temp bam_blacklist bam_cidrlist; do 
+	    if ipset list $ipset | grep -q $ip 2>/dev/null; then
+            error " $ip BLOCKED by ipset $ipset";
+            if $remove; then
+                ipset del $ipset $ip;
+			    print " $ip Has been REMOVED from ipset $ipset"
+            fi
+        else 
+            print " $ip not blocked in ipset: $ipset"
+        fi
+    done
+}
+		
+isnulled_preflight $ip 
+echo '=================== IP ADDRESS ==================='
+for method in isnulled firewall firewall_local cphulkd logintrack blacklist ipset; do
+    ${method}_check $ip $remove;
+done
+echo '=================== IP RANGES ==================='
+for ip in $classC $classB $classA; do
+    for method in isnulled firewall firewall_local cphulkd logintrack blacklist ipset; do 
+        ${method}_check $ip $remove
+    done
+done
+

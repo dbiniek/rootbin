@@ -1,0 +1,375 @@
+#!/usr/bin/env perl
+# Originally a John Shields oneliner, scripted by Kyle Luzny
+# Special thanks to Kevin Schottie and Julian Fondren for perpetually reminding me that I don't know perl ;-)
+#
+# TODO
+# add a start/finish time when verbose
+# only grab top n line from headers, or find good exit condition for line by line traversal
+# add real sanity tests for arguments
+# fork a --report flag based on sweet eximparse oneliner
+# add support for multiple regex matches, default || behaviour
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Find;
+use Sys::Hostname;
+
+# gives you what you need, electrolytes for end users
+sub help{
+  print << 'EOF';
+
+eximclear [--verbose|-v] [--clean|-c] [regex flag] [string]
+
+A tool for clearing out the exim queue on cPanel based systems.
+
+Regexes:
+  --to, -t            Match the to address
+  --from, -f          Match the from address
+  --subject, -s       Match the mail subject
+  --auth, -a          Match the '-auth' Exim message header
+  --helo_name, -e     Match the '-helo_name' Exim message header
+  --host_address, -r  Match the '-host_address' Exim message header
+  --host_name, -n     Match the '-host_name' Exim message header
+  --script, -x        Match the 'X-PHP-SCRIPT' Exim message header
+  --domain, -d        Match all the mail from a domain
+  --user, -u          Match all the mail from all domains under a user
+  --reseller, -o      Match all the mail from all domains under a reseller
+  --bounces, -b       Matches bounces, accepts an optional domain name
+  --pattern, -p       Specifiy a regex pattern to match in the mail header, no // needed
+
+Options:
+  --mail, -m          Test your match against an exim id, or the full path to a header file, requires above matching options
+  --clean, -c         Actually clean out the mail queue
+  --verbose, -v       Prints extra info about the regex and mail matches
+  --help, -h          Display this help prompt
+
+Examples:
+  eximclear -v -c -b spam.com                        # clear all the bounces for spam.com
+  eximclear -v -a frank                              # count and show mail for auth_id frank - Mwahahahha
+  eximclear -c -t abuse@hostgator.com                # quietly clear the mail sent to abuse@hostgator.com
+  eximclear -v -c -f imaspammer@hax.com              # unapologetically clear the mail sent from imaspammer@hax.com
+  eximclear -v -p "(bad|worse)" -m 1YbOvu-0001gx-AQ  # test a custom regex against an item in the mail queue
+
+EOF
+  return;
+}
+#  eximclear -v -o sakit -b                           # clear all the bounces for sakit's accounts
+
+# globals
+my ( $to, $from, $subject, $auth, $helo_name, $host_address, $host_name, $domain, $script, $user, $reseller, $bounces, $pattern, $mail, $clean ,$verbose, $help, $regex, $found_count );
+
+# plzdontmurdrbox
+sub be_nicer {
+  my $pid = $$;
+  system "ionice -c2 -p$pid";
+  system "renice +19 $pid";
+  return;
+}
+
+# used to specify the cli options
+sub get_options {
+  GetOptions(
+    'to|t=s' =>           \$to,
+    'from|f=s' =>         \$from,
+    'subject|s=s' =>      \$subject,
+    'auth|a=s' =>         \$auth,
+    'helo_name|e=s' =>    \$helo_name,
+    'host_address|r=s' => \$host_address,
+    'host_name|n=s' =>    \$host_name,
+    'domain|d=s' =>       \$domain,
+    'script|x=s' =>       \$script,
+    'user|u=s' =>         \$user,
+    'reseller|o=s' =>     \$reseller,
+    'bounces|b:s' =>      \$bounces,
+    'pattern|p=s'=>       \$pattern,
+    'mail|m=s'=>          \$mail,
+    'clean|c' =>          \$clean,
+    'verbose|v' =>        \$verbose,
+    'help|h' =>           \$help
+  );
+
+  # real sanity checking needs to go here
+  if ( $help ) { help(); exit; }
+}
+
+# display an error message, help, then exit
+sub error_and_bail {
+  my $message = shift;
+  print "\n".$message."\n";
+  help();
+  exit;
+}
+
+# bail out if a bad user is provided
+sub user_exists {
+  my $user = shift;
+  error_and_bail('No user found: ' . $user) unless getpwnam($user);
+}
+
+# pull the list of domains for a user
+sub user_domains {
+  my $user = shift;
+  user_exists($user);
+  my $user_regex = '(.*):\s+' . $user . '$';
+  my $file_path = '/etc/userdomains';
+  error_and_bail('Missing ' . $file_path . ' unable to proceed') unless -e $file_path;
+  my @domains;
+  open( my $userdomains_fh, "<", $file_path ) or die "$!";
+  while (<$userdomains_fh>) {
+    if ( $_ =~ /$user_regex/ ) {
+      push(@domains, $1);
+    }
+  }
+  close($userdomains_fh);
+  return join('|', map { quotemeta $_ } @domains);
+}
+
+# pull the list of users for a reseller
+sub reseller_users {
+  my $reseller = shift;
+  user_exists($reseller);
+  open my $f, '<', '/etc/trueuserowners' or die "Unable to open /etc/trueuserowners : $!";
+  chomp(my @users = map { [split /: /]->[0] } grep { /: \Q$reseller/ } <$f>);
+  close $f;
+  @users
+}
+
+# pull the list of domains for a reseller
+sub reseller_domains {
+  return join('|', map { user_domains($_) } reseller_users(shift))
+}
+
+# filter out / from future regular expressions
+sub escape_slash {
+  my $original_path = shift;
+  my $find = '/';
+  my $replace = '\/';
+  (my $new_path = $original_path) =~ s|$find|$replace|g;
+  return $new_path;
+}
+
+# used when -v is used to print all the matching exim ids
+sub print_match {
+  my $match_data  = shift;
+  my $mail_file = shift;
+  chomp $match_data;
+  print $mail_file."\t".$match_data."\n";
+  return;
+}
+
+# displays the count during the dry runs 
+sub print_match_count {
+  my $count = shift;
+  print 'Found '.$count." matches in the queue, use -c to remove them\n";
+  return;
+}
+
+# loop through lines and print out the matched line
+sub find_and_print_matches {
+  my $lines_ref = shift;
+  my @lines = @{$lines_ref};
+  my $naughty_mail = shift;
+  foreach(@lines){
+    print_match($_, $naughty_mail) if $_ =~ /$regex/;
+  }
+  return;
+}
+
+# fetch all the lines in a file
+# the missing die on open is intentional, don't want stop execution because one mail didn't unlink
+sub fetch_file {
+  my $file = shift;
+  open(my $file_handler, '<', $file) or return;
+  my @lines = <$file_handler>;
+  close($file_handler);
+  return @lines;
+}
+
+# unlink the 3 files associated with exim mail 
+sub unlink_exim {
+  my $naughty_mail = shift;
+  unlink($naughty_mail);
+  $naughty_mail =~ s/-H$/-D/;
+  unlink $naughty_mail;
+  $naughty_mail =~ s/input/msglog/; # thanks schottie
+  $naughty_mail =~ s/-D$//;
+  unlink $naughty_mail;
+  return;
+}
+
+# performed on each found file
+sub purge {
+  my $naughty_mail = $File::Find::name;
+  my @lines = fetch_file($naughty_mail);
+  unlink_exim($naughty_mail) if (grep { /$regex/ } @lines);
+  return;
+}
+
+sub purge_and_print {
+  my $naughty_mail = $File::Find::name;
+  my @lines = fetch_file($naughty_mail);
+  if(grep { /$regex/ } @lines){
+    find_and_print_matches(\@lines, $naughty_mail);
+    unlink_exim $naughty_mail;
+  }
+  return;
+}
+
+# count the number of matches in the queue
+sub count_matches {
+  my $naughty_mail = $File::Find::name;
+  my @lines = fetch_file($naughty_mail);
+  $found_count++ if (grep { /$regex/ } @lines);
+  return;
+}
+
+sub count_and_print_matches {
+  my $naughty_mail = $File::Find::name;
+  my @lines = fetch_file($naughty_mail);
+  if(grep { /$regex/ } @lines){
+    $found_count++;
+    find_and_print_matches(\@lines, $naughty_mail);
+  }
+  return;
+}
+
+# clean up the exim db
+sub clean_exim_db {
+  print "Cleaning up the exim DBs {retry,reject,wait-remote_smtp}\n";
+  `/usr/sbin/exim_tidydb /var/spool/exim retry`;
+  `/usr/sbin/exim_tidydb /var/spool/exim reject`;
+  `/usr/sbin/exim_tidydb /var/spool/exim wait-remote_smtp`;
+  `/usr/sbin/exim_tidydb /var/spool/exim ratelimit`;
+  return;
+}
+
+# faster than file::find when perusing for bounces
+sub fetch_bounces {
+  my $bounces = shift;
+  my @bounce_ids;
+  if ( $bounces eq '') {
+   @bounce_ids = `exiqgrep -i -f '<>'`;
+  } else {
+   @bounce_ids = `exiqgrep -i -f '<>' -r ${bounces}`;
+  }
+  return @bounce_ids;
+}
+
+# used when unlinking based on the exim id and not a file::find crawl
+sub unlink_by_id {
+  my $exim_id = $_;
+  my $exim_file = '/var/spool/exim/input/'.substr($exim_id,5,1).'/'.$exim_id.'-H'; #one simple trick that spammers hate!
+  unlink_exim $exim_file;
+  return;
+}
+
+# script starts here
+
+get_options();
+
+# select which regular expresion to match against the mail headers
+$regex =    $to           	? '^\d+T\s+To:\s+<?' . $to                                      #ok
+          : $from         	? '^\d+F\s+From:.*' . $from . '>?\b'                            #ok
+          : $subject      	? '^\d+\s+Subject:\s+' . $subject . '$'                         #ok
+          : $domain       	? '^\d+F\s+From:.*?[@+]' . $domain . '>?\s*$'
+          : $script       	? '\bX\-PHP\-Script\:\s+' . escape_slash($script) . '\b'
+          : $user         	? '^\d+F\s+From:.*?[@+](' . user_domains($user) . ')>?\s*$'
+          : $reseller       ? qr/^(?:\d+F\s+From:|-auth_sender)\s(?:.*?[\@+](@{[reseller_domains($reseller)]})|(?:@{[join('|', map { quotemeta($_.'@'.hostname()) } reseller_users($reseller))]}))>?\s*$/
+          : $auth         	? '^-auth\w+\s+' . $auth . '$'                                  #ok
+          : $helo_name    	? '^-helo_name\s+' . $helo_name . '$'
+          : $host_address 	? '^-host_address\s+' . $host_address . '$'
+          : $host_name    	? '^-host_name\s+' . $host_name . '$'
+          : $pattern      	? $pattern
+          : defined($bounces)   ? $bounces
+          : error_and_bail('No regular expression was found!');
+
+if ($reseller and !$bounces and defined $bounces) { $bounces = qr/(@{[reseller_domains($reseller)]})/ }
+
+print 'Using /'.$regex."/ to match mail items.\n" if $verbose;
+
+# Here we match against a test the regex against a test mail item.
+if ($mail) {
+  # check if we are using an exim id, or a file path
+  my @lines;
+  if ($mail =~ /[A-Za-z0-9]{5,}-[A-Za-z0-9]{5,}\-[A-za-z0-9]+/) {
+    @lines = `/usr/sbin/exim -Mvh $mail`;
+  } else {
+    print "Testing regex against the file: ".$mail."\n";
+    open(my $mail_fh, '<', $mail) or error_and_bail('Can\'t open' . $mail . ' unable to proceed:\n$!'); 
+    @lines = <$mail_fh>;
+    close($mail_fh);
+  }
+  if ($verbose) {
+    print "############ MAIL START ############\n";
+    print(@lines,"\n");
+    print "############ MAIL STOP  ############\n\n";
+  }
+  if(grep { /$regex/ } @lines){
+    print "Match found";
+  } else {
+    print "NO match found";
+  }
+  print " against /".$regex."/\n\n";
+
+  if ($verbose){
+    foreach(@lines) {
+     print $_."\n" if $_ =~ /$regex/;
+    }
+  }
+  exit;
+}
+
+# Start crawling the exim queue
+my $queue_path = '/var/spool/exim/input';
+
+# ionice and renice
+be_nicer();
+
+print "Starting to process the queue... this could take a while\n";
+
+# using separate methods here to minimize the conditionals in each flow
+# uneccessary verbose checks would slow down the actual cleaning
+$found_count = 0;
+if (defined $bounces) {
+  # this is a much faster way to catch bounces
+  my @bounces = fetch_bounces($bounces);
+  if ($clean) {
+    foreach(@bounces) {
+      chomp($_);
+      unlink_by_id $_;
+      print_match('Bounce '.$bounces, $_) if $verbose;
+    }
+  } elsif ($verbose) {
+    print @bounces;
+    print "\n";
+    $found_count = @bounces;
+    print_match_count($found_count);
+  } else {
+    print_match_count($found_count);
+  }
+} elsif ($clean && $verbose) {
+  # mail purge with print
+  find(\&purge_and_print, $queue_path);
+  clean_exim_db();
+} elsif ($clean) {
+  # mail purge
+  find(\&purge, $queue_path);
+  clean_exim_db();
+} elsif ($verbose) {
+  # verbose dry run
+  find(\&count_and_print_matches, $queue_path);
+  print_match_count($found_count);
+} else {
+  # dry run
+  find(\&count_matches, $queue_path);
+  print_match_count($found_count);
+}
+
+# small summary report
+if ($verbose) {
+  my $remaining_mail=`exim -bpc`;
+  chomp $remaining_mail;
+  print "There are still ${remaining_mail} items in the exim queue\n";
+}
+print "Done... thank you for cleaning up the internet\n";

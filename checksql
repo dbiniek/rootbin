@@ -1,0 +1,22 @@
+#!/usr/bin/perl
+$hostname=`hostname`;
+chomp($hostname);
+use DBI;
+open(DAT, "/root/.my.cnf");
+while (<DAT>) {
+	if ( /password=['"]?(.*?)['"]?$/ ) {
+		$mysqlpass = $1;
+		last;
+	}
+}
+close(DAT);
+
+my $dbh = DBI->connect("DBI:mysql:database=mysql;host=localhost","root","$mysqlpass") || die "couldnt connect";
+my $querystring = qq^select * from user where (Select_priv="Y" OR Insert_priv="Y" OR Update_priv="Y" OR Delete_priv="Y" OR Create_priv="Y" OR Drop_priv="Y" OR Reload_priv="Y" OR Shutdown_priv="Y" OR Process_priv="Y" OR File_priv="Y" OR Grant_priv="Y" OR References_priv="Y" OR Index_priv="Y" OR Alter_priv="Y" OR Show_db_priv="Y" OR Super_priv="Y" OR Create_tmp_table_priv="Y" OR Lock_tables_priv="Y" OR Execute_priv="Y" OR Repl_slave_priv="Y" OR Repl_client_priv="Y" OR Create_view_priv="Y" OR Show_view_priv="Y" OR Create_routine_priv="Y" OR Alter_routine_priv="Y" OR Create_user_priv="Y" OR Event_priv="Y" OR Trigger_priv="Y") AND User NOT IN ("root","cpldap","roundcube","cphulkd")^;
+#print "Query: $querystring\n";
+my $query = $dbh->prepare($querystring);
+$query->execute();
+while ( my @row = $query->fetchrow_array) {
+        print "[!] $hostname: @row[1]\n";
+}
+

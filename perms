@@ -1,0 +1,681 @@
+#!/usr/bin/perl
+#########################################################################
+# Perms 3.0
+# OC: Jacob Perkins
+# Maintainer: James Lavoy
+# Contributer: Robert Davis, Michael Streeter, Mitchell Bounds
+# permissions fixer.
+# https://stash.endurance.com/projects/HGADMIN/repos/perms/browse
+# Please submit all bug reports to your supervisor
+#
+# (C) 2016 - Endurance International Group
+#########################################################################
+use strict;
+use Cwd;
+use IO::Handle;
+STDERR->autoflush(1);
+STDOUT->autoflush(1);
+
+# define non-standard permissions below.
+# The code will run until it finds a regex that it matches. Therefore order is important. To keep order consistent, each regex is defined in the @index array.
+# The key in the perms hash is a relative path from the users home directory.
+# Below that is a 'd'' or 'f'' to signify the permissions of a directory or file matching the specified regex. Put nothing to keep it standard.
+# You can use uid's or usernames for user and group. If you put the special term '_user' it will be replaced with the users UID/GID.
+# Do not quote your mode, and use the 4 character octal format (0644, 0755, etc)
+
+my @index = (
+        '^.ssh',
+        '^etc.*@pwcache',
+        '^.cphorde',
+        '^public_html$',
+        '^public_ftp$',
+        '^public_ftp/incoming$',
+        '^etc',
+        '^.cpanel/quickinstall',
+        '^.cpanel/caches/dynamicui',
+        '^.cpanel/caches/user_manager$',
+        '^.cpanel/datastore',
+        '^.cpanel/caches',
+        '^.cpanel/datastore',
+        '^(hgtransfer|hgtransfers|xfer|xfers)',
+        '^.contactemail$',
+        '^.*\.(pl|cgi|fcgi|sh|py)$',
+        'etc.*(quota|passwd)(,v)?$',
+        '^.htpasswds',
+        '^.cpanel$',
+        '^mail',
+        '^mail.*(cur|new|tmp|.Sent|.Drafts|.Trash|.Junk)$',
+        '^mail.*maildirsize$',
+        '^$',
+        'ftpquota$',
+        '^.autorespond$',
+        '^MYSQL_DATA',
+        '^.accesshash$',
+        '^.fantasticodata',
+        '^fantastico_backups$',
+        'shadow(,v)?$',
+        '^backupwordpress$',
+        '^.security',
+        '^.cpanel/nvdata.cache$',
+        '^.cpanel/email_accounts.json$',
+        '^.cpanel/contactinfo$',
+        '^.cpanel/nvdata$',
+        '^.cpanel/email_accounts_count$',
+        '^.lastlogin$',
+        '^rails_apps.*log',
+        '^rails_apps.*script',
+        '^.my.cnf$',
+        '^public_html.zip$',
+        '^dbconnect-backup.tar$',
+        '(^|/)bin/(python|pip|easy_install)([0-9.-]+)?$',
+);
+
+my %perms = (
+    '^$' => {
+        'd' => {
+            'mode' => 0711,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.accesshash$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.contactemail$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel$' => {
+        'd' => {
+            'mode' => 0700,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/nvdata.cache$' => {
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/email_accounts.json$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/contactinfo$' => {
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/nvdata$' => {
+        'd' => {
+            'mode' => 0700,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/email_accounts_count$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/caches/dynamicui' => {
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/caches/user_manager$' => {
+        'd' => {
+            'mode' => 0755,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/datastore' => {
+        'f' => {
+            'mode' => 0644,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/caches' => {
+        'd' => {
+            'mode' => 0700,
+            'user' => '_user',
+            'group' => '_user',
+        },
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/datastore' => {
+        'd' => {
+            'mode' => 0700,
+            'user' => '_user',
+            'group' => '_user',
+        },
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cphorde' => {
+        'd' => {
+            'mode' => 0700,
+            'user' => '_user',
+            'group' => '_user',
+        },
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.autorespond$' => {
+        'd' => {
+            'mode' => 0700,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.cpanel/quickinstall' => {
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => '_user',
+        },
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.fantasticodata' => {
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => '_user',
+        },
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^fantastico_backups$' => {
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => '_user',
+        }
+    },
+    '^public_html$' => {
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => 'nobody',
+        },
+    },
+    '^public_ftp$' => {
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^public_ftp/incoming$' => {
+        'd' => {
+            'mode' => 0777,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    'ftpquota$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    'etc.*(quota|passwd)(,v)?$' => {
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => 'mail',
+        },
+    },
+    'shadow(,v)?$' => {
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^etc.*@pwcache' => {
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => '_user',
+        },
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^etc' => {
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => 'mail',
+        },
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => 'mail',
+        },
+    },
+    '^mail.*(cur|new|tmp|.Sent|.Drafts|.Trash|.Junk)$' => {
+        'd' => {
+            'mode' => 0700,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^mail.*maildirsize$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => 'mail',
+        },
+    },
+    '^mail' => {
+        'd' => {
+            'mode' => 0751,
+            'user' => '_user',
+            'group' => '_user',
+        },
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.*\.(pl|cgi|fcgi|sh|py)$' => {
+        'f' => {
+            'mode' => 0755,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^MYSQL_DATA' => {
+        'f' => {
+            'mode' => 0640,
+            'user' => 'mysql',
+            'group' => 'mysql',
+        },
+        'd' => {
+            'mode' => 0750,
+            'user' => 'mysql',
+            'group' => 'mysql',
+        },
+    },
+    '^.htpasswds' => {
+        'f' => {
+            'mode' => 0640,
+            'user' => '_user',
+            'group' => 'nobody',
+        },
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => 'nobody',
+        },
+    },
+    '^.ssh' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+        'd' => {
+            'mode' => 0700,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^(hgtransfer|hgtransfers|xfer|xfers)' => {
+        'd' => {
+            'mode' => 0755,
+            'user' => 'root',
+            'group' => 'root',
+        },
+        'f' => {
+            'mode' => 0644,
+            'user' => 'root',
+            'group' => 'root',
+        },
+    },
+    '^backupwordpress$' => {
+        'd' => {
+            'mode' => 0750,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.security' => {
+        'd' => {
+            'mode' => 0700,
+            'user' => 'root',
+            'group' => 'root',
+        },
+        'f' => {
+            'mode' => 0600,
+            'user' => 'root',
+            'group' => 'root',
+        },
+    },
+    '^.lastlogin$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^rails_apps.*log' => {
+        'f' => {
+            'mode' => 0666,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^rails_apps.*script' => {
+        'f' => {
+            'mode' => 0755,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^.my.cnf$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^public_html.zip$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '^dbconnect-backup.tar$' => {
+        'f' => {
+            'mode' => 0600,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+    '(^|/)bin/(python|pip|easy_install)([0-9.-]+)?$' => {
+        'f' => {
+            'mode' => 0755,
+            'user' => '_user',
+            'group' => '_user',
+        },
+    },
+);
+
+my @user_excludes = (
+    '.',
+    '..',
+    'root',
+    'virtfs',
+    'hgtransfer',
+);
+
+my ( $user, $home, %ids, $log ); 
+my $default_file_mode = 0644;
+my $default_dir_mode = 0755;
+my $runtime = time();
+my $verbose = 1 ? grep(/^-v$/, @ARGV) : 0;
+my %docroots;
+
+print "[*] Perms v3.0\n";
+main();
+print "[*] Done\n";
+
+
+
+sub main {
+    ( $user ) = @ARGV;
+    ( undef, $home, $user ) = split(/\//, cwd()) unless $user;
+    $home = get_home($user) unless ( $home =~ /^home[0-9]+?$/ );
+    chdir('/' . $home . '/' . $user);
+    sanity($user, $home);
+    check_dso($user);
+    get_ids($user);
+    populate_docroots($user);
+    fix_symlinks($home, $user);
+
+    correct('/' . $home . '/' . $user, $perms{'^$'}->{'d'}->{'mode'}, $perms{'^$'}->{'d'}->{'user'}, $perms{'^$'}->{'d'}->{'group'});
+    find('/' . $home . '/' . $user);
+    fix_valiases($user);
+}
+
+sub sanity {
+    my ( $user, $home ) = @_;
+    die "[!] No user specified and not run from a homedirectory\n" unless $user;
+    die "[!] Invalid user [$user] specified\n" if grep(/^$user$/, @user_excludes);
+    die "[!] This is not a cPanel server\n" unless -d '/usr/local/cpanel';
+    die "[!] Specified user [$user] is not a valid cpanel user\n" unless -f '/var/cpanel/users/' . $user;
+    die "[!] No user specified and not run from a home directory\n" unless (( defined($home) ) && ( $home =~ /^home([0-9]+)?$/ ));
+    return(1);
+}
+
+sub check_dso {
+    my $user = shift;
+    return(0) unless -f '/usr/local/cpanel/bin/rebuild_phpconf';
+    open(my $f, '-|', '/usr/local/cpanel/bin/rebuild_phpconf --current');
+        while(<$f>) {
+            if ( /^(ea\-)?(php|PHP)[0-9]{1,2}\sSAPI:\sdso/ ) {
+                ( $default_file_mode, $default_dir_mode ) = ( 0640, 0750 );
+                return(1);
+            }
+        }
+    close($f);
+    return(0);
+}
+
+sub get_home {
+    my $user = shift;
+    foreach my $dir ( </home*> ) {
+        if ( -d $dir . '/' . $user ) {
+            $dir =~ s/\///g;
+            return($dir);
+        }
+    }
+    die "[!] Could not determine users home directory.\n";
+}
+
+sub get_ids {
+    my $user = shift;
+    ( undef, undef, $ids{$user}->{'uid'}, $ids{$user}->{'gid'} ) = getpwnam($user);
+    return(1);
+}
+
+sub fix_symlinks {
+    my ( $home, $user ) = @_;
+    unless ( -l 'www' ) {
+        if ( -d 'public_html' ) {
+            symlink('public_html', 'www');
+            system('chown', '-h', $user . ':' . $user, 'www');
+        }
+    }
+    unless ( -l 'access-logs' ) {
+        unless ( -d '/usr/local/apache/domlogs/' . $user ) {
+            system('mkdir', '-p', '/usr/local/apache/domlogs/' . $user);
+            system('chown', 'root:' . $user, '/usr/local/apache/domlogs/' . $user);
+        }
+        symlink('/usr/local/apache/domlogs/' . $user, 'access-logs');
+        system('chown', '-h', $user . ':' . $user, 'access-logs');
+    }
+    return(1);
+}
+
+sub find {
+    my $path = shift;
+    next if $path !~ /^\/$home\/$user/;
+    opendir(my $d, $path);
+        foreach my $name ( map { $path . '/' . $_ } grep { ! /^\.(\.)?$/ } readdir($d) ) {
+            my $relativepath = (split '/', $name, 4)[-1];
+            lstat($name);
+            # skipping symlinks, any of the cPanel required symlinks are already recreated with proper permissions at this point.
+            next if ( -l _ );
+            # we can't reliably tell if they link outside the users homedir, so to avoid accidently chowning a root owned file to the user, we're skipping all hardlinks - ESOSD-15369
+            next if ( -f _ && ( (lstat(_))[3] > 1 ));
+            # check and run edge-cases
+            if ( exists $docroots{$name} ) {
+                correct($name, 0750, $user, 'nobody');
+                find($name) if -d $name;
+                next;
+            }
+            my $regex = get_index($relativepath);
+            if ( $regex ) {
+                if (( -f _ ) && ( $perms{$regex}->{'f'} )) {
+                    correct($name, $perms{$regex}->{'f'}->{'mode'}, $perms{$regex}->{'f'}->{'user'}, $perms{$regex}->{'f'}->{'group'});
+                    next;
+                } elsif ( -d _ ) {
+                    if ( $perms{$regex}->{'d'} ) {
+                        correct($name, $perms{$regex}->{'d'}->{'mode'}, $perms{$regex}->{'d'}->{'user'}, $perms{$regex}->{'d'}->{'group'});
+                    }
+                    find($name);
+                    next;
+                }
+            }
+            # everything else
+            if ( -f _ ) {
+                correct($name, $default_file_mode, $ids{$user}->{'uid'}, $ids{$user}->{'gid'});
+                next;
+            }
+            if ( -d _ ) {
+                correct($name, $default_dir_mode, $ids{$user}->{'uid'}, $ids{$user}->{'gid'});
+                find($name);
+                next;
+            }
+        }
+    closedir($d);
+}
+
+sub get_index {
+    my $relativepath = shift;
+    foreach my $regex ( @index ) {
+        if ( $relativepath =~ /$regex/ ) {
+            return($regex);
+        }
+    }
+    return(0);
+}
+
+sub fix_valiases {
+    my ( $user ) = shift;
+    open(my $fh, '<', '/etc/userdomains');
+        while(<$fh>) {
+            if ( /^([a-zA-Z0-9\.\-]+):\s$user$/ ) {
+                my $domain = $1;
+                if ( -f '/etc/valiases/' . $domain ) {
+                    # have to do the ..'s so we get out of the relative path of the users homedirectory
+                    correct('/../../etc/valiases/' . $domain, 0640, $user, 'mail');
+                }
+            }
+        }
+    close($fh);
+}
+
+sub correct {
+    my ( $file, $mode, $uid, $gid ) = @_;
+    ( $uid, $gid ) = fix_input($uid, $gid);
+    my ( undef, undef, $fmode, undef, $fuid, $fgid, undef, undef, undef, $mtime, $ctime ) = stat($file);
+    my $work = 0;
+    if ( sprintf('%04o', $fmode & 07777) ne sprintf('%04o', $mode & 07777) ) {
+        $work = 1;
+        print '- chmoding ' . $file . ', ' . sprintf("%04o", $mode & 07777) . "\n" if $verbose;
+        chmod($mode, $file);
+    }
+    if (( $fuid != $uid ) || ( $fgid != $gid )) {
+        $work = 1;
+        print '- chowning ' . $file . ', ' . $uid . ', ' . $gid . "\n" if $verbose;
+        chown($uid, $gid, $file);
+    }
+    _log($file, $mtime, $ctime) if $work;
+}
+
+sub _log {
+    my ( $file, $mtime, $ctime ) = @_;
+    return unless (( defined($file) ) && ( defined($mtime) ) && ( defined($ctime) ));
+    unless ( defined($log) ) {
+        my $path = '/' . $home . '/' . $user . '/.permslog';
+        open($log, '>>', $path);
+        chmod(0600, $path);
+        system('chown', '-h', $user . ':' . $user, $path);
+    }
+    print $log $runtime . "\t" . $file . "\t" . $mtime . "\t" . $ctime . "\n";
+    return(1);
+}
+
+sub fix_input {
+    my ( $uid, $gid ) = @_;
+    # convert usernames and specials into uids
+    if ( $uid !~ /^[0-9]+$/ ) {
+        if ( $uid eq '_user' ) {
+            $uid = $ids{$user}->{'uid'};
+        } else {
+            ( undef, undef, $ids{$uid}->{'uid'} ) = getpwnam($uid) unless defined($ids{$uid}->{'uid'});
+            $uid = $ids{$uid}->{'uid'};
+        }
+    }
+    # convert groups and specials into gids
+    if ( $gid !~ /^[0-9]+$/ ) {
+        if ( $gid eq '_user' ) {
+            $gid = $ids{$user}->{'gid'};
+        } else {
+            ( undef, undef, $ids{$gid}->{'gid'} ) = getgrnam($gid) unless defined($ids{$gid}->{'gid'});
+            $gid = $ids{$gid}->{'gid'};
+        }
+    }
+    return($uid, $gid);
+}
+
+sub populate_docroots {
+    my ($user) = @_;
+    open my $f, '<', '/etc/userdatadomains' or return;
+    while (defined(my $line = <$f>)) {
+        my ($domuser, $type, $docroot) = (split /: |==/, $line)[1,3,5];
+        next if $docroot =~ m(^/ [^/]+ / [^/]+ /public_html/ [^/]+)x; # skip docroots under public_html
+        next unless $domuser eq $user;
+        $docroots{$docroot}++;
+    }
+    close $f;
+}
+
+__END__

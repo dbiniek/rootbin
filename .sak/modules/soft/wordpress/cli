@@ -1,0 +1,3040 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife -- WordPress CLI Library
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash-WP
+#- @subpackage CLI
+
+#+ Our main subcommand processing loop.
+#| Handles the "wp" subcommand.
+#- @param mixed $args... Positionals provided from CLI script.
+sak_cli_wp() {
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    ""|info|overview)     sak_cli_wp_info "$@" ;;
+    basic|basics)         sak_cli_wp_info "basics" ;;
+    cache|caches|caching) sak_cli_wp_cache_info "$@" ;;
+    count|counts)         sak_cli_wp_count_info "$@" ;;
+    cron|wpcron|wp-cron)  sak_cli_wp_cron "$@" ;;
+
+    backup)   sak_cli_wp_backup "$@" ;;
+    diff)     sak_cli_diff --only "wordpress" "$@" ;;
+    replace)  sak_cli_replace --only "wordpress" "$@" ;;
+
+    import)           sak_cli_wp_import "$@" ;;
+    resurrect)        sak_cli_wp_resurrect "$@" ;;
+    connect)          sak_cli_wp_connect "$@" ;;
+    profile|profiler) sak_cli_wp_plugin_profiler "$@" ;;
+
+    set)            sak_cli_wp_set "$@" ;;
+    plugin|plugins) sak_cli_wp_plugins "$@" ;;
+    theme|themes)   sak_cli_wp_themes "$@" ;;
+    user|users)     sak_cli_wp_users "$@" ;;
+
+    -h|help|--help) sak_cli_help_wp ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+       sak_cli_help_wp; exit 1 ;;
+  esac
+}
+
+#+ Theme subcommand handler.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_themes() {
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    ""|info)            sak_cli_wp_theme_info "$@" ;;
+    set|reset|default)  sak_cli_wp_theme_set "$cmd" "$@" ;;
+
+    -h|help|--help) sak_cli_help_wp_theme ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+       sak_cli_help_wp_theme; exit 1 ;;
+  esac
+}
+
+#+ Plugins subcommand handler.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_plugins() {
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    -a|-d)          sak_cli_wp_plugin_info "$cmd" "$@" ;;
+    ""|info)        sak_cli_wp_plugin_info "$@" ;;
+    activate|deactivate|\
+    enable|disable) sak_cli_wp_plugin_toggle "$cmd" "$@" ;;
+
+    install)      sak_cli_wp_plugin_install "$@" ;;
+    find|search)  sak_cli_wp_plugin_search "$@" ;;
+
+    test|toggle)  sak_cli_wp_plugin_test_toggle ;;
+
+    -h|help|--help) sak_cli_help_wp_plugin ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+       sak_cli_help_wp_plugin; exit 1 ;;
+  esac
+}
+
+#+ Users subcommand handler.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_users() {
+  local cmd="$1" IFS=$' \t\n'
+  shift
+
+  case "$cmd" in
+    ""|info)  sak_cli_wp_user_info ;;
+
+    disp|display|setdisp|setdisplay|changedisplay)
+      sak_cli_wp_user_edit "display" "$@" ;;
+    email|setemail|changeemail)
+      sak_cli_wp_user_edit "email" "$@" ;;
+    name|rename|setname|changename)
+      sak_cli_wp_user_edit "username" "$@" ;;
+    role|setrole|changerole)
+      sak_cli_wp_user_edit "role" "$@" ;;
+
+    -h|help|--help) sak_cli_help_wp_user ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+       sak_cli_help_wp_user; exit 1 ;;
+  esac
+}
+
+##################################################################
+##################################################################
+#
+# WordPress Help
+#
+
+#@ WordPress command help
+sak_cli_help_wp() {
+  sak_cli_usage
+cat << EOF
+
+These are WordPress specific functions.
+
+Help Commands:
+  --help  This help
+  info    Display WordPress information found in current directory
+  counts  Display post, page, comment, and taxonomy counts
+  cron    Display an overview of WP Cron entry names and intervals
+
+Commands:
+  backup [all|db [DATABASE [PATH]]]
+          Without arguments, generate a core backup of the WordPress install
+          detected in the current directory. If "all" is specified, a full
+          directory backup is created. If "db" is specified, a backup of the
+          installation or specified DB is created, optionally at the path
+          specified.
+
+  cache [--set NAME [OPTIONS]]
+          Display or set cache plugin configuration
+
+  diff    Show a core file diff. Wrapper for software specific diff command.
+
+  replace [OPTIONS]...
+          Replace core install files for WordPress. Wrapper for main replace
+          command.
+
+  resurrect [OPTIONS] [--database] DATABASE
+          Download and install a WordPress site using information from DATABASE.
+          This option should be used with great care.
+
+  connect [OPTIONS]
+          Connect an existing wordpress install to the specified database
+
+  plugins (enable PLUGIN...|disable PLUGIN...|test|search TERMS...|install SLUG)
+          Without arguments, display plugins. Specify "enable" and a list of
+          plugins to enable; specify "disable" and a list of plugins to disable.
+
+  profiler
+          Downloads and installs a profiling plugin to help diagnose issues such
+          as slow loading sites, etc.
+
+  users [COMMAND ...]
+          Information or modification of users.
+
+  set [ITEM ...]
+          Changes basic WordPress settings.
+
+  theme [COMMAND ...]
+          WordPress theme functions.
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ WordPress set command help
+sak_cli_help_wp_set() {
+  local u=$'\e[4m' e=$'\e[0m'
+  sak_cli_usage
+cat << EOF
+
+Help Commands:
+  --help  This help
+
+Commands:
+  set name NEWNAME
+        Changes the site name to the new name specified
+
+  set tag DESCRIPTION
+        Changes the site's tagline or description
+
+  set (home|site|url) NEWURL
+        Changes the Home URL, Site URL, or both (site and home) to the new URL
+        specified.
+
+  set permalink CODE
+        Adjust the permalink markup for the site. To disable permalinks, you may
+        specify "" as the code.
+
+        See ${u}http://goo.gl/ZFgK6${e} for more information.
+
+Examples:
+  sak-cli wp set name "Doug's Super Blog"
+  sak-cli wp set tag "The ultimate site for guys named Doug."
+  sak-cli wp set url "http://www.dougster.tld"
+  sak-cli wp set home "http://www.dougster.tld/welcome-page.html"
+  sak-cli wp set permalink "/blog/%year%/%monthnum%/%day%/%postname%/"
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ WordPress theme command help
+sak_cli_help_wp_theme() {
+  sak_cli_usage
+cat << EOF
+
+Help Commands:
+  --help  This help
+
+  theme [info]
+          This command will show information about installed themes
+
+Commands:
+  theme set THEME
+          Change the WordPress theme to the one specified using the "template"
+          field from "theme info" command.
+
+  theme default
+  theme reset
+          Resets the blog's theme to the default for the installed version
+
+Examples:
+  sak-cli wp theme info
+  sak-cli wp theme set twentyten
+  sak-cli wp theme reset
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ WordPress plugin command help
+sak_cli_help_wp_plugin() {
+  sak_cli_usage
+cat << EOF
+
+Help Commands:
+  --help  This help
+
+  plugins [info]
+            This command will show information about installed plugins
+
+  plugins (-a|-d)
+            Specifying -a with show only active plugins, while using -d will
+            only show disabled plugins.
+
+Commands:
+  plugins enable PLUGIN [PLUGIN]...
+  plugins disable PLUGIN [PLUGIN]...
+            Enables or disables specified plugin filenames from the "info"
+            command. You may use the predicate "all" to enable or disable all
+            plugins at once.
+
+  plugins install SLUG
+            Providing the "Install Slug" from a search sub-command result will
+            attempt to download the plugin and install it automatically.
+
+  plugins search TERMS...
+            Performs a search of WordPress.org plugins and returns the top 5
+            matches.
+
+  plugins test
+            Performs a test of the installed plugins by first disabling all
+            plugins, then re-enabling those that were active previously,
+            one by one. Handy for issues showing a blank page.
+
+Examples:
+  sak-cli wp plugins info
+  sak-cli wp plugins enable hello.php
+  sak-cli wp plugins disable all
+  sak-cli wp plugins search WP Super Cache
+  sak-cli wp plugins install wp-super-cache
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+#"
+#@ WordPress user command help
+sak_cli_help_wp_user() {
+  sak_cli_usage
+cat << EOF
+
+Help Commands:
+  --help  This help
+
+  user [info]
+          This command will show information about all users
+
+Commands:
+  user display USERNAME NEWNAME
+          Change a user's display name (cosmetic only)
+
+  user email USERNAME EMAIL
+          Change a user's email address.
+
+  user rename USERNAME NEWNAME
+          Change a user's login to that specified with NEWNAME.
+
+  user role USERNAME NEWROLE
+          Change a user's role, where NEWROLE is one of administrator, editor,
+          author, contributor, or subscriber.
+
+  user password USERNAME
+          Prompts for a new password for USERNAME.
+          * Not yet functional
+
+Examples:
+  sak-cli wp user info
+  sak-cli wp user display doug "The Dougster"
+  sak-cli wp user email doug doug@doug.tld
+  sak-cli wp user rename doug dougster
+  sak-cli wp user role doug administrator
+  sak-cli wp user password doug
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ WordPress user command help
+sak_cli_help_wp_cache() {
+  local b=$'\e[1m' u=$'\e[4m' e=$'\e[0m' w=$'\e[31;1m'
+  sak_cli_usage
+cat << EOF
+
+Help Commands:
+  --help  This help
+
+Modes:
+  ${b}NAME must be one of:${e} ${u}supercache${e}
+
+  --set NAME
+          Attempts to set up WordPress with the recommended settings for the
+          specified plugin. This will automatically disable known page cache
+          plugins and install the plugin if it does not exist.
+
+  --mass NAME
+          Same as --set, except that caching will be set for any WordPress
+          installations found. Using this option, the --directory, --reseller,
+          and --user options are enabled. Implies --yes.
+
+          NOTE: The --docroot option is ignored when using --mass.
+
+Targets:
+  -D, --directory LIST
+          Comma separated list of directories to use as targets (subdirectories
+          are included). ${b}Mass mode only.${e}
+
+  -R, --reseller LIST
+          Comma separated list of resellers to use. This will include all resold
+          accounts. ${b}Mass mode only.${e}
+
+  -U, --user LIST
+          Comma separarted list of users to target. ${b}Mass mode only.${e}
+
+Options:
+  -d, --docroot PATH
+          Manually specifies web root for this installation instead of detecting
+          the document root automatically from httpd.conf (if it exists).
+          This option is ignored when using --mass.
+
+          ${b}${u}NOTE${e}: Document root is ${u}NOT${e} always the same as the WordPress install
+          root! Getting this wrong can cause caching to fail. ${b}It is recommended
+          to use this option only as a last resort.${e}
+          (e.g. /home/user/public_html vs /home/user/public_html/blog)
+
+  -e, --errors (IGNORE|FAIL)
+          When errors are encountered, either ignore and continue, or fail and
+          exit. Default is FAIL. ${b}Mass mode only.${e}
+
+  -i, --ignore-version
+          Ignores the installed WP Super Cache version and applies settings
+          anyway. May cause the install to fail. ${b}Use with caution.${e}
+
+  -p, --permalinks (fail|skip|common|CODE)
+          As WP Super Cache (and possibly others) require Permalinks to be
+          active, if they are not set this option will set the structure
+          according to the option provided.
+
+          ${b}fail${e} - Default. Will cause an error display when Permalinks are
+          disabled and exit with an error status code.
+
+          ${b}skip${e} - Will also display an error, but the exit status will be 0.
+
+          ${b}common${e} - Will use: /%year%/%monthnum%/%postname%/
+
+          Any other argument will be applied as the Permalink code.
+          See ${u}http://goo.gl/ZFgK6${e} for more information.
+
+Prompts:
+  -y, --yes
+          Does not prompt for confirmation before disabling all cache plugins.
+          Default when using --mass.
+  -n, --no
+          Prompts for confirmation before disabling cache plugins. Default when
+          using --set.
+
+Output:
+  -q, --quiet
+          Reduce verbosity. Implies --yes and overrides --no. Default (once)
+          when using --mass.
+          ${b}*${e} Can be specified multiple times.
+
+  -v, --verbose
+          Increase verbosity. Inverse of --quiet and does not set --yes or --no.
+          ${b}*${e} Can be specified multiple times.
+
+Notes:
+  All options above require --set to be present.
+  When using --yes and --no (without --quiet), the last option takes precedence.
+
+Examples:
+  sak-cli wp cache --set supercache
+  sak-cli wp cache --set supercache --ignore-version
+  sak-cli wp cache --set supercache --quiet
+  sak-cli wp cache --set supercache --verbose --yes
+  sak-cli wp cache --set supercache -vy --permalinks "/blog/%postname%.html"
+  sak-cli wp cache --set supercache -id /home/doug/public_html/blog
+
+  sak-cli wp cache --mass supercache --user user1,user2 --no
+  sak-cli wp cache --mass supercache --reseller reseller1 --errors=ignore
+  sak-cli wp cache --mass supercache --directory ~user1/sites -e ignore -p common
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ WordPress resurrect command help
+sak_cli_help_wp_resurrect() {
+  sak_cli_usage
+cat << EOF
+
+The resurrect command will help restore a WordPress installation with only the
+database left intact. This is handy if an installation has been lost and a
+backup is not available.
+
+This command is only supported on cPanel systems and will fail on Plesk.
+
+Help Commands:
+  --help  This help
+
+Arguments:
+  DATABASE
+          The database to use for resurrecting WordPress. Specifying the
+          database can be done this way, or with the switch. At least one is
+          required.
+
+Connections:
+  -d, --database DATABASE
+          The database to use for resurrecting WordPress. The switch is optional
+          as the database can be specified on its own. At least one is required.
+
+  -P, --password
+          Prompt for a MySQL virtual user password. You cannot specify the
+          password as an argument for security reasons.
+
+  -u, --username USERNAME
+          MySQL virtual username.
+
+Options:
+  --create-auth
+          Create a new virtual MySQL username and password. Can be used in
+          combination with a username and/or password. The database name will
+          be used as the username if it does not already exist. Otherwise, a
+          username will be generated with the template <USER>_wp<N> where <USER>
+          will be the cPanel username and <N> is a number beginning from 1 and
+          incremented until a free name is found.
+
+  --create-pass
+          If optionally specifying a username, this option will generate a
+          random password for the virtual user.
+
+          NOTE: If a username specified is an existing user, the password will
+          be reset. Any existing software that use that password will then cease
+          to connect properly!
+
+  --create-grant
+          Use this option to add necessary database privileges for a specified
+          virtual user. This option is not necessary if using --create-auth.
+          Handy if borrowing existing credentials from another WordPress site.
+
+  --ignore-schema
+          WordPress stores a database schema version which can be used to guess
+          what version of WordPress to install. This option will disable that
+          check
+
+          NOTE: Use with caution! Using a version with a different schema will
+          require the database to be altered!
+
+  -p, --prefix PREFIX
+          Manually specify the table prefix. This switch is not required if
+          there is only a single installation of WordPress in the database. If
+          not used, a list of prefixes will be shown to you if required.
+
+  -V, --version
+          WordPress version to install. This flag is optional as the database
+          schema will be used to "guess" the proper version.
+
+Output:
+  -v, --verbose
+          Increases output in some circumstances. May be used multiple times.
+
+  -q, --quiet
+          Decrease output. May be used multiple times. Will not prevent warning
+          or error output.
+
+Examples:
+  sak-cli wp resurrect --database user_wrdp1 --user user_wrdp1 --pass
+  sak-cli wp resurrect user_wrdp1 --user user_wrdp1 --pass
+
+  sak-cli wp resurrect user_wrdp1 --create-auth
+  sak-cli wp resurrect user_wrdp1 --user user_wrdp1 --create-pass
+  sak-cli wp resurrect user_wrdp1 --user user_wrdp2 --pass --create-grant
+
+  sak-cli wp resurrect user_wrdp2 --user user_blog -p wp2_ -V 3.3 --create-pass
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ WordPress connect command help
+sak_cli_help_wp_connect() {
+  sak_cli_usage
+cat << EOF
+
+The connect command is used to recreate the wp-config.php when it has either
+been removed or corrupted. The wp-config.php file is recreated with either a
+specified database or the most appropriate database is located on the server. 
+Either a database or a domain can be spesified and sak-cli will automatically
+attempt to locate the correct information.
+
+Help Commands:
+  --help This help
+
+Arguments: 
+
+Connection:
+  --db, --database DATABASE
+          The database to connect to.
+
+  --domain DOMAIN
+          The domain of the site. If no database or domain is specified, cPanel
+          will be queried to attempt to detect the correct domain.
+
+  -P, --password
+          Prompt for a MySQL virtual user password. You cannot specify the
+          password as an argument for security reasons.
+
+  -u, --username USERNAME
+          MySQL virtual username.
+
+Options:
+  --no-create-auth
+          By default authentication details will be created automatically. This
+          can be disabled so details can be manually created.
+          Default operation:
+          Create a new virtual MySQL username and password. Can be used in
+          combination with a username and/or password. The database name will
+          be used as the username if it does not already exist. Otherwise, a
+          username will be generated with the template <USER>_wp<N> where <USER>
+          will be the cPanel username and <N> is a number beginning from 1 and
+          incremented until a free name is found.
+
+  --create-pass
+          If optionally specifying a username, this option will generate a
+          random password for the virtual user.
+
+          NOTE: If a username specified is an existing user, the password will
+          be reset. Any existing software that use that password will then cease
+          to connect properly!
+
+  --create-grant
+          Use this option to add necessary database privileges for a specified
+          virtual user. This option is not necessary if using --create-auth.
+          Handy if borrowing existing credentials from another WordPress site.
+
+  -p, --prefix PREFIX
+          Manually specify the table prefix. This switch is not required if
+          there is only a single installation of WordPress in the database. If
+          not used, a list of prefixes will be shown to you if required.
+
+
+EOF
+}
+
+#@ WordPress import command help
+sak_cli_help_wp_import() {
+  sak_cli_usage
+cat << EOF
+       sak-cli [GLOBAL OPTIONS] wp import [OPTIONS] FILENAME
+
+The import command may be used to import various WordPress settings and XML
+export file containing posts, comments, and taxonomy.
+
+NOTE: This command is primarily meant to be used only by migrations.
+
+Help Commands:
+  --help  This help
+
+Arguments:
+  FILENAME
+          File path to the INI import/export configuration.
+
+Options:
+  -a, --all
+          Import both content and settings.
+
+  -c, --content
+          Default. Import only content.
+
+  -s, --settings
+          Imports only blog settings.
+
+Examples:
+  sak-cli wp import --all /home/migration/username/export.ini
+  sak-cli wp import -s ../temp/export.ini
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+##################################################################
+##################################################################
+#
+# WordPress CLI functions
+#
+
+#+ Info subcommand.
+#| Provides basic information output about a WordPress install. Also acts as a
+#| passthru for other sub-commands of the same level (e.g. cache).
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_info() {
+  local cmd="$1" basic vuln soft path ver mu IFS=$'\t\n' \
+        blogname desc siteurl homeurl stylesheet template theme permalink \
+        dbversion cache=() vuln soft path ver
+
+  if [[ -n "$cmd" ]]; then
+    case "$cmd" in
+      cash) sak_cli_find_cache; return ;;
+      basic|basics|overview) ;; # Fall through
+      cache|caches|caching|count|counts|user|users|theme|themes|plugin|plugins)
+        sak_cli_wp "$@"; return ;;  # Loop back to wp command
+      *) sak_cli_help_wp && exit 1 ;; # Error
+    esac
+  fi
+
+  sak_cli_get_installs "wordpress"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  sak_wp_cache_data 0 basics ||
+    sak_fatal $SAK_ERR_UNK "Unknown error caching WordPress information."
+
+  cfile="$(sak_wp_cache_file BASICS)"
+  while IFS=$'\x1E' read -ra basic; do
+    case "${basic[0]}" in
+      blogname)             blogname="${basic[1]}"   ;;
+      blogdescription)      desc="${basic[1]}"       ;;
+      siteurl)              siteurl="${basic[1]}"    ;;
+      home)                 homeurl="${basic[1]}"    ;;
+      stylesheet)           stylesheet="${basic[1]}" ;;
+      template)             template="${basic[1]}"   ;;
+      current_theme)        theme="${basic[1]}"      ;;
+      permalink_structure)  permalink="${basic[1]}"  ;;
+      db_version)           dbversion="${basic[1]}"  ;;
+    esac
+  done < "$cfile"
+
+  case "$vuln" in
+   -1) vuln='\e[1mUnknown'     ;; # Unknown    = White
+    0) vuln='\e[32mSecure'     ;; # Secure     = Green
+    1) vuln='\e[33mOutdated'   ;; # Outdated   = Black
+    2) vuln='\e[31mVulnerable' ;; # Vulnerable = Red
+  esac
+
+  (( SAK_WP_MU == 1 )) &&
+    printf -v mu '\n \e[1m*** \e[33mWARNING: \e[31mMultisite enabled!\n\e[0;1m *** \e[33mSome functions may not work or may produce unexpected results!\e[0m\n'
+
+  [[ -f "$path/wp-content/advanced-cache.php" ]]  && cache[0]="File"
+  [[ -f "$path/wp-content/object-cache.php" ]]    && cache[1]="Object"
+  [[ -f "$path/wp-content/db.php" ]]              && cache[2]="DB"
+
+  printf "
+==[ Overview ]======================-==--- -- -
+Path    : %s
+Software: \e[1mWordPress\e[0m
+Version : \e[1m%s\e[0m (%b\e[0m)
+
+Database: \e[1m%s\e[0m
+DB Ver  : \e[1m%s\e[0m
+Prefix  : \e[1m%s\e[0m
+%s
+Site Name: \e[1m%s\e[0m
+Tagline:   \e[1m%s\e[0m
+
+Home URL: \e[34;4m%s\e[0m
+Site URL: \e[34;4m%s\e[0m
+
+Permalink: \e[1m%s\e[0m
+
+Possible Caching: \e[1m%b\e[0m\n" \
+  "$path" \
+  "$ver" \
+  "$vuln" \
+  "$SAK_WP_DB" \
+  "$dbversion" \
+  "$SAK_WP_PREFIX" \
+  "$mu" \
+  "$blogname" \
+  "$desc" \
+  "$homeurl" \
+  "$siteurl" \
+  "${permalink:-NONE SET}" \
+  "${cache[*]:-\e[31mNONE}"
+
+  [[ "$cmd" =~ "basic" ]] && echo && return 0
+
+  echo -e "\n==[ Counts ]========================-==--- -- -"
+  sak_cli_wp_count_info 1
+
+  sak_version_req 0 "3.2" &&
+  echo -e "\n==[ Caching ]=======================-==--- -- -" &&
+  sak_cli_wp_cache_info 1
+
+  echo -e "\n==[ Users ]=========================-==--- -- -"
+  sak_cli_wp_user_info 1
+
+  echo -e "\n==[ Themes ]========================-==--- -- -"
+  sak_cli_wp_theme_info 1
+
+  echo -e "\n==[ Plugins ]=======================-==--- -- -"
+  sak_cli_wp_plugin_info 1
+  echo
+}
+
+#+ WP set subcommand.
+#| Used for adjusting basic WordPress settings.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_set() {
+  local cmd="$1" value="$2" owner script set rewrite=0 \
+        vuln soft path ver IFS re="(%post_id%|%postname%)"
+
+  # name meta (home|site|url) permalink
+  case "$cmd" in
+    name|title|blogname|blogtitle)
+      printf -v set 'blogname\t%s\n' "$value" ;;
+    tag|meta|tagline)
+      printf -v set 'blogdescription\t%s\n' "$value" ;;
+    home|homeurl)
+      printf -v set 'home\t%s\n' "$value" ;;
+    site|siteurl)
+      printf -v set 'siteurl\t%s\n' "$value" ;;
+    url|urls)
+      printf -v set 'home\t%s\nsiteurl\t%s\n' "$value" "$value" ;;
+    permalink|permalinks)
+      if [[ -n "$value" && ! "$value" =~ $re ]]; then
+        echo "$SAK_BASENAME: invalid permalink setting -- $value" >&3
+        sak_cli_help_wp_set; exit 1
+      fi
+      rewrite=1
+      printf -v set 'permalink_structure\t%s\n' "$value" ;;
+    ""|*help*) sak_cli_help_wp_set; exit 0 ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3
+       sak_cli_help_wp_set; exit 1 ;;
+  esac
+
+  sak_cli_get_installs "wordpress"
+  sak_wp_cache_data 0 basics || return 1
+
+  cfile="$(sak_wp_cache_file BASICS)"
+  echo -n "$set" > "$cfile"
+
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -i "$cfile" \
+    --root --db "$SAK_WP_DB" --prefix "$SAK_WP_PREFIX" --set basics)"
+
+  if [[ -n "$err" ]]; then
+    sak_wait_message 5 "Error" "$err" 5 35
+    return 1
+  fi
+
+  # Update rewrite rules only if not multisite
+  if [[ "$rewrite" -eq "1" && "$SAK_WP_MU" -ne "1" ]]; then
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+    owner="$(stat -c %U "$path")"
+    script="$(sak_mktmp "$owner")"
+
+    if sak_mysql_check_suspension "$owner" &>/dev/null; then
+      sak_message "Error" "[MySQL] The user \`$owner' appears to be suspended. Please check for MySQL restrictions or max_questions limits before proceeding." &&
+      exit $SAK_ERR_ARG
+    fi
+
+    cat "$SAK_MOD_DIR/soft/wordpress/gateway.php" > "$script"
+    umask 0022
+    err="$(/usr/bin/sudo -u "$owner" "$SAK_PHP" -q "$script" "$path" rewrite STDOUT 2>&1)"
+    umask 0077
+
+    # delete script
+    rm -f "$script"
+
+    if [[ -n "$err" ]]; then
+      echo
+      sak_wait_message 5 "Error" "$err" 5 35
+      sak_fatal_backtrace $SAK_ERR_SUB_ERR "Error adjusting settings. Resolve any errors shown above or apply manually."
+    fi
+  fi
+
+  # Else, we pop up the overview
+  sak_cli_wp_info "basic"
+}
+
+#+ Show cron entries.
+#| Displays cron entries set up by WordPress and plugins.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_cron() {
+  local cmd="$1" n=1 count cron=() re='^[0-9]+$'
+
+  case "$cmd" in
+    '') ;;
+    -h|help|--help) sak_cli_help_wp && exit 0 ;;
+    *) echo "$SAK_BASENAME: unrecognized option -- \`$cmd'" >&3
+       sak_cli_help_wp && exit 1 ;;
+  esac
+
+  sak_cli_get_installs "wordpress" || return 1
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  sak_wp_cache_data 0 cron || return 1
+
+  cfile="$(sak_wp_cache_file CRON)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving cron information."
+
+  count=$(wc -l "$cfile" 2>/dev/null) ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving cron information."
+
+  #06/17/12 16:05:13 wp_scheduled_delete  INVALID  1 day(s)
+  # LASTRUN  FUNCTION  HASH  SCHEDULE  INTERVAL  READABLE
+  echo
+  while IFS=$'\x1E' read -ra cron; do
+    [[ "${cron[0]}" =~ $re ]] &&
+      cron[0]="$(date -d@"${cron[0]}" +"%D %T")"
+    [[ "${cron[2]}" != "INVALID" ]] &&
+      cron[2]=" \e[32mGOOD\e[0m  " || cron[2]="\e[31mINVALID\e[0m"
+    (( (n++ - 1) % 25 == 0 )) &&
+      printf '\e[1mNext Run           Function Call             Status   Runs Every\e[0m\n'
+      printf '%10s  %-24s  %b  %s\n' \
+        "${cron[@]:0:2}" "${cron[2]}" "${cron[5]}"
+  done < "$cfile"
+}
+
+#+ Show stats.
+#| Displays post, page, comment count.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_count_info() {
+  local i="$1" pototal patotal cototal IFS=$'\t\n' \
+        capp=0 cwait=0 cspam=0 ctrash=0 cacount tcount
+  local -a potype pocount patype pacount
+
+  sak_cli_get_installs "wordpress"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  sak_wp_cache_data 0 counts || return 1
+
+  cfile="$(sak_wp_cache_file COUNTS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving count information."
+
+  while IFS=$'\x1E' read -ra count; do
+    case "${count[0]}" in
+      posts)
+        n="${#pocount[@]}"
+        potype[$n]="${count[1]}"
+        pocount[(n++)]="${count[2]}"
+        let "pototal = pototal + ${count[2]}" ;;
+      pages)
+        n="${#pacount[@]}"
+        patype[$n]="${count[1]}"
+        pacount[(n++)]="${count[2]}"
+        let "patotal = patotal + ${count[2]}" ;;
+      categories)
+        cacount="${count[1]}" ;;
+      tags)
+        tcount="${count[1]}" ;;
+      comments)
+        case "${count[1]}" in
+          approved) capp="${count[2]}"  ;;
+          waiting)  cwait="${count[2]}" ;;
+          spam)     cspam="${count[2]}" ;;
+          trash)    ctrash="${count[2]}";;
+        esac
+        let "cototal = cototal + ${count[2]}" ;;
+      *) sak_log 4 "DEBUG" "Unknown count type: ${count[0]}" ;;
+    esac
+  done < "$cfile"
+
+  if [[ -z "$i" ]]; then
+    echo -e "\n  \e[1mPosts\e[0m:"
+    for po in ${!potype[@]}; do
+      printf '  %12s: \e[1m%d\e[0m\n' "${potype[$po]}" "${pocount[$po]}"
+    done
+    printf '  \e[1m%12s: %d\e[0m\n' "Total" "$pototal"
+
+    echo -e "\n  \e[1mPages\e[0m:"
+    for pa in ${!patype[@]}; do
+      printf '  %12s: \e[1m%d\e[0m\n' "${patype[$pa]}" "${pacount[$pa]}"
+    done
+    printf '  \e[1m%12s: %d\e[0m\n' "Total" "$patotal"
+
+    echo -e "\n  \e[1mComments\e[0m:"
+    printf '  \e[1;32m%12s\e[0m: \e[1m%d\e[0m\n' "Approved" "$capp"
+    printf '  \e[1;33m%12s\e[0m: \e[1m%d\e[0m\n' "Waiting" "$cwait"
+    printf '  \e[1;31m%12s\e[0m: \e[1m%d\e[0m\n' "Spam" "$cspam"
+    printf '  \e[1;30m%12s\e[0m: \e[1m%d\e[0m\n' "Trash" "$ctrash"
+    printf '  \e[1m%12s: %d\e[0m\n' "Total" "$cototal"
+
+    echo -e "\n  \e[1mTaxonomy\e[0m:"
+    printf '  %12s: \e[1m%d\e[0m\n' "Categories" "$cacount"
+    printf '  %12s: \e[1m%d\e[0m\n\n' "Tags" "$tcount"
+  else
+    printf 'Posts: \e[1m%-8d\e[0m    Comments  : \e[1m%d\e[0m (\e[1;32m%d\e[0m/\e[1;33m%d\e[0m/\e[1;31m%d\e[0m/\e[1;30m%d\e[0m)\n' \
+      "$pototal" "$cototal" "$capp" "$cwait" "$cspam" "$ctrash"
+    printf 'Pages: \e[1m%-8d\e[0m    (\e[1;32mApproved\e[0m/\e[1;33mWaiting\e[0m/\e[1;31mSpam\e[0m/\e[1;30mTrash\e[0m)\n' "$patotal"
+    printf 'Tags : \e[1m%-8d\e[0m    Categories: \e[1m%-8d\e[0m\n' "$tcount" "$cacount"
+  fi
+}
+
+#+ WordPress backups.
+#| Handler for file and database backups.
+#| @uses sak_cli_wp_db_backup
+#| @uses sak_core_backup
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_backup() {
+  local soft path ver
+
+  if [[ "$1" == "db" ]]; then
+    shift
+    sak_cli_wp_db_backup "$@"
+    return "$?"
+  fi
+
+  sak_cli_get_installs "wordpress"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  let "SAK_QUIET++"
+  sak_core_backup 0
+}
+
+#+ WordPress DB backup
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_db_backup() {
+  local db soft path ver
+
+  sak_cli_get_installs "wordpress"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  sak_wp_cache_config 0 || sak_fatal_backtrace $SAK_ERR_SUB_CNF "Error obtaining WordPress information."
+  db="$SAK_WP_DB"
+  path="$PWD"
+
+  sak_data_backup "$db" "$path"
+}
+
+#+ WordPress theme info
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_theme_info() {
+  local cfile n=1 theme act parent IFS=$'\t\n'
+
+  sak_cli_get_installs "wordpress"
+  sak_wp_cache_data 0 themes || return 1
+
+  cfile="$(sak_wp_cache_file THEMES)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving theme information."
+
+  [[ -z "$1" ]] && echo
+  while IFS=$'\x1E' read -ra theme; do
+    [[ "${theme[0]}" -eq "0" ]] && act="      " || act="\e[32mActive\e[0m"
+    if [[ -n "${theme[4]}" ]]; then
+      if [[ "${theme[4]:0:1}" == "!" ]]; then
+        printf -v parent '  Parent: \e[1m%s\e[0m \e[1;31mmissing!\e[0m' "${theme[4]:1}"
+        act="\e[1;31mBROKEN\e[0m"
+      else
+        printf -v parent '  Parent: \e[1m%s\e[0m' "${theme[4]}"
+      fi
+    else
+      parent=""
+    fi
+    printf '#%-3d [%b] \e[34m%-32s\e[0m Version \e[33m%-12s\e[0m (Template: \e[1m%s\e[0m%b)\n' \
+      "$n" "$act" "${theme[3]}" "${theme[2]}" "${theme[1]}" "$parent"
+    if [[ -n "$1" && "$n" -ge "25" ]]; then
+      n="$(wc -l "$cfile")"
+      printf '\e[33mShowing the first 25 (of %s) themes, use \e[1m"sak-cli wp themes"\e[0;33m to list all.\e[0m\n' "${n%% *}"
+      break
+    fi
+    let "n++"
+  done < "$cfile"
+}
+
+#+ WordPress theme subcommand.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_theme_set() {
+  local cmd="$1" t="$2" cfile bfile stylesheet template ctheme theme IFS
+  shift
+
+  sak_cli_get_installs "wordpress"
+  sak_wp_cache_data 0 basics || return 1
+  sak_wp_cache_data 0 themes || return 1
+
+  cfile="$(sak_wp_cache_file THEMES)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving theme information."
+  bfile="$(sak_wp_cache_file BASICS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving install information."
+
+  if [[ "$cmd" == "reset" || "$cmd" == "default" ]]; then
+    IFS=$'\t'
+    temp="$(sak_menu_wp_reset_theme "0")" && \
+    temp=($temp) && \
+    stylesheet="${temp[0]}" && \
+    template="${temp[1]}" && \
+    ctheme="${temp[2]}"
+  else
+    while IFS=$'\x1E' read -ra theme; do
+      if [[ "$t" == "${theme[1]}" ]]; then
+        if [[ -n "${theme[4]}" ]]; then
+          if [[ "${theme[4]:0:1}" == "!" ]]; then
+            sak_fatal $SAK_ERR_ARG "Specified theme's parent (${theme[4]:1}) is missing. Please install it first."
+          fi
+        else
+          theme[4]="${theme[1]}"
+        fi
+        stylesheet="${theme[1]}"
+        template="${theme[4]}"
+        ctheme="${theme[3]}"
+        break
+      fi
+      let "n++"
+    done < "$cfile"
+  fi
+
+  if [[ -n "$stylesheet" && -n "$template" && -n "$ctheme" ]]; then
+    printf 'stylesheet\t%s\n' "$stylesheet" > "$bfile"
+    printf 'template\t%s\n' "$template" >> "$bfile"
+    printf 'current_theme\t%s\n' "$ctheme" >> "$bfile"
+
+    err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -i "$bfile" \
+      --root --db "$SAK_WP_DB" --prefix "$SAK_WP_PREFIX" --set basics)"
+
+    if [[ -n "$err" ]]; then
+      sak_message "Error" "$err"
+      return 1
+    fi
+
+    sak_message "Theme" "Theme change successful."
+    sak_cli_wp_theme_info
+  else
+    sak_fatal $SAK_ERR_ARG "Specified theme is broken or does not exist."
+  fi
+  return 0
+}
+
+#+ WordPress plugin subcommand.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_plugin_info() {
+  local cfile n=1 plugin color on=0 off=0 re='^(-[ad])?$'
+
+  sak_cli_get_installs "wordpress"
+  sak_wp_cache_data 0 plugins || return 1
+
+  cfile="$(sak_wp_cache_file PLUGINS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving plugin information."
+
+  [[ "$1" =~ $re ]] && echo
+  while IFS=$'\x1E' read -ra plugin; do
+    [[ -n "$2" && "$2" != "${plugin[1]}" ]] && continue;
+    if [[ "${plugin[0]}" -eq "0" ]]; then
+      plugin[0]="Disabled"
+      color="[31m"
+      let "off++"
+      [[ "$1" == "-a" ]] && continue
+    else
+      plugin[0]="Active"
+      color="[32m"
+      let "on++"
+      [[ "$1" == "-d" ]] && continue
+    fi
+    printf '#%-3d [\e%s%8s\e[0m] \e[34m%-32s\e[0m Version \e[33m%-12s\e[0m (File: \e[1m%s\e[0m)\n' \
+      "$n" \
+      "$color" \
+      "${plugin[0]}" \
+      "${plugin[3]}" \
+      "${plugin[2]}" \
+      "${plugin[1]}"
+    if [[ -n "$1" && "$n" -ge "50" ]]; then
+      n="$(wc -l "$cfile")"
+      printf '\e[33mShowing the first 50 (of %s) plugins, use \e[1m"sak-cli wp plugins"\e[0;33m to list all.\e[0m\n' "${n%% *}"
+      break
+    fi
+    let "n++"
+  done < "$cfile"
+
+  [[ -z "$2" ]] && printf "                \e[32mActive: %-3d\e[0m    \e[31mDisabled: %-3d\e[0m\n" "$on" "$off"
+}
+
+#+ WordPress.org api plugin search.
+#| sak_cli_wp_plugin_search [--help] TERMS...
+#- @param string $terms... Search terms.
+sak_cli_wp_plugin_search() {
+  local cfile result request terms="$*" n=1 re="^[-a-zA-Z0-9_. ]+$"
+
+  case "$1" in
+    --) shift ;;
+    -h|help|--help) sak_cli_help_wp_plugin; return ;;
+  esac
+
+  if [[ ! "$terms" =~ $re ]]; then
+    sak_fatal $SAK_ERR_ARG "Search must contain only alphanumeric characters, dash, space, and underscore."
+  fi
+
+  sak_version # We do this because we don't need to scan for software
+  echo
+
+  cfile="$(sak_mkcache)"
+
+  printf -v request "http://sak.dev.gatorsec.net/software/wp-plugin-search.php?api=%d&s=%s" "$SAK_WP_API_VER" "$terms"
+  sak_download "$request" "$cfile"
+
+  printf "\e[1m #    Name                              Version       Install Slug          URL\e[0m\n"
+               #1    Akismet                           2.5.4         akismet               http://wordpress.org/extend/plugins/akismet/
+  while IFS=$'\x1E' read -ra result; do
+    if [[ "${#result[0]}" -gt "32" ]]; then
+      result[0]="${result[0]:0:28} ..."
+    fi
+    printf '#%-3d  \e[34m%-32s\e[0m  \e[33m%-12s\e[0m  \e[35m%-20s\e[0m  \e[4m%s\e[0m\n' \
+      "$n" "${result[@]}"
+    let "n++"
+  done < "$cfile"
+}
+
+#@ Profiler install subcommand
+sak_cli_wp_plugin_profiler() {
+  local cmd="$1" basic cfile url="http://git.hgfix.net/hgwprofiler/p3-profiler.zip"
+
+  case "$cmd" in
+    -h|help|--help) sak_cli_help_wp; return 0 ;;
+    ?*) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+        sak_cli_help_wp; exit 1 ;;
+  esac
+
+  sak_cli_get_installs "wordpress"  # Checked early for the next tests
+  sak_version_req 0 "3.3" ||
+    sak_fatal $SAK_ERR_ARG "The profiler plugin requires WordPress 3.3 or higher."
+
+  [[ "$SAK_WP_MU" -eq "1" ]] &&
+    sak_fatal $SAK_ERR_ARG "MultiSite appears to be enabled on this installation, which is currently unsupported."
+
+  sak_wp_cache_data "$i" plugins ||
+    sak_fatal $SAK_ERR_UNK "Could not query plugin data for this installation!"
+
+  cfile="$(sak_wp_cache_file PLUGINS)" ||
+    sak_message "Error" "Unknown error caching plugin information."
+
+  while IFS=$'\x1E' read -ra plugin; do
+    if [[ "${plugin[1]}" == "p3-profiler/p3-profiler.php" ]]; then
+      sak_fatal $SAK_ERR_ARG "Profiling plugin already installed: ${plugin[3]} version ${plugin[2]}"
+    fi
+  done < "$cfile"
+
+  sak_cli_wp_plugin_install_handler "" "$url" 1
+  sak_message "Profiler" "Activating plugin..."
+  if ! sak_cli_wp_plugin_toggle "quiet" "enable" "p3-profiler/p3-profiler.php"; then
+    sak_message "Error" "Error activating Profiler."
+    return $SAK_ERR_SUB_ERR
+  fi
+  sak_message "Profiler" "Install successful."
+  if [[ -f "$path/wp-content/advanced-cache.php" ]]; then
+    echo
+    sak_message "Warning" "A caching plugin appears to be active on this installation.\nPlease disable any caching before profiling the site!"
+  fi
+
+  sak_cli_wp_plugin_info
+
+  sak_wp_cache_data 0 basics ||
+    sak_fatal $SAK_ERR_UNK "Could not read URL information."
+
+  cfile="$(sak_wp_cache_file BASICS)"
+  while IFS=$'\x1E' read -ra basic; do
+    if [[ "${basic[0]}" == "siteurl" ]]; then
+      printf -v url '%s/wp-admin/tools.php?page=profiler' "${basic[1]%/}"
+      echo; sak_message "Profiler" "Dashboard link: $url"; echo
+      return 0
+    fi
+  done < "$cfile"
+
+  sak_message "Warning" "Unable to get site URL. Please log in manually."
+  return 0
+}
+
+#+ Plugin install subcommand
+#| sak_cli_wp_plugin_install [--help] SLUG
+#- @param string $slug Slug to search and download.
+sak_cli_wp_plugin_install() {
+  local cmd="$1" re="^[-a-z0-9.]+$"
+
+  case "$cmd" in
+    -h|help|--help) sak_cli_help_wp_plugin; return 0 ;;
+  esac
+
+  [[ -n "$2" || ! "$cmd" =~ $re ]] &&
+    sak_fatal $SAK_ERR_ARG "Install slug appears invalid. Must contain only lowercase alphanumeric characters and dashes."
+
+  sak_cli_wp_plugin_install_handler "$cmd"
+}
+
+#+ WordPress plugin download and install.
+#| sak_cli_wp_plugin_install [SLUG] [URL]
+#| @param string  $slug   Slug to search and download.
+#| @param string  $url    URL to download from.
+#| @param bool    $quiet  If set, will not print plugin status after install.
+#- @return bool True on success. False on failure.
+sak_cli_wp_plugin_install_handler() {
+  local slug="$1" url="$2" quiet="$3" cfile re="^[-a-z0-9.]+$"
+
+  which unzip &>/dev/null ||
+    sak_fatal_backtrace $SAK_ERR_SUB_CNF "Could not find a usable unzip binary. Make sure one exists in \$PATH, or install manually."
+
+  [[ ! -e "./wp-content/plugins" || ! -d "./wp-content/plugins" ]] &&
+    sak_fatal_backtrace $SAK_ERR_SUB_CNF "Plugins directory does not exist or is not a directory."
+
+  sak_cli_get_installs "wordpress"
+
+  if ! sak_version_req 0 "3.0"; then
+    sak_message "Warning" "WordPress version is extremely outdated! It is not recommended to install new plugins on old sites."
+    sak_message "Warning" "Waiting 10 seconds... Press CTRL+C if you wish to abort."
+    sleep 10 # Give them a chance to bail
+  fi
+
+  if [[ -n "$url" ]]; then
+    cfile="$(sak_wp_plugins_download "dummy-tag" "1" "$url")" ||
+      sak_fatal $SAK_ERR_UNK "Unkown error occurred during download."
+    sak_wp_plugins_install 0 "" "" "$cfile" ||
+      sak_fatal_backtrace $SAK_ERR_ARG "Error during installation."
+  else
+    sak_wp_plugins_install 0 "$slug"
+    case "$?" in
+      0) ;;   2) echo; return 1 ;;  # Error already printed
+      *) sak_fatal_backtrace $SAK_ERR_ARG "Error during installation." ;;
+    esac
+  fi
+
+  [[ -z "$quiet" ]] &&
+    sak_message "Information" "Installation successful!" &&
+    sak_cli_wp_plugin_info
+  return 0
+}
+
+#+ WordPress individual plugin toggle.
+#| Supplied plugin must have + for enable or - for disable.
+#| @param string $quiet=""  Less verbose if set to "quiet".
+#- @param string $plugin    Plugin to toggle with +/- prefix.
+sak_cli_wp_plugin_toggle() {
+  local cmd cfile n=1 p_act p_name p_ver p_file color vuln soft path ver \
+        script plugin args q=0 all=0 tog="+"
+
+  [[ "$1" == "quiet" ]] && q=1 && shift
+
+  cmd="$1"
+  shift
+
+  sak_cli_get_installs "wordpress"
+
+  if ! sak_version_req 0 "2.6"; then
+    sak_message "Error" "Plugin toggle requires WordPress 2.6 or higher."
+    exit $SAK_ERR_ARG
+  fi
+
+  [[ "$cmd" == "disable" || "$cmd" == "deactivate" ]] &&
+    tog="-"
+
+  if [[ "$@" == "all" ]]; then
+    all=1
+  else
+    for plugin; do
+      printf -v args "%s%s%s\x1E" "$args" "$tog" "$plugin"
+    done
+  fi
+
+  [[ -z "$args" && "$all" -ne "1" ]] && return 1
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  sak_wp_cache_data 0 plugins || return 1
+
+  if [[ "$all" -eq "1" ]]; then
+    cfile="$(sak_wp_cache_file PLUGINS)"
+    if [[ "$?" -gt "0" ]]; then
+      sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving plugin information."
+    fi
+    while IFS=$'\x1E' read -ra plugin; do
+      printf -v args "%s%s%s\x1E" "$args" "$tog" "${plugin[1]}"
+    done < "$cfile"
+  fi
+
+  owner="$(stat -c %U "$path")"
+  script="$(sak_mktmp "$owner")"
+
+  if sak_mysql_check_suspension "$owner" ; then
+    sak_message "Error" "[MySQL] The user \`$owner' appears to be suspended. Please check for MySQL restrictions or max_questions limits before proceeding." &&
+    exit $SAK_ERR_ARG
+  fi
+
+  cat "$SAK_MOD_DIR/soft/wordpress/gateway.php" > "$script"
+
+  local IFS=$'\x1E'
+  lfile="$(sak_mkcache)"
+  err="$(/usr/bin/sudo -u "$owner" "$SAK_PHP" -q "$script" "$path" plugin $args 2>&1 1>"$lfile")"
+  [[ "$q" -eq "0" ]] && sak_message "Plugin" "$(cat "$lfile")"
+
+  # delete script
+  rm -f "$script"
+
+  if [[ -n "$err" ]]; then
+    echo
+    sak_wait_message 5 "Error" "$err" 5 35
+    exit $SAK_ERR_UNK
+  fi
+
+  [[ "$q" -eq "0" ]] &&
+    echo &&
+    sak_cli_wp_plugin_info 1
+
+  return 0
+}
+
+#+ WordPress plugin testing.
+#- Disables all plugins and then re-enables them one-by-one.
+sak_cli_wp_plugin_test_toggle() {
+  local cfile owner script ret plugin plugins IFS=$'\x1E' \
+        vuln soft path ver
+
+  sak_cli_get_installs "wordpress"
+
+  if ! sak_version_req 0 "2.6"; then
+    sak_message "Error" "Plugin toggle requires WordPress 2.6 or higher."
+    exit $SAK_ERR_ARG
+  fi
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  sak_wp_cache_data 0 plugins || return 1
+
+  cfile="$(sak_wp_cache_file PLUGINS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving plugin information."
+
+  owner="$(stat -c %U "$path")"
+  script="$(sak_mktmp "$owner")"
+
+  if sak_mysql_check_suspension "$owner" &>/dev/null; then
+    sak_message "Error" "[MySQL] The user \`$owner' appears to be suspended. Please check for MySQL restrictions or max_questions limits before proceeding." &&
+    exit $SAK_ERR_ARG
+  fi
+
+  # Grab enabled plugins
+  while IFS=$'\x1E' read -ra plugin; do
+    [[ "${plugin[0]}" -ne "1" ]] && continue
+    printf -v plugins '%s%s\x1E' "$plugins" "${plugin[1]}"
+  done < "$cfile"
+
+  if [[ "${#plugins}" -eq "0" ]]; then
+    sak_message "Error" "No plugins are currently enabled. Giving up before we divide by zero."
+    exit 0
+  fi
+
+  sak_message "Info" "Current plugin status:"
+  echo
+  sak_cli_wp_plugin_info 1
+
+  printf '\e[sPress any key to disable all plugins... (Interrupt now to abort)'
+  read -rsn 1
+  printf '\e[u\e[K\n'
+
+  for plugin in $plugins; do
+    printf -v args "%s/%s\x1E" "$args" "$plugin"
+  done
+
+  cat "$SAK_MOD_DIR/soft/wordpress/gateway.php" > "$script"
+
+  # Disable them
+  sak_message "Info" "Disabling all plugins:"
+  err="$(/usr/bin/sudo -u "$owner" "$SAK_PHP" -q "$script" "$path" plugin $args 2>&1 1>/dev/null)"
+
+  if [[ -n "$err" ]]; then
+    sak_message "Error" "$err" 5 35
+    sak_fatal_backtrace $SAK_ERR_SUB_ERR "Unexpected error running sub-command to toggle plugins."
+  fi
+
+  sak_cli_wp_plugin_info 1
+
+  # Re-enable them
+  for plugin in $plugins; do
+    printf "\e[sPress a key to enable '%s'..." "$plugin"
+    # Ignore interrupts
+    trap "printf '\e[u\e[K\e[sPress a key to enable %s... \e[1m[ctrl-c ignored]\e[0m' \"'$plugin'\"" \
+      SIGINT
+    read -rsn 1
+    echo -e '\e[u\e[K'
+    trap "" SIGINT # No need to print anything here
+
+    sak_message "Info" "Re-enabling $plugin:"
+    err="$(/usr/bin/sudo -u "$owner" "$SAK_PHP" -q "$script" "$path" plugin "*$plugin" 2>&1 1>/dev/null)"
+
+    if [[ -n "$err" ]]; then
+      sak_message "Error" "$err" 5 35
+      sak_fatal_backtrace $SAK_ERR_SUB_ERR "Unexpected error running sub-command to toggle plugins."
+    fi
+
+    sak_cli_wp_plugin_info 1 "$plugin"
+    echo
+  done
+
+  # delete script
+  rm -f "$script"
+
+  echo
+  sak_message "Info" "Done:"
+
+  sak_cli_wp_plugin_info 1
+
+  # Allow interrupts again
+  trap sak_trap SIGINT SIGTERM
+}
+
+#+ WordPress user info.
+#- @param bool $short=NULL  If unset, will show short output.
+sak_cli_wp_user_info() {
+  local i="$1" n cfile total vuln soft path ver user IFS=$'\t\n'
+  shift
+
+  sak_cli_get_installs "wordpress"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  sak_wp_cache_data 0 users || return 1
+
+  cfile="$(sak_wp_cache_file USERS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving plugin information."
+
+  total="$(wc -l "$cfile")"
+  total="${total%% *}"
+
+  [[ -z "$i" ]] && echo
+
+  if [[ -n "$i" || "$total" -le "150" ]]; then
+    while IFS=$'\x1E' read -ra user; do
+      printf '#%-3d \e[34m%-12s\e[0m \e[1m%-16s\e[0m  Disp: \e[34m%-16s\e[0m  Email: \e[1m%s\e[0m  Registered: \e[1m%s\e[0m\n' \
+        "${user[0]}" "${user[1]}" "(${user[6]})" "${user[2]}" "${user[3]}" "${user[4]}"
+      [[ -n "$i" && "$total" -gt "25" && "$n" -ge "25" ]] &&
+        printf '\e[33mShowing the first 25 (of %s) users, use \e[1m"sak-cli wp users"\e[0;33m to list all.\e[0m\n' "$total" &&
+        break
+      let "n++"
+    done < "$cfile"
+  else
+    while IFS=$'\x1E' read -ra user; do
+      [[ -z "$n" ]] && printf "\n  Total Users: %s\n\n" "$total"
+      let "n++"
+      printf '#%-3d \e[34m%-12s\e[0m \e[1m%-12s\e[0m  Disp: \e[34m%-16s\e[0m  Email: \e[1m%s\e[0m  Registered: \e[1m%s\e[0m\n' \
+        "${user[0]}" "${user[1]}" "(${user[6]})" "${user[2]}" "${user[3]}" "${user[4]}"
+    done < "$cfile" | /usr/bin/less -SR
+  fi
+}
+
+#+ WordPress user edit command.
+#| sak_cli_wp_user_edit TYPE USER NEW
+#| @param string $type  Setting type.
+#| @param string $user  Username.
+#- @param string $new   New setting to apply.
+sak_cli_wp_user_edit() {
+  local type="$1" u="$2" new="$3" cfile vuln soft path ver user IFS=$'\t\n'
+  shift
+
+  if [[ "$type" == "role" ]]; then
+    # We check/correct roles before we bother doing anything else
+    case "$new" in
+      admin)        new="administrator" ;;
+      cont|contrib) new="contributor"   ;;
+      sub)          new="subscriber"    ;;
+      administrator|editor|author|contributor|subscriber) ;;
+      *) sak_fatal $SAK_ERR_ARG "Unknown role \`$new'" ;;
+    esac
+  fi
+
+  sak_cli_get_installs "wordpress"
+
+  if ! sak_version_req 0 "2.0"; then
+    sak_message "Error" "User editing requires WordPress 2.0 or higher."
+    exit $SAK_ERR_ARG
+  fi
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  sak_wp_cache_data 0 users || return 1
+
+  cfile="$(sak_wp_cache_file USERS)" ||
+    sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving plugin information."
+
+  while IFS=$'\x1E' read -ra user; do
+    if [[ "$u" == "${user[1]}" ]]; then
+      case "$type" in
+        username) user[1]="$new" ;;
+        display)  user[2]="$new" ;;
+        email)    user[3]="$new" ;;
+        role)     user[6]="$new" ;;
+      esac
+
+      printf '%d\t%s\t%s\t%s\t%s\t%s\t%s\n' ${user[@]} > "$cfile"
+
+      err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -i "$cfile" \
+        --root --db "$SAK_WP_DB" --prefix "$SAK_WP_PREFIX" --set users)"
+
+      if [[ -n "$err" ]]; then
+        sak_message "Error" "$err"
+        return 1
+      fi
+
+      echo
+      sak_cli_wp_user_info 1
+      return 0
+    fi
+  done < "$cfile"
+
+  sak_fatal $SAK_ERR_ARG "Could not find user \`$u'"
+}
+
+#+ WordPress caching plugin info and setup passthru.
+#| @uses sak_cli_wp_cache_set_cache
+#| @uses sak_cli_wp_cache_mass_set_cache
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_cache_info() {
+  local arg cfile key legacy path r rec var set=() cache=()
+
+  for arg; do
+    case "$arg" in
+      --set*)   sak_cli_wp_cache_set_cache "$@"
+                return "$?" ;;
+      --mass*)  sak_cli_wp_cache_mass_set_cache "$@"
+                return "$?" ;;
+      -h|help|--help)
+        sak_cli_help_wp_cache; exit 0 ;;
+    esac
+  done
+
+  if ! getopt -n "$SAK_BASENAME" -o "" -l "set:" -- "$@" >/dev/null; then
+    echo "$SAK_BASENAME: option \`--set' is required for additional arguments"
+    sak_cli_help_wp_cache; exit 1
+  fi
+
+  sak_cli_get_installs "wordpress"
+
+  if ! sak_version_req 0 "3.0"; then
+    sak_message "Error" "Cache information requires WordPress 3.0 or higher."
+    exit $SAK_ERR_ARG
+  fi
+
+  [[ -z "$1" ]] && echo
+
+  if sak_wp_cache_cache 0; then
+    cfile="$(sak_wp_cache_file CACHE)"
+
+    if [[ "$?" -gt "0" ]]; then
+      sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving cache information."
+    fi
+
+    while IFS=$'\x1E' read -ra set; do
+      case "${set[0]}" in
+        enabled)             cache[0]="${set[1]}"  ;;
+        browser)             cache[1]="${set[1]}"  ;;
+        preview|lifetime)    cache[2]="${set[1]}"  ;;
+        pgcache|rewrite)     cache[3]="${set[1]}"  ;;
+        pgengine|compress)   cache[4]="${set[1]}"  ;;
+        dbcache|legacy)      cache[5]="${set[1]}"  ;;
+        dbengine|path)       cache[6]="${set[1]}"  ;;
+        dlifetime|usercache) cache[7]="${set[1]}"  ;;
+        objcache)            cache[8]="${set[1]}"  ;;
+        objengine)           cache[9]="${set[1]}"  ;;
+        olifetime)           cache[10]="${set[1]}" ;;
+        minify)              cache[11]="${set[1]}" ;;
+        mengine)             cache[12]="${set[1]}" ;;
+        mlifetime)           cache[13]="${set[1]}" ;;
+        cdn)                 cache[14]="${set[1]}" ;;
+        cloudflare)          cache[15]="${set[1]}" ;;
+      esac
+    done < "$cfile"
+
+    for key in "${!cache[@]}"; do
+      case "${cache[$key]}" in
+        true)  cache[$key]='\e[34mYes\e[0m' ;;
+        false) cache[$key]='\e[33mNo \e[0m' ;;
+
+        # W3TC Engines
+        apc)          cache[$key]='APC' ;;
+        eaccelerator) cache[$key]='eAccelerator' ;;
+        file)         cache[$key]='Disk' ;;
+        file_generic) cache[$key]='Disk: Enhanced' ;;
+        memcached)    cache[$key]='memcached' ;;
+        xcache)       cache[$key]='XCache' ;;
+      esac
+    done
+  else
+    [[ "$?" -ne "2" ]] &&
+      sak_fatal_backtrace $SAK_ERR_UNK "Unknown error retrieving cache information."
+    [[ -f "$path/wp-content/advanced-cache.php" ||
+       -f "$path/wp-content/object-cache.php" ||
+       -f "$path/wp-content/db.php" ]] &&
+      echo -e "  \e[1mCache drop-ins found, but Super Cache not detected/activated, check manually.\e[0m" ||
+      echo -e "  \e[31mNo caching enabled.\e[0m"
+    return 0
+  fi
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  [[ -n "$SAK_WP_CACHE" && ! -f "$path/wp-content/advanced-cache.php" ]] &&
+    sak_message "Warning" "Cache plugin found, but drop-in file does not exist! Caching will not work without it." &&
+    echo
+
+  if [[ "$SAK_WP_CACHE" == "w3tc" ]]; then
+printf "\
+\e[1mCaching Plugin\e[0m:  \e[1;4;34mW3 Total Cache\e[0m (\e[32mActive\e[0m)
+\e[1mCaching Enabled\e[0m: %b  \e[1mPreview Mode\e[0m: %b
+\e[1mBrowser Cache\e[0m:   %b
+\e[1mMinify\e[0m:          %b (\e[36m%s\e[0m)
+
+\e[1mPage Cache\e[0m:   %b (\e[36m%s\e[0m)
+\e[1mDB Cache\e[0m:     %b (\e[36m%s\e[0m)
+\e[1mObject Cache\e[0m: %b (\e[36m%s\e[0m)
+
+\e[1mCloudflare\e[0m: %b    \
+\e[1mCDN\e[0m: %b
+" \
+"${cache[0]:-\e[33mNo \e[0m}" \
+"${cache[2]:-\e[33mNo \e[0m}" \
+"${cache[1]:-\e[33mNo \e[0m}" \
+"${cache[11]:-\e[33mNo \e[0m}" \
+"${cache[12]:-none}" \
+"${cache[3]:-\e[33mNo \e[0m}" \
+"${cache[4]:-none}" \
+"${cache[5]:-\e[33mNo \e[0m}" \
+"${cache[6]:-none}" \
+"${cache[8]:-\e[33mNo \e[0m}" \
+"${cache[9]:-none}" \
+"${cache[14]:-\e[33mNo \e[0m}" \
+"${cache[15]:-\e[33mNo \e[0m}"
+
+  elif [[ "$SAK_WP_CACHE" == "wpsc" ]]; then
+    [[ "${cache[3]}" =~ No && ! "${cache[5]}" =~ Yes ]] &&
+      cache[8]='\e[34mYes\e[0m' ||
+      cache[8]='\e[33mNo \e[0m'
+    [[ "${cache[3]}" =~ "Yes" ]] &&
+      cache[1]='\e[34mYes\e[0m'
+
+    rec=("Yes" "Yes" "No" "No" "No" "Yes" "^3600$"); r=0
+    var=(1 3 8 5 7 4 2)
+    for v in ${var[@]}; do
+      [[ "${cache[$v]}" =~ ${rec[$r]} ]] && c[$v]='\e[1;32m' || c[$v]='\e[1;31m'; let "r++"
+    done
+
+    [[ -n "${cache[2]}" ]] &&
+      cache[2]="${cache[2]} s" ||
+      cache[2]="Unset "
+
+printf "\
+\e[1mCaching Plugin\e[0m:  \e[1;4;34mWP Super Cache\e[0m (\e[32mActive\e[0m)
+\e[1mCaching Enabled\e[0m: %b   \e[1;4mRecommended\e[0m
+\e[1mBrowser Cache\e[0m:   %b       %bYes\e[0m
+
+\e[1mRewrite Mode\e[0m:    %b       %bYes\e[0m
+\e[1mPHP Mode\e[0m:        %b       %bNo\e[0m
+\e[1mLegacy Mode\e[0m:     %b       %bNo\e[0m
+
+\e[1mCache Users\e[0m:     %b       %bNo\e[0m
+\e[1mCompression\e[0m:     %b       %bYes\e[0m
+\e[1mCache Expiry\e[0m:    \e[35m%-9s\e[0m %b3600 s\e[0m
+" \
+"${cache[0]:-\e[33mNo \e[0m}" \
+"${cache[1]:-\e[33mNo \e[0m}" "${c[1]}" \
+"${cache[3]:-\e[33mNo \e[0m}" "${c[3]}" \
+"${cache[8]}"                 "${c[8]}" \
+"${cache[5]:-\e[33mNo \e[0m}" "${c[5]}" \
+"${cache[7]:-\e[33mNo \e[0m}" "${c[7]}" \
+"${cache[4]:-\e[33mNo \e[0m}" "${c[4]}" \
+"${cache[2]:-\e[33mNo \e[0m}" "${c[2]}"
+  fi
+
+  (( SAK_WP_MU == 1 )) && echo &&
+    sak_message "Warning" "Multisite is enabled. Settings may not be accurate!"
+}
+
+#+ Checks for, installs, configures cache plugins.
+#| NOTE: Only supports WP Super Cache for now.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_cache_set_cache() {
+  local p v d=0 n=1 t=0 args basic docroot="" errors=1 ignore=0 permalinks="fail" \
+        re="(%post_id%|%postname%)" success=0 yes=0 vuln soft path ver IFS
+
+  args=$(getopt -n "$SAK_BASENAME" -o "d:hiynp:qv" -l "docroot:,force,help,ignore-version,no,permalinks:,quiet,set:,verbose,yes" -- "$@")
+  stat="$?"
+  [[ "$stat" -gt "0" ]] && sak_cli_help_wp_cache && exit "$stat"
+
+  eval set -- $args
+
+  shopt -s nocasematch
+  while :; do
+    case "$1" in
+      --) ;;
+      "") break ;;
+      --set)
+        if [[ "$2" != "supercache" ]]; then
+          echo "$SAK_BASENAME: unknown type -- $2" >&3
+          echo "$SAK_BASENAME: cache option --set supports: supercache" >&3
+          sak_cli_help_wp_cache; exit 1
+        fi
+        shift ;;
+      -p|--permalinks)
+        permalinks="$2"; shift
+        if [[ "$permalinks" == "common" ]]; then
+          permalinks="/%year%/%monthnum%/%postname%/"
+        elif [[ -z "$permalinks" ]]; then
+          echo "$SAK_BASENAME: permalink cannot be empty." >&3
+          sak_cli_help_wp_cache; exit 1
+        elif [[ "$permalinks" != "fail" && "$permalinks" != "skip" &&
+                "$permalinks" != "common" &&
+                ! "$permalinks" =~ $re ]]; then
+          echo "$SAK_BASENAME: invalid permalink setting -- $permalinks" >&3
+          sak_cli_help_wp_cache; exit 1
+        fi ;;
+      -i|--ignore-version) ignore=1 ;;
+      -d|--docroot) docroot="${2%%/}"; shift ;;
+      -y|--yes)     yes=1 ;;
+      -n|--no)      yes=0 ;;
+      -q|--quiet)   ((SAK_QUIET++)) ;;
+      -v|--verbose) ((SAK_QUIET--)) ;;
+      -h|help|--help)
+         sak_cli_help_wp_cache; exit 0 ;;
+      *) echo "$SAK_BASENAME: unknown argument -- $1" >&3
+         sak_cli_help_wp_cache; exit 1 ;;
+    esac
+    shift
+  done
+  shopt -u nocasematch
+
+  sak_cli_get_installs "wordpress"
+  sak_cli_wp_cache_set_supercache 0 "$permalinks" "$ignore" "$yes" "$docroot"
+  return "$?"
+}
+
+#+ Similar to {@link sak_cli_wp_cache_set_cache}, but works on multiple installs.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_cache_mass_set_cache() {
+  local i p v d=0 n=1 t=0 args basic errors=1 ignore=0 permalinks="fail" \
+        re="(%post_id%|%postname%)" success=0 yes=1 vuln soft path ver IFS
+
+  let "SAK_QUIET++" # By default, we are less verbose here
+
+  args=$(getopt -n "$SAK_BASENAME" -o "D:d:e:hiynp:qR:U:v" -l "directory:,docroot:,errors:,force,help,ignore-version,mass:,no,permalinks:,quiet,reseller:,user:,verbose,yes" -- "$@")
+  stat="$?"
+  [[ "$stat" -gt "0" ]] && sak_cli_help_wp_cache && exit "$stat"
+
+  eval set -- $args
+
+  shopt -s nocasematch
+  while :; do
+    case "$1" in
+      --) ;;
+      "") break ;;
+      --mass)
+        if [[ "$2" != "supercache" ]]; then
+          echo "$SAK_BASENAME: unknown type -- $2" >&3
+          echo "$SAK_BASENAME: cache option --mass supports: supercache" >&3
+          sak_cli_help_wp_cache; exit 1
+        fi
+        shift ;;
+      -p|--permalinks)
+        permalinks="$2"; shift
+        if [[ "$permalinks" == "common" ]]; then
+          permalinks="/%year%/%monthnum%/%postname%/"
+        elif [[ -z "$permalinks" ]]; then
+          echo "$SAK_BASENAME: permalink cannot be empty." >&3
+          sak_cli_help_wp_cache; exit 1
+        elif [[ "$permalinks" != "fail" && "$permalinks" != "skip" &&
+                "$permalinks" != "common" &&
+                ! "$permalinks" =~ $re ]]; then
+          echo "$SAK_BASENAME: invalid permalink setting -- $permalinks" >&3
+          sak_cli_help_wp_cache; exit 1
+        fi ;;
+      -e|--errors)
+        case "$2" in
+          ignore|skip) errors=0 ;;
+          fail|stop)   errors=1 ;;
+          *) echo "$SAK_BASENAME: invalid error setting." >&3
+             sak_cli_help_wp_cache; exit 1 ;;
+        esac; shift ;;
+
+      # t=1 here is to signify we have a target... later we error if t=0
+      -D|--directory) t=1; sak_add_targets "$2";  shift ;;
+      -U|--user)      t=1; sak_add_targets "$2";  shift ;;
+      -R|--reseller)  t=1; sak_add_rtargets "$2"; shift ;;
+
+      -i|--ignore-version) ignore=1 ;;
+      -d|--docroot) shift ;; # --docroot is ignored for --mass
+      -y|--yes)     yes=1 ;;
+      -n|--no)      yes=0 ;;
+      -q|--quiet)   ((SAK_QUIET++)) ;;
+      -v|--verbose) ((SAK_QUIET--)) ;;
+      -h|help|--help)
+         sak_cli_help_wp_cache; exit 0 ;;
+      *) echo "$SAK_BASENAME: unknown argument -- $1" >&3
+         sak_cli_help_wp_cache; exit 1 ;;
+    esac
+    shift
+  done
+  shopt -u nocasematch
+
+  if [[ "$t" -eq "0" ]]; then
+    echo "$SAK_BASENAME: at least one directory, reseller, or user must be specified when using --mass" >&3
+    sak_cli_help_wp_cache; exit 1
+  fi
+
+  sak_cli_get_installs "wordpress" "full"
+  echo
+  t="${#SAK_SOFTWARE[@]}"
+  sak_message "Notice" "Found $t potential WordPress installations."
+  printf '\e[s'
+  read -n1 -r -p "Are you sure you wish to continue [N/y]?" doit
+  printf '\e[u\e[K'
+
+  shopt -s nocasematch
+  case "$doit" in
+    y|yes) ;;
+    *) return 0 ;;
+  esac
+  shopt -u nocasematch
+
+  for i in "${!SAK_SOFTWARE[@]}"; do
+    # MAD HAX! sak-cli doesn't support multiple installs in most places
+    SAK_SOFTWARE[0]="${SAK_SOFTWARE[$i]}"
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+    echo
+    sak_message "Notice" "($n of $t) Switching to $(sak_soft_name "$soft") at $path"
+    if ! sak_cli_wp_cache_set_supercache 0 "$permalinks" "$ignore" "$yes"; then
+      if [[ "$errors" == "1" ]]; then
+        sak_message "Error" "Installation failed. Halting."
+        exit 1
+      else
+        sak_message "Warning" "Installation failed, continuing..."
+      fi
+    fi
+    let "n++"
+    SAK_WP_INIT=-1  # Fool the cache...
+  done
+
+  echo
+  sak_message "Notice" "Mass cache settings complete."
+}
+
+#+ Does the actual cache plugin installation and applies settings.
+#| sak_cli_wp_cache_set_supercache INDEX PERMALINKS IGNORE PROMPT [DOCROOT]
+#| @param int     $index      Software install index.
+#| @param string  $permalink  Permalinks to use if not set.
+#| @param bool    $ignore     Ignore installed plugin version.
+#| @param bool    $prompt     Prompt before disabling other plugins.
+#| @param string  $docroot="" Override docroot (e.g. if not detected).
+#- @return bool True on success. False otherwise (script exit).
+sak_cli_wp_cache_set_supercache() {
+  local i=0 p v d=0 basic cfile disable new owner plugin request result script \
+      stat vfile docroot="$5" ignore="$3" permalinks="$2" \
+      success=0 yes="$4" vuln soft path ver IFS
+
+  if ! sak_version_req "$i" "3.0"; then
+    sak_message "Error" "Cache information requires WordPress 3.0 or higher."
+    return $SAK_ERR_ARG
+  fi
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+  if ! sak_wp_cache_data "$i" basics; then
+    sak_message "Error" "Error retrieving WordPress config settings. Make sure this installation is not broken."
+    return $SAK_ERR_UNK
+  fi
+
+  owner="$(stat -c %U "$path")"
+
+  if sak_mysql_check_suspension "$owner" &>/dev/null; then
+    sak_message "Error" "[MySQL] The user \`$owner' appears to be suspended. Please check for MySQL restrictions or max_questions limits before proceeding." &&
+    exit $SAK_ERR_ARG
+  fi
+
+  # We cannot reliably work on MultiSite yet
+  if [[ "$SAK_WP_MU" -eq "1" ]]; then
+    sak_message "Error" "MultiSite appears to be enabled on this installation, which is currently unsupported."
+    return $SAK_ERR_ARG
+  fi
+
+  cfile="$(sak_wp_cache_file BASICS)"
+
+  # Check that our permalinks are set properly and adjust, skip, or fail
+  while IFS=$'\x1E' read -ra basic; do
+    case "${basic[0]}" in
+      permalink_structure)
+        if [[ -z "${basic[1]}" ]]; then
+          # Permalinks are not set, figure out what to do
+          case "$permalinks" in
+            fail) sak_fatal $SAK_ERR_ARG "Permalinks not set, exiting with failure." ;;
+            skip) sak_message "Warning" "Permalinks not set, skipping."; return 0 ;;
+            *)
+              sak_message -v 1 "Permalinks" "Permalinks not set, attempting to set them to: $permalinks"
+              if ! sak_cli_wp_set "permalinks" "$permalinks" >/dev/null; then
+                sak_message "Error" "Could not update permalinks!"
+                return $SAK_ERR_SUB_ERR
+              fi ;;
+          esac
+        else
+          sak_message -v 1 "Permalinks" "Permalinks are set, no adjustments required."
+          break # Permalinks are set up
+        fi
+    esac
+  done < "$cfile"
+
+  # If DocumentRoot is not provided, try to guess
+  if [[ -z "$docroot" ]]; then
+    if [[ -f "/usr/local/apache/conf/httpd.conf" ]]; then
+      sak_message -v 1 "DocRoot" "No --docroot specified. Scanning for valid DocumentRoot."
+      owner="$(stat -c %U "$path")"
+      o="$owner"
+      dir="$path"
+      while :; do
+        if [[ "$o" == "$owner" ]]; then
+          printf -v g '^\s*(?i:DocumentRoot)\s+%s\s*$' "$dir"
+          if grep -qP "$g" "/usr/local/apache/conf/httpd.conf"; then
+            docroot="$dir"
+            sak_message -v 1 "DocRoot" "Detected \`$docroot' as Document Root."
+            break
+          fi
+        fi
+        dir="$(dirname "$dir")"
+        [[ -z "$dir" || "$dir" == "/" ]] && break
+        o="$(stat -c %U "$dir")"
+      done
+    else
+      echo # Exit here is fine since this only works on cPanel servers for now
+      sak_message "Error" "No --docroot specified and /usr/local/apache/conf/httpd.conf does not exist or is not readable."
+      sak_fatal $SAK_ERR_ARG "This feature does not yet work on non-cPanel systems. Please manually specify --docroot."
+    fi
+  fi
+
+  # Check that we have a good DocumentRoot
+  if [[ -z "$docroot" ]]; then
+    sak_message "Error" "Could not determine document web-root. Please use --docroot=PATH to specify it manually."
+    return $SAK_ERR_SUB_ERR
+  fi
+
+  [[ "$SAK_QUIET" -lt "1" ]] && echo ||
+    sak_message "Status" "Setting up $(sak_soft_name "$soft") at $path"
+  sak_wp_cache_data "$i" plugins || return 1
+
+  if ! cfile="$(sak_wp_cache_file PLUGINS)"; then
+    sak_message "Error" "Unknown error retrieving plugin information."
+    return $SAK_ERR_UNK
+  fi
+
+  if ! vfile="$(sak_cache_file PLUGIN-WP-SEARCH_wp-super-cache)"; then
+    vfile="$(sak_mkcache)"
+    new=1
+  fi
+
+  if [[ "$new" -eq "1" ]]; then
+    n=${#SAK_WP_CACHE_FILE[@]}
+    SAK_CACHE_FILE[$n]="$vfile"
+    SAK_CACHE_TYPE[$n]="PLUGIN-WP-SEARCH_wp-super-cache"
+
+    printf -v request "http://sak.dev.gatorsec.net/software/wp-plugin-search.php?api=%d&s=%s" "$SAK_WP_API_VER" "wp-super-cache"
+    sak_download "$request" "$vfile"
+  fi
+
+  [[ "$SAK_QUIET" -lt "1" ]] &&
+    sak_message "Warning" "All page cache plugins must be deactivated." &&
+    sak_message "Scanning" "Scanning for active cache plugins..." &&
+    echo
+  # Check for caching plugins and disable them
+  while IFS=$'\x1E' read -ra plugin; do
+    # Store Super Cache version if it's installed
+    [[ "${plugin[3]}" == "WP Super Cache" ]] && v="${plugin[2]}" && p="${plugin[1]}" &&
+      sak_message -v 1 "SuperCache" "Found WP Super Cache version ${v}."
+    # WP Super Cache is in here so we reset its settings to default
+    case "${plugin[3]}" in
+      "WP Super Cache"|"W3 Total Cache"|"Quick Cache"|\
+      "Hyper Cache"|"Hyper Cache Extended"|"Lite Cache")
+        if [[ "${plugin[0]}" -eq "0" ]]; then
+          [[ "$SAK_QUIET" -lt "1" ]] &&
+            sak_message "Plugin" "Cache plugin \`${plugin[3]}' is installed, but is already disabled."
+          continue
+        fi
+
+        # Add to disable list
+        printf -v disable '%s%s\x1E' "$disable" "${plugin[1]}"
+        sak_message "Plugin" "Cache plugin \`${plugin[3]}' is active and will be disabled."
+        let "d++" ;;
+    esac
+  done < "$cfile"
+
+  if [[ "$d" -gt "0" ]]; then
+    if [[ "$yes" -eq "0" && "$SAK_QUIET" -lt "1" ]]; then
+      # We trap CTRL+C here so we reset the terminal properly due to read -s
+      trap "which tset &>/dev/null && tset; exit 0" SIGINT
+      printf '\n\e[s\e[1mNOTICE: The %s plugin(s) list above will be disabled. If this is incorrect, press \e[4mCTRL+C\e[0;1m now or press any key to continue.\e[0m' "$d"
+      read -rsn 1
+      printf '\e[u\e[K'
+      trap sak_trap SIGINT SIGTERM
+    fi
+
+    [[ "$SAK_QUIET" -lt "1" ]] &&
+      sak_message "Plugin" "Disabling cache plugins..."
+    IFS=$'\x1E'
+    if ! sak_cli_wp_plugin_toggle "quiet" "disable" $disable; then
+      sak_message "Error" "Error disabling caching plugins"
+      return $SAK_ERR_ARG
+    fi
+  else
+    [[ "$SAK_QUIET" -lt "1" ]] &&
+      sak_message "Plugin" "No active caching plugins found."
+  fi
+
+  # Check to see if we missed any
+  if [[ -f "$path/wp-content/advanced-cache.php" ]]; then
+    sak_cli_wp_plugin_info
+    sak_message "Error" "Page cache drop-in exists! Please disable any caching plugins manually before trying again."
+    return $SAK_ERR_ARG
+  fi
+
+  # If plugin is already installed, check version, make sure it's up to date
+  if [[ "$ignore" == "0" && -n "$v" ]]; then
+    while IFS=$'\x1E' read -ra result; do
+      if [[ "${result[0]}" == "WP Super Cache" ]]; then
+        sak_message -v 1 "SuperCache" "Latest version of WP Super Cache is ${result[1]}."
+        if [[ "$v" != "${result[1]}" ]]; then
+          # Version does not match, force download
+          sak_message "Error" "WP Super Cache is outdated. Cowardly refusing to change settings. Please update the plugin manually."
+          return $SAK_ERR_SUB_ERR
+        fi
+        break
+      fi
+    done < "$vfile"
+  fi
+
+  # If we have no version, we need to install
+  if [[ -z "$v" ]]; then
+    [[ "$SAK_QUIET" -lt "1" ]] &&
+      sak_message "Install" "Installing WP Super Cache..."
+    if ! sak_wp_plugins_install "$i" "wp-super-cache"; then
+      sak_message "Error" "Error installing WP Super Cache."
+      return $SAK_ERR_SUB_ERR
+    fi
+    p="wp-super-cache/wp-cache.php"
+  fi
+
+  # Fire it up!
+  [[ "$SAK_QUIET" -lt "1" ]] && sak_message "Plugin" "Activating WP Super Cache..."
+  if ! sak_cli_wp_plugin_toggle "quiet" "enable" "$p"; then
+    sak_message "Error activating WP Super Cache."
+    return $SAK_ERR_SUB_ERR
+  fi
+
+  # Apply settings
+  owner="$(stat -c %U "$path")"
+  script="$(sak_mktmp "$owner")"
+
+  cat "$SAK_MOD_DIR/soft/wordpress/gateway.php" > "$script"
+  umask 0022
+  [[ "$SAK_QUIET" -lt "1" ]] &&
+    sak_message "Plugin" "Applying recommended cache settings..."
+  err="$(/usr/bin/sudo -u "$owner" "$SAK_PHP" -q "$script" "$path" enable_wpsc STDOUT "$docroot" 2>&1)"
+  umask 0077
+
+  rm -f "$script"   # delete script
+
+  if [[ -n "$err" ]]; then
+    echo
+    sak_wait_message 5 "Error" "$err" 5 35
+    sak_message "Error" "Error adjusting settings. Resolve any errors shown above or apply manually."
+    return $SAK_ERR_SUB_ERR
+  fi
+
+  # Make sure the settings actually took
+  if sak_wp_cache_cache "$i"; then
+    cfile="$(sak_wp_cache_file CACHE)"
+    if [[ "$?" -eq "0" ]]; then
+      while IFS=$'\x1E' read -ra set; do
+        case "${set[0]}" in
+          enabled) [[ "${set[1]}" == "true" ]] && success=1; break ;;
+        esac
+      done < "$cfile"
+    fi
+  fi
+
+  if [[ "$success" == "0" ]]; then
+    sak_message "Cache settings did not apply properly! Please check that this is not a broken install, if not, please report as a bug."
+    return $SAK_ERR_UNK
+  else
+    sak_message "Status" "Success."
+  fi
+
+  [[ "$SAK_QUIET" -lt "1" ]] &&
+    echo &&
+    sak_cli_wp_cache_info 1
+
+  return 0
+}
+
+#+ Import a WordPress XML export.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_import() {
+  local ic=0 is=0 args file soft_info stat yn \
+        vuln soft path ver
+
+  args=$(getopt -n "$SAK_BASENAME" -o "achs" -l "all,content,help,settings" -- "$@")
+  stat="$?"
+  [[ "$stat" -gt "0" ]] && sak_cli_help_wp_import && exit "$stat"
+
+  eval set -- $args
+
+  while :; do
+    case "$1" in
+      --) shift; break ;;
+
+      -a|--all) ic=1; is=1 ;;
+      -c|--content)  ic=1 ;;
+      -s|--settings) is=1 ;;
+
+      -h|--help|*help*) sak_cli_help_wp_import; exit 0 ;;
+      *) echo "$SAK_BASENAME: unknown argument -- $1"
+         sak_cli_help_wp_import; exit $SAK_ERR_ARG ;;
+    esac
+    shift
+  done
+
+  (( ic | is )) || ic=1
+  : ${file:=$1}
+  SAK_WP_PASS=""
+
+  [[ -z "$file" || "$file" == "help" ]] &&
+    sak_cli_help_wp_import && exit $SAK_ERR_ARG
+
+  sak_cli_get_installs "wordpress"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  # Duplicated since content import will override some info
+  soft_info="${SAK_SOFTWARE[0]}"
+
+  [[ ! -f "$file" ]] &&
+    sak_fatal $SAK_ERR_ARG "Import file not found."
+
+  sak_wp_cache_data 0 basics ||
+    sak_fatal $SAK_ERR_UNK "Unknown error caching WordPress information."
+
+  [[ "$SAK_WP_MU" == "1" ]] &&
+    sak_fatal $SAK_ERR_UNK "Unable to import to a multisite WordPress. Manual import required."
+
+  # Import content
+  if (( ic == 1 )); then
+    sak_cli_wp_import_content "$file" ||
+      sak_fatal $SAK_ERR_SUB_ERR "Error importing content."
+  fi
+
+  # Import settings
+  if (( is == 1 )); then
+    printf 'Importing will overwrite settings. Continue [N/y]? '
+    read -rn1 yn; echo
+    case "$yn" in y|Y);; *) return 0;; esac
+    sak_message "Backup" "Creating database backup."
+    sak_data_backup "$SAK_WP_DB" "$path"
+    sak_cli_wp_import_settings "$file" "$soft_info" ||
+      sak_fatal $SAK_ERR_SUB_ERR "Error importing configuration data."
+    ! (( ic )) && sak_cli_wp_info "basics"
+  fi
+
+  return 0
+}
+
+#+ WordPress settings import.
+#| @param string $file Path to INI export file.
+#| @param string $soft_info Original software information.
+#- @return bool False on failure. True otherwise.
+sak_cli_wp_import_settings() {
+  local file="$1" soft_info="$2" err vuln soft path ver
+
+  sak_message "Import" "[Settings] Preparing to import WordPress configuration."
+
+  IFS=$'\t' read -r vuln soft path ver <<< "$soft_info"
+  if [[ -z "$SAK_WP_DB" || -z "$SAK_WP_PREFIX" ]]; then
+    sak_fatal_backtrace "WordPress database and/or prefix information is missing."
+  fi
+
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -i "$file" --path "$path" \
+    --root --db "$SAK_WP_DB" --prefix "$SAK_WP_PREFIX" --import-basics)"
+
+  if [[ -n "$err" ]]; then
+    sak_message "Error" "$err"
+    return 1
+  fi
+
+  sak_message "Import" "[Settings] Configuration imported."
+  return 0
+}
+
+#+ WordPress content import.
+#| @param string $file Path to INI export file.
+#- @return bool False on failure. True otherwise.
+sak_cli_wp_import_content() {
+  local file="$1" dbuser dbpass err wptmp odir vuln soft path ver
+
+  sak_message "Import" "[Setup] Cloning database settings."
+
+  dbuser="$(sak_get_php_opt "$SAK_WP_CONFIG" "DB_USER")"
+  SAK_WP_PASS="$(sak_get_php_opt "$SAK_WP_CONFIG" "DB_PASSWORD")"
+
+  wptmp="$SAK_CACHE_DIR/wp-import"
+  rm -rf "$wptmp"
+  mkdir -p "$wptmp"
+
+  sak_message "Import" "[Setup] Preparing mock WordPress install."
+
+  odir="$PWD" &&
+  cd "$wptmp"
+
+  # Prepare a blank install with same DB connection
+  SAK_WP_IMPORTING=1 sak_cli_wp_resurrect --db "$SAK_WP_DB" \
+    --prefix "$SAK_WP_PREFIX" --username "$dbuser" --internal-pass -q ||
+    sak_fatal $SAK_ERR_SUB_ERR "Error creating mock installation."
+
+  sak_message "Import" "[Setup] Installing import plugin."
+
+  # Install importer plugin
+  SAK_WP_IMPORTING=1 sak_cli_wp_plugin_install_handler "wordpress-importer" "" 1 ||
+    sak_fatal $SAK_ERR_SUB_ERR "Error installing import plugin."
+
+  sak_message "Import" "[Setup] Complete."
+
+  echo -e "\n==[ Counts ]========================-==--- -- -"
+  sak_cli_wp_info "counts" 1
+  echo -e "====================================-==--- -- -\n"
+
+  sak_message "Import" "[Content] Beginning posts import."
+
+  # Perform the actual import
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/import.php" "$file" "$wptmp")"
+
+  if [[ -n "$err" ]]; then
+    sak_wait_message 5 "Error" "$err" 5 35
+    return 1
+  fi
+
+  sak_message "Import" "[Content] Posts import completed."
+  echo -e "\n==[ Post-Import Counts ]============-==--- -- -"
+  sak_cli_wp_info "counts" 1
+  echo -e "====================================-==--- -- -\n"
+
+  cd "$odir"
+  [[ -d "$wptmp" ]] && rm -rf "$wptmp" # Destroy old directory
+  return 0
+}
+
+#+ Resurrects a WordPress install from the abyss from only a database.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_resurrect() {
+  local i=0 n p s v args cfile config db DBVER err force group host \
+        ignore_schema newauth newgrant newpass owner ownername pass prefix \
+        salts stat user version db_name=() db_pre=() db_ver=() db_mu=() \
+        re='^[a-zA-Z0-9_-]+$' vuln soft path ver IFS
+
+  args=$(getopt -n "$SAK_BASENAME" -o "d:hH:p:Pqu:vV:" -l "create-auth,create-grant,create-pass,db:,database:,help,host:,ignore-schema,internal-pass,password,prefix:,quiet,username:,verbose,version:" -- "$@")
+  stat="$?"
+  [[ "$stat" -gt "0" ]] && sak_cli_help_wp_resurrect && exit "$stat"
+
+  eval set -- $args
+
+  while :; do
+    case "$1" in
+      --) shift; break ;;
+      -d|--db|--database) db="$2";      shift ;;
+      -H|--host)          host="$2";    shift ;;
+      -P|--password)      p=1 ;;
+      -p|--prefix)        prefix="$2";  shift ;;
+      -u|--username)      user="$2";    shift ;;
+      -V|--version)       version="$2"; shift ;;
+      # Special case for imports
+      --internal-pass)    pass="$SAK_WP_PASS"; SAK_WP_PASS="" ;;
+
+      --create-auth)    newauth=1 ;;  # create user & pass
+      --create-pass)    newpass=1 ;;  # create new pass
+      --create-grant)   newgrant=1 ;; # add grant for user,pass on db
+      --ignore-schema)  ignore_schema=1 ;; # skip schema->version check
+
+      -v|--verbose) ((SAK_QUIET--)) ;;
+      -q|--quiet)   ((SAK_QUIET++)) ;;
+
+      -h|--help|*help*) sak_cli_help_wp_resurrect; exit 0 ;;
+      *) echo "$SAK_BASENAME: unknown argument -- $1"
+         sak_cli_help_wp_resurrect; exit $SAK_ERR_ARG ;;
+    esac
+    shift
+  done
+
+  # Defaults if not specified
+  : ${db:=$1} ${host:=localhost}
+
+  # Required arguments
+  if [[ -z "$db" ]]; then
+    echo "$SAK_BASENAME: no database specified."
+    sak_cli_help_wp_resurrect; exit $SAK_ERR_ARG
+  elif [[ "$db" == "help" ]]; then
+    sak_cli_help_wp_resurrect; exit 0
+  elif [[ ! "$db" =~ $re ]]; then
+    echo "$SAK_BASENAME: invalid database name: $db"
+    sak_cli_help_wp_resurrect; exit $SAK_ERR_ARG
+  fi
+
+  ! sak_msg_silence && sak_version
+
+  # Preflight checks...
+  sak_message "Resurrect" "[Preflight] Performing pre-flight checks. Please fasten your seatbelts for take-off..."
+  [[ -f "$PWD/wp-config.php" ]] &&
+    sak_message "Error" "[Preflight] An existing wp-config.php already found in this directory. Refusing to continue." &&
+    sak_message "Error" "[Preflight] Did you mean to use the 'replace' command instead?" &&
+    exit $SAK_ERR_ARG
+
+  for dir in "wp-content" "wp-admin" "wp-includes"; do
+    [[ -e "$PWD/$dir" ]] &&
+      sak_message "Error" "[Preflight] One or more WordPress directories already exist! Merging with them is not safe!" &&
+      exit $SAK_ERR_ARG
+  done
+
+  # Check owner & perms
+  sak_message "Resurrect" "[Preflight] Checking ownership and permissions."
+  u="$(stat -c "%u %U" .)"
+  owner="${u% *}"
+  ownername="${u#* }"
+
+  [[ -z "$ownername" || "$ownername" =~ ^[0-9]+$ ]] &&
+    sak_message "Error" "[Preflight] Could not resolve directory owner UID ($owner) to a username." &&
+    exit $SAK_ERR_UNK
+
+  ! sak_msg_silence && {
+    [[ "$owner" -lt "500" ]] &&
+      sak_message "Error" "[Preflight] Directory is owned by (${ownername:-unknown user}) with UID < 500." &&
+      exit $SAK_ERR_UNK
+  }
+
+  group="${SAK_GIDS[$owner]}"
+
+  u="${db%%_*}"
+  ! sak_msg_silence && [[ -n "$u" && "$u" != "$ownername" ]] &&
+    sak_message "Warning" "  [MySQL] Database user \`$u' does not match \`$ownername' user."
+
+  if [[ -n "$p" ]]; then  # Get password from console
+    printf '\e[s'
+    read -resp 'Password: ' pass 2>&3
+    printf '\e[u\e[K'
+  fi
+
+  # Create auth
+  if [[ "$newauth" == "1" ]]; then
+    newgrant=1
+    if [[ -z "$user" ]]; then # User was not specified
+      if ! sak_mysql_check_user "$db" &>/dev/null; then # First, try to use DB name as username
+        user="$db"
+        sak_message "Resurrect" "[MySQL] Using database name \`$user' as username."
+      else
+        sak_message "Warning" "  [MySQL] User with the same name of \`$db' already exists, ignoring and making new user."
+        n=1 # Generate user && Verify user does not exist
+        while [[ -z "$user" ]] || sak_mysql_check_user "$user" &>/dev/null; do
+          [[ "$n" -gt "20" ]] &&
+            sak_message "Error" "[MySQL] Could not generate a valid username after 20 attempts!" &&
+            exit $SAK_ERR_UNK
+          printf -v user '%s_wp%d' "$ownername" "$n"
+          let "n++"
+        done
+        sak_message "Resurrect" "[MySQL] Using generated username \`$user'"
+      fi
+    else # Verify user does not exist
+      if err="$(sak_mysql_check_user "$user")"; then
+        sak_message "Error" "[MySQL] Specified user \`$user' already exists!"
+        exit $SAK_ERR_ARG
+      fi
+      sak_message "Resurrect" "[MySQL] Using specified username \`$user'"
+    fi
+    if [[ -z "$p" ]]; then # Generate password
+      pass="$(sak_make_password)"
+      sak_message "Resurrect" "[MySQL] Using generated password: $pass"
+    else
+      sak_message "Resurrect" "[MySQL] Using manually typed password."
+    fi
+    sak_message "Resurrect" "[MySQL] Creating the new user."
+    sak_mysql_create_auth "$user" "$pass"
+  fi
+
+  [[ -z "$user" ]] &&
+    sak_message "Error" "[MySQL] A database username is required when not created automatically.\n[MySQL] Please specify with --user <username> or use --create-auth" &&
+    exit $SAK_ERR_ARG
+
+  if [[ "$newpass" == "1" ]]; then
+    [[ ! "$user" =~ _ ]] &&
+      sak_message "Error" "[MySQL] Refusing to update password. Only user_dbname style usernames are supported." &&
+      exit $SAK_ERR_ARG
+    if ! sak_mysql_check_user "$user" &>/dev/null; then
+      sak_message "Error" "[MySQL] The user \`$user' does not exist. Cannot update password for non-existant user." &&
+      exit $SAK_ERR_ARG
+    fi
+    pass="$(sak_make_password)"
+    sak_message "Resurrect" "[MySQL] Using generated password: $pass"
+    sak_message "Resurrect" "[MySQL] Updating password for user \`$user'"
+    sak_mysql_create_pass "$user" "$pass"
+  fi
+
+  if [[ "$newgrant" == "1" || "$newpass" == "1" ]]; then
+    sak_message "Resurrect" "[MySQL] Updating user privileges on database."
+    sak_cpanel_map_dbuser "$ownername" "$user" "$db"
+    sak_cpanel_map_privs "$owner" "$user" "$db"
+  fi
+
+  [[ -z "$pass" ]] &&
+    sak_message "Error" "A database password is required. Please specify one or have it created (see help)." &&
+    exit $SAK_ERR_ARG
+
+  # See if user exists
+  if ! err="$(sak_mysql_check_user "$user")"; then
+    sak_message "Error" "[MySQL] User \`$user' does not exist.\n$err"
+    exit $SAK_ERR_ARG
+  fi
+  sak_message "Resurrect" "[MySQL] Verified user $user exists."
+
+  # Test auth
+  if ! err="$(sak_mysql_check_auth_db "$user" "$pass" "$db")"; then
+    sak_message "Error" "[MySQL] Authentication failed.\n$err"
+    exit $SAK_ERR_ARG
+  fi
+  sak_message "Resurrect" "[MySQL] Verified authentication successful."
+
+  cfile="$(sak_mkcache)"
+
+  sak_message "Resurrect" "[Preflight] Checking for valid WordPress table prefix(es)."
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -o "$cfile" \
+    --root --db "$db" --prefix "$prefix" --get dbver)"
+
+  if [[ -n "$err" ]]; then
+    sak_wait_message 5 "Error" "$err" 5 35
+    return 1
+  fi
+
+  while IFS=$'\x1E' read -ra DBVER; do
+    db_name[$i]="${DBVER[0]}"
+    db_pre[$i]="${DBVER[1]}"
+    db_ver[$i]="${DBVER[2]}"
+    db_mu[((i++))]="${DBVER[3]}"
+  done < "$cfile"
+
+  # Multiples found
+  if [[ -n "${db_name[0]}" && "$i" -gt "1" ]]; then
+    sak_message "Warning" "  [Preflight] Multiple table prefixes found. Please specify one from the list below."
+    printf '\n\e[1m%-24s %-10s  %6s  %s\e[0m\n' "Database" "Prefix" "Schema" "WordPress Version(s)"
+    for (( n=0; n < i; n++ )); do
+      printf '%-24s %-10s  % 6d  %s\n' "${db_name[$n]}" "${db_pre[$n]}" "${db_ver[$n]}" "${SAK_WP_DB_LOOKUP[${db_ver[$n]:-0}]}"
+    done
+    exit 0
+  fi
+
+  # Didn't get a valid prefix
+  [[ -z "${db_name[0]}" ]] &&
+    sak_message "Error" "[Preflight] Could not find tables with valid prefix. If this is a WordPress database, it may be broken." &&
+    exit $SAK_ERR_ARG
+
+  # Single prefix and valid version found (or provided)
+  ! sak_msg_silence && {
+    [[ "$prefix" != "${db_pre[0]}" ]] &&
+      sak_message "Resurrect" "[Preflight] Automatically detected \`${db_pre[0]}' as table prefix." ||
+      sak_message "Resurrect" "[Preflight] Specified table prefix \`$prefix' validated."
+    }
+
+  # Schema version not found in lookup array
+  ver="$(sak_wp_db_lookup "${db_ver[0]}")"
+  if [[ -z "$ver" ]]; then
+    [[ "${db_ver[0]}" =~ ^[0-9]+$ ]] && # see if we got something numeric
+      sak_message "Error" "[Preflight] Schema version \`${db_ver[0]}' is not in the list." ||
+      sak_message "Error" "[Preflight] Schema version \`${db_ver[0]}' in this database appears invalid."
+    sak_message "Error" "[Preflight] Cannot determine WordPress version. Please correct arguments or specify version."
+    exit $SAK_ERR_UNK
+  fi
+  sak_message "Resurrect" "[Preflight] Schema version ${db_ver[0]} validated."
+
+  # Version sanity checks
+  ver="${ver%% *}"
+  if [[ -n "$version" && "$version" != "$ver" ]]; then
+    schema[0]="${db_ver[0]}"
+    schema[1]=""
+    for s in "${!SAK_WP_DB_LOOKUP[@]}"; do
+      for v in ${SAK_WP_DB_LOOKUP["$s"]}; do
+        [[ "$v" == "$version" ]] && schema[1]=$s
+      done
+    done
+    if [[ "${schema[0]]}" == "${schema[1]]}" ]]; then
+      sak_message "Resurrect" "[Preflight] WordPress version $version and $ver differ, but both correspond with schema ${db_ver[0]}."
+      ver="$version"
+    else
+      sak_message "Error" "[Preflight] WordPress version $version and $ver differ and different schema versions!"
+      if [[ -n "$ignore_schema" ]]; then
+        sak_message "Warning" "  [Preflight] Continuing due to --ignore-schema."
+      else
+        exit $SAK_ERR_ARG
+      fi
+    fi
+  elif [[ -z "$version" ]]; then
+    sak_message "Resurrect" "[Preflight] Automatically selecting WordPress $ver corresponding with schema version ${db_ver[0]}."
+  else
+    sak_message "Resurrect" "[Preflight] Specified WordPress version $version corresponds with schema version ${db_ver[0]}."
+    ver="$version"
+  fi
+
+  [[ "${db_mu[0]}" == "1" ]] &&
+    sak_message "Warning" "  [Preflight] Possible WordPress MultiSite tables detected!\n  [Preflight] Additional post-installation adjustments will be necessary!"
+
+  # NOTE: Variable "soft" re-used here
+  printf -v soft '%s\t%s\t%s\t%s' -1 "wordpress" "$PWD" "$ver"
+  SAK_SOFTWARE=("$soft")
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  # Set us up the bomb
+  SAK_WP_INIT=0
+  SAK_WP_CONFIG="$PWD/wp-config.php"
+  SAK_WP_DB="$db"
+  SAK_WP_HOST="${host:-localhost}"
+  SAK_WP_PREFIX="${db_pre[0]}"
+  SAK_WP_MU="${db_mu[0]}"
+  SAK_WP_VER="$ver"
+
+  ! sak_msg_silence && {
+    sak_cli_wp_info "basics"
+    sak_message "Resurrect" "[Preflight] Preflight check success."
+    echo
+    sak_message "Resurrect" "[Install] Downloading and performing installation."
+  }
+  sak_core_get_install 0 >/dev/null || return 1
+  sak_message "Resurrect" "[Install] Extracting installation."
+  sak_core_replace_generic 0 1 "$ownername" >/dev/null
+  sak_message "Resurrect" "[Install] Base file installation complete." &&
+  echo
+
+  local config url="http://sak.dev.gatorsec.net/software/configs/wordpress/wordpress-000.txt"
+  sak_message "Resurrect" "[Config] Downloading generic WordPress config."
+  config="$(sak_download_pipe "$url")"
+
+  # database
+  sak_message "Resurrect" "[Config] Making database connection adjustments."
+  config="$(sak_edit_tag "DEFINE_DB_NAME_000" "$SAK_WP_DB" <<< "$config")"
+  config="$(sak_edit_tag "DEFINE_DB_USER_000" "$user" <<< "$config")"
+  config="$(sak_edit_tag "DEFINE_DB_PASS_000" "${pass/"'"/\'}" <<< "$config")"
+  config="$(sak_edit_tag "DEFINE_DB_HOST_000" "$SAK_WP_HOST" <<< "$config")"
+  config="$(sak_edit_tag "DEFINE_WP_PREFIX_000" "$SAK_WP_PREFIX" <<< "$config")"
+
+  # salts
+  salts="$(sak_wp_make_salts)"
+  sak_message "Resurrect" "[Config] Generating random salts."
+  config="$(sak_edit_tag "DEFINE_WP_SALTS_000" "$salts" <<< "$config")"
+
+  # multisite (not fully supported)
+  if [[ "$SAK_WP_MU" == "1" ]]; then
+    sak_message "Resurrect" "[Config] Enabling MultiSite dashboard menu."
+    mu="define('WP_ALLOW_MULTISITE', true);"
+    config="$(sak_edit_tag "DEFINE_WP_MULTISITE_000" "$mu" <<< "$config")"
+  else
+    config="$(sak_edit_tag "DEFINE_WP_MULTISITE_000" "" 1 <<< "$config")"
+  fi
+
+  sak_message "Resurrect" "[Config] Writing configuration file."
+  printf '%s\n' "$config" > "$SAK_WP_CONFIG"
+  chown "$ownername:$group" "$SAK_WP_CONFIG"
+  chmod 644 "$SAK_WP_CONFIG"
+
+  ! sak_msg_silence && {
+    echo # Get out your shotgun, this zombie has risen
+    sak_message "Resurrect" "WordPress version $SAK_WP_VER successfully resurrected. Mmmm...Brains..."
+    echo
+
+    [[ "$SAK_WP_MU" == "1" ]] &&
+      sak_message "Warning" "[Post Install] WordPress MultiSite needs additional configuration.\n[Post Install] Please see http://goo.gl/8J7qD for more information." &&
+      echo
+  }
+  return 0
+}
+
+
+
+#+ Connect a WordPress install to a database.
+#- @param mixed $args... Command line positionals.
+sak_cli_wp_connect() {
+  local i=0 n p s v args cfile config db DBVER err force group host \
+        ignore_schema newauth=1 newgrant newpass owner ownername pass prefix \
+        salts stat user version db_name=() db_pre=() db_ver=() db_mu=() \
+        re='^[a-zA-Z0-9_-]+$' vuln soft path ver IFS domain IS_OWP=0 \
+        IS_OWP_ROOT=0 primary_domain OWP_config
+
+
+
+  args=$(getopt -n "$SAK_BASENAME" -o "d:hH:p:Pqu:vV:" -l "no-create-auth,create-grant,create-pass,db:,database:,domain:,help,host:,ignore-schema,internal-pass,password,prefix:,quiet,username:,verbose,version:" -- "$@")
+  stat="$?"
+  [[ "$stat" -gt "0" ]] && sak_cli_help_wp_connect && exit "$stat"
+
+  eval set -- $args
+
+  while :; do
+    case "$1" in
+      --) shift; break ;;
+      -d|--db|--database) db="$2";      shift ;;
+      -H|--host)          host="$2";    shift ;;
+      --domain)           domain="$2";  shift ;;
+      -P|--password)      p=1 ;;
+      -p|--prefix)        prefix="$2";  shift ;;
+      -u|--username)      user="$2";    shift ;;
+      -V|--version)       version="$2"; shift ;;
+      # Special case for imports
+      --internal-pass)    pass="$SAK_WP_PASS"; SAK_WP_PASS="" ;;
+
+      --no-create-auth)    newauth=0 ;;  # don't automatically create authentication
+      --create-pass)    newpass=1 ;;  # create new pass
+      --create-grant)   newgrant=1 ;; # add grant for user,pass on db
+      --ignore-schema)  ignore_schema=1 ;; # skip schema->version check
+
+      -v|--verbose) ((SAK_QUIET--)) ;;
+      -q|--quiet)   ((SAK_QUIET++)) ;;
+
+      -h|--help|*help*) sak_cli_help_wp_connect; exit 0 ;;
+      *) echo "$SAK_BASENAME: unknown argument -- $1"
+         sak_cli_help_wp_connect; exit $SAK_ERR_ARG ;;
+    esac
+    shift
+  done
+
+  # Defaults if not specified
+  : ${host:=localhost}
+
+  ! sak_msg_silence && sak_version
+
+  # Check owner & perms
+  sak_message "Create" "[Preflight] Checking ownership and permissions."
+  u="$(stat -c "%u %U" .)"
+  owner="${u% *}"
+  ownername="${u#* }"
+
+  [[ -z "$ownername" || "$ownername" =~ ^[0-9]+$ ]] &&
+    sak_message "Error" "[Preflight] Could not resolve directory owner UID ($owner) to a username." &&
+    exit $SAK_ERR_UNK
+
+  ! sak_msg_silence && {
+    [[ "$owner" -lt "500" ]] &&
+      sak_message "Error" "[Preflight] Directory is owned by (${ownername:-unknown user}) with UID < 500." &&
+      exit $SAK_ERR_UNK
+  }
+
+  # Determine required values
+  primary_domain=$(uapi --user=$ownername DomainInfo  list_domains --output=json | python -c 'import json;import sys;from pprint import pprint;jdata = sys.stdin.read();data = json.loads(jdata); print data["result"]["data"]["main_domain"]')
+
+  # OWP requires some special checks
+  hostname=$(cat /proc/sys/kernel/hostname)
+  [[ "$hostname" = "wp"*".hostgator.com" ]] && IS_OWP=1 && [[ "$PWD" = *"/public_html" ]] && IS_OWP_ROOT=1
+
+  [[ "$IS_OWP" = "1" ]] && sak_message "Create" "[Preflight] OWP server detected!"
+
+  # Required arguments
+  if [[ -z "$db" ]] && [[ -z "$domain" ]]; then
+    # We will do some checks to see if we are in public_html and there is only one database
+
+    [[ "$PWD" = *"/public_html" ]] && {
+      domain=$primary_domain
+      sak_message "Create" "[Preflight] No domain or database provided, using $domain due to working directory in public_html."
+    }
+  fi
+
+
+  if [[ -z "$db" ]] && [[ -z "$domain" ]]; then
+    echo "$SAK_BASENAME: no database or domain specified."
+    sak_cli_help_wp_connect; exit $SAK_ERR_ARG
+  fi
+
+  
+  # No DB specified
+  if [[ -z "$db" ]]; then
+    
+    # This is VERY not koser for sak however there is no other place to place a function call like this without it being
+    # out of place there. I am sure a future explorer will hate this deviation from the status quo but until we have more 
+    # functions that need to call and return generic mysql data, this will be here.
+    
+    databases=($(cpapi2 --user=$ownername --output=json MysqlFE listdbs  | $SAK_PYTHON -c 'import json;import sys;from pprint import pprint;jdata = sys.stdin.read();data = json.loads(jdata);
+for dbdata in data["cpanelresult"]["data"]: print dbdata["db"]'))
+
+    sak_message "Create" "[Preflight] Looking for a sutable database to use."
+
+    founddbs=()
+    
+    for searchdb in "${databases[@]}"; do
+    
+      cfile="$(sak_mkcache)"
+
+      # Get all of the prefixes for each db
+      err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -o "$cfile" \
+        --root --db "$searchdb" --prefix "$prefix" --get dbver)"
+
+      if [[ -n "$err" ]]; then
+        sak_wait_message 5 "Error" "$err" 5 35
+        return 1
+      fi
+
+      i=0
+
+      while IFS=$'\x1E' read -ra DBVER; do
+        db_name[$i]="${DBVER[0]}"
+        db_pre[$i]="${DBVER[1]}"
+        db_ver[$i]="${DBVER[2]}"
+        db_mu[((i++))]="${DBVER[3]}"
+      done < "$cfile"
+
+
+      for searchprefix in "${db_pre[@]}"; do 
+
+        cfile="$(sak_mkcache)"
+
+        err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -o "$cfile" \
+          --root --db "$searchdb" --prefix "$searchprefix" --get basics)"
+
+        if [[ -n "$err" ]]; then
+          #sak_wait_message 5 "Error" "$err" 5 35
+          #return 1
+          continue
+        fi 
+
+        i=0
+
+        while IFS=$'\x1E' read -ra basic; do
+          case "${basic[0]}" in
+            siteurl)              siteurl="${basic[1]}"    ;;
+          esac
+        done < "$cfile"
+        
+        # for OWP we will allow it to match as long as the siteurl ends with "~username"
+        [[ "$IS_OWP" = "1" ]] && [[ "$siteurl" =  *"/~$ownername"* ]] && founddbs=("${founddbs[@]}"  "$searchdb $searchprefix  $siteurl")
+
+        [[ "$siteurl" =  *"//$domain"* ]] && founddbs=("${founddbs[@]}"  "$searchdb $searchprefix $siteurl")
+
+      done
+
+    done
+
+    if [[ "${#founddbs[@]}" -gt "1" ]]; then
+      sak_message "Create" "[Preflight] Found multiple Databases. You will need to specify a target using --database or --prefix arguments. "
+      [[ "$IS_OWP" = "1" ]] && sak_message "Create" "[Preflight] Due to OWP domain matching, this may require manual review of each database ending with /~$ownername" 
+      for found in "${founddbs[@]}"; do 
+        read db prefix domain <<<"$found"; sak_message "Create" "Database: $db - Prefix: $prefix - Domain: $domain"; 
+      done
+      exit $SAK_ERR_ARG
+    fi
+
+    [[ "${#founddbs[@]}" -eq "0" ]]  && sak_message "Create" "[Preflight] Found no Databases for $domain. You will need to specify one using --database and --prefix arguments" &&
+      exit $SAK_ERR_ARG
+
+    read db prefix domain <<<${founddbs[0]};
+
+    sak_message "Create" "[Preflight] Found a single database '$db' prefix with the prefix '$prefix'"
+
+  fi
+
+  # No domain specified, lets try and find the correct one
+  if [[ -z "$domain" ]]; then
+
+    cfile="$(sak_mkcache)"
+
+    err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -o "$cfile" \
+      --root --db "$db" --prefix "$prefix" --get dbver)"
+
+    if [[ -n "$err" ]]; then
+      sak_wait_message 5 "Error" "$err" 5 35
+      return 1
+    fi
+
+    i=0
+
+    while IFS=$'\x1E' read -ra DBVER; do
+      db_name[$i]="${DBVER[0]}"
+      db_pre[$i]="${DBVER[1]}"
+      db_ver[$i]="${DBVER[2]}"
+      db_mu[((i++))]="${DBVER[3]}"
+    done < "$cfile"
+
+
+    for searchprefix in "${db_pre[@]}"; do 
+
+      cfile="$(sak_mkcache)"
+
+      err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -o "$cfile" \
+        --root --db "$db" --prefix "$searchprefix" --get basics)"
+
+      if [[ -n "$err" ]]; then
+        #sak_wait_message 5 "Error" "$err" 5 35
+        #return 1
+        continue
+      fi 
+
+      i=0
+
+      while IFS=$'\x1E' read -ra basic; do
+        case "${basic[0]}" in
+          siteurl)              siteurl="${basic[1]}"    ;;
+        esac
+      done < "$cfile"
+        
+      founddomains=("${founddomains[@]}"  "$searchprefix $siteurl")
+    done
+
+    [[ "${#founddomains[@]}" -gt "1" ]] && 
+      sak_message "Create" "[Preflight] Found multiple targets. You will need to specify a target using --domain or --prefix arguments:" &&
+      for found in "${founddomains[@]}"; do read prefix domain <<<"$found"; sak_message "Create" "Database: $db - Prefix: $prefix - Domain: $domain"; done && 
+      exit $SAK_ERR_ARG
+
+    [[ "${#founddomains[@]}" -eq "0" ]]  && 
+      sak_message "Create" "[Preflight] Found no wordpress sites for the database $db. You will need to specify one using --database and --prefix arguments." &&
+      exit $SAK_ERR_ARG
+
+    read prefix domain <<<${founddomains[0]};
+
+    sak_message "Create" "[Preflight] Found a single domain '$domain' under the prefix '$prefix' "
+  fi
+
+  # Some final sanity checks for OWP servers
+  if [[ "$IS_OWP" = "1" ]] && [[ "$domain" = *"/~$ownername"* ]]; then
+    # If the domain ends with ~user then we need to check that, 1. we are in public_html and 2. we have the actual domain saved
+    [[ "$IS_OWP_ROOT" = "0" ]] && 
+      sak_message "Error" "You are attempting to use an OWP database ending in '/~$ownername' however the current install is not located in /public_html" &&
+      exit $SAK_ERR_ARG
+    [[ -z "$primary_domain" ]] && 
+      sak_message "Error" "$primary_domain OWP database detected however sak-cli was unable to determine the account's primary domain. This should not happen and we are failing out to prevent further issues" &&
+      exit $SAK_ERR_ARG
+    
+  fi
+
+  
+  sak_message "Create" "[Preflight] Using '$domain' under the database '$db' the prefix '$prefix' "
+
+  for dir in "wp-content" "wp-admin" "wp-includes"; do
+    [[ -e "$PWD/$dir" ]] || {
+      sak_message "Error" "[Preflight] One or more critical WordPress directories are missing! Perhapse you need to use resurrect?" &&
+      exit $SAK_ERR_ARG
+      }
+  done
+
+  cfile="$(sak_mkcache)"
+
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/soft/wordpress/main.php" -o "$cfile" \
+    --root --db "$db" --prefix "$prefix" --get dbver)"
+
+  if [[ -n "$err" ]]; then
+    sak_wait_message 5 "Error" "$err" 5 35
+    return 1
+  fi
+
+  i=0
+
+  while IFS=$'\x1E' read -ra DBVER; do
+    db_name[$i]="${DBVER[0]}"
+    db_pre[$i]="${DBVER[1]}"
+    db_ver[$i]="${DBVER[2]}"
+    db_mu[((i++))]="${DBVER[3]}"
+  done < "$cfile"
+
+  sak_message "Create" "Authentication checks."
+
+  group="${SAK_GIDS[$owner]}"
+
+  u="${db%%_*}"
+  ! sak_msg_silence && [[ -n "$u" && "$u" != "$ownername" ]] &&
+    sak_message "Warning" "  [MySQL] Database user \`$u' does not match \`$ownername' user."
+
+  if [[ -n "$p" ]]; then  # Get password from console
+    printf '\e[s'
+    read -resp 'Password: ' pass 2>&3
+    printf '\e[u\e[K'
+  fi
+
+  # Create auth
+  if [[ "$newauth" == "1" ]]; then
+    newgrant=1
+    if [[ -z "$user" ]]; then # User was not specified
+      if ! sak_mysql_check_user "$db" &>/dev/null; then # First, try to use DB name as username
+        user="$db"
+        sak_message "Create" "[MySQL] Using database name \`$user' as username."
+      else
+        sak_message "Warning" "  [MySQL] User with the same name of \`$db' already exists, ignoring and making new user."
+        n=1 # Generate user && Verify user does not exist
+        while [[ -z "$user" ]] || sak_mysql_check_user "$user" &>/dev/null; do
+          [[ "$n" -gt "20" ]] &&
+            sak_message "Error" "[MySQL] Could not generate a valid username after 20 attempts!" &&
+            exit $SAK_ERR_UNK
+          printf -v user '%s_wp%d' "$ownername" "$n"
+          let "n++"
+        done
+        sak_message "Create" "[MySQL] Using generated username \`$user'"
+      fi
+    else # Verify user does not exist
+      if err="$(sak_mysql_check_user "$user")"; then
+        sak_message "Error" "[MySQL] Specified user \`$user' already exists!"
+        exit $SAK_ERR_ARG
+      fi
+      sak_message "Create" "[MySQL] Using specified username \`$user'"
+    fi
+    if [[ -z "$p" ]]; then # Generate password
+      pass="$(sak_make_password)"
+      sak_message "Create" "[MySQL] Using generated password: $pass"
+    else
+      sak_message "Create" "[MySQL] Using manually typed password."
+    fi
+    sak_message "Create" "[MySQL] Creating the new user."
+    sak_mysql_create_auth "$user" "$pass"
+  fi
+
+  [[ -z "$user" ]] &&
+    sak_message "Error" "[MySQL] A database username is required when not created automatically.\n[MySQL] Please specify with --user <username> or use --create-auth" &&
+    exit $SAK_ERR_ARG
+
+  if [[ "$newpass" == "1" ]]; then
+    [[ ! "$user" =~ _ ]] &&
+      sak_message "Error" "[MySQL] Refusing to update password. Only user_dbname style usernames are supported." &&
+      exit $SAK_ERR_ARG
+    if ! sak_mysql_check_user "$user" &>/dev/null; then
+      sak_message "Error" "[MySQL] The user \`$user' does not exist. Cannot update password for non-existant user." &&
+      exit $SAK_ERR_ARG
+    fi
+    pass="$(sak_make_password)"
+    sak_message "Create" "[MySQL] Using generated password: $pass"
+    sak_message "Create" "[MySQL] Updating password for user \`$user'"
+    sak_mysql_create_pass "$user" "$pass"
+  fi
+
+  if [[ "$newgrant" == "1" || "$newpass" == "1" ]]; then
+    sak_message "Create" "[MySQL] Updating user privileges on database."
+    sak_cpanel_map_dbuser "$ownername" "$user" "$db"
+    sak_cpanel_map_privs "$owner" "$user" "$db"
+  fi
+
+  [[ -z "$pass" ]] &&
+    sak_message "Error" "A database password is required. Please specify one or have it created (see help)." &&
+    exit $SAK_ERR_ARG
+
+  # See if user exists
+  if ! err="$(sak_mysql_check_user "$user")"; then
+    sak_message "Error" "[MySQL] User \`$user' does not exist.\n$err"
+    exit $SAK_ERR_ARG
+  fi
+  sak_message "Create" "[MySQL] Verified user $user exists."
+
+  # Test auth
+  if ! err="$(sak_mysql_check_auth_db "$user" "$pass" "$db")"; then
+    sak_message "Error" "[MySQL] Authentication failed.\n$err"
+    exit $SAK_ERR_ARG
+  fi
+  sak_message "Create" "[MySQL] Verified authentication successful."
+
+  [[ "${db_mu[0]}" == "1" ]] &&
+    sak_message "Warning" "  [Preflight] Possible WordPress MultiSite tables detected!\n  [Preflight] Additional post-installation adjustments will be necessary!"
+
+  # NOTE: Variable "soft" re-used here
+  printf -v soft '%s\t%s\t%s\t%s' -1 "wordpress" "$PWD" "$ver"
+  SAK_SOFTWARE=("$soft")
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  # Set us up the bomb
+  SAK_WP_INIT=0
+  SAK_WP_CONFIG="$PWD/wp-config.php"
+  SAK_WP_DB="$db"
+  SAK_WP_HOST="${host:-localhost}"
+  SAK_WP_PREFIX="${db_pre[0]}"
+  SAK_WP_MU="${db_mu[0]}"
+  SAK_WP_VER="$ver"
+  SAK_WP_OWP_DOMAIN="http://$primary_domain"
+
+  ! sak_msg_silence && {
+    sak_cli_wp_info "basics"
+    sak_message "Create" "[Preflight] Preflight check success."
+    echo
+    sak_message "Create" "[Config] Proceeding."
+  }
+
+  local config url="http://sak.dev.gatorsec.net/software/configs/wordpress/wordpress-000.txt"
+  sak_message "Create" "[Config] Downloading generic WordPress config."
+  config="$(sak_download_pipe "$url")"
+
+  # database
+  sak_message "Create" "[Config] Making database connection adjustments."
+  config="$(sak_edit_tag "DEFINE_DB_NAME_000" "$SAK_WP_DB" <<< "$config")"
+  config="$(sak_edit_tag "DEFINE_DB_USER_000" "$user" <<< "$config")"
+  config="$(sak_edit_tag "DEFINE_DB_PASS_000" "${pass/"'"/\'}" <<< "$config")"
+  config="$(sak_edit_tag "DEFINE_DB_HOST_000" "$SAK_WP_HOST" <<< "$config")"
+  config="$(sak_edit_tag "DEFINE_WP_PREFIX_000" "$SAK_WP_PREFIX" <<< "$config")"
+
+  # OWP Stuff
+  if [[ "$IS_OWP" = "1" ]] && [[ "$domain" = *"/~$ownername"* ]]; then
+    OWP_config=$(echo -e "<?php\ndefine('WP_HOME','DEFINE_OWP_HOME');\ndefine('WP_SITEURL','DEFINE_OWP_HOME');")
+    config="$(sak_edit_tag "<?php" "$OWP_config" <<< "$config")"
+    config="$(sak_edit_tag "DEFINE_OWP_HOME" "$SAK_WP_OWP_DOMAIN" <<< "$config")"
+    config="$(sak_edit_tag "DEFINE_OWP_HOME" "$SAK_WP_OWP_DOMAIN" <<< "$config")"
+  fi
+
+
+  # salts
+  salts="$(sak_wp_make_salts)"
+  sak_message "Create" "[Config] Generating random salts."
+  config="$(sak_edit_tag "DEFINE_WP_SALTS_000" "$salts" <<< "$config")"
+
+  # multisite (not fully supported)
+  if [[ "$SAK_WP_MU" == "1" ]]; then
+    sak_message "Create" "[Config] Enabling MultiSite dashboard menu."
+    mu="define('WP_ALLOW_MULTISITE', true);"
+    config="$(sak_edit_tag "DEFINE_WP_MULTISITE_000" "$mu" <<< "$config")"
+  else
+    config="$(sak_edit_tag "DEFINE_WP_MULTISITE_000" "" 1 <<< "$config")"
+  fi
+
+  sak_message "Create" "[Config] Writing configuration file."
+  printf '%s\n' "$config" > "$SAK_WP_CONFIG"
+  chown "$ownername:$group" "$SAK_WP_CONFIG"
+  chmod 644 "$SAK_WP_CONFIG"
+
+  ! sak_msg_silence && {
+    echo # Get out your shotgun, this zombie has risen
+    sak_message "Create" "WordPress version $SAK_WP_VER successfully resurrected. Mmmm...Brains..."
+    echo
+
+    [[ "$SAK_WP_MU" == "1" ]] &&
+      sak_message "Warning" "[Post Install] WordPress MultiSite needs additional configuration.\n[Post Install] Please see http://goo.gl/8J7qD for more information." &&
+      echo
+  }
+  return 0
+}

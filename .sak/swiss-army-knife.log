@@ -1,0 +1,292 @@
+[  UNIXTIME  | DATE                            ] RUSER         PID LEVEL  :: TYPE         : MESSAGE
+[ 1493695769 | Mon,  1 May 2017 22:29:29 -0500 ] jameswright  25026 INFO   :: START        : Command line: sak-cli orphans
+[ 1493695769 | Mon,  1 May 2017 22:29:29 -0500 ] jameswright  25026 INFO   :: START        : Working dir: /home/holyshovel/public_html
+[ 1493695769 | Mon,  1 May 2017 22:29:29 -0500 ] jameswright  25026 INFO   :: START        : Parsed  Args: orphans
+[ 1493695771 | Mon,  1 May 2017 22:29:31 -0500 ] jameswright  25026 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli_orphans /root/bin/.sak/modules/cli
+[ 1494386069 | Tue,  9 May 2017 22:14:29 -0500 ]              2845 INFO   :: START        : Command line: sak-cli holyshovel.com
+[ 1494386069 | Tue,  9 May 2017 22:14:29 -0500 ]              2845 INFO   :: START        : Working dir: /root
+[ 1494386069 | Tue,  9 May 2017 22:14:29 -0500 ]              2845 INFO   :: START        : Parsed  Args: holyshovel.com
+[ 1494386069 | Tue,  9 May 2017 22:14:29 -0500 ]              2845 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1494386093 | Tue,  9 May 2017 22:14:53 -0500 ]              2907 INFO   :: START        : Command line: sak-cli wp holyshovel.com
+[ 1494386093 | Tue,  9 May 2017 22:14:53 -0500 ]              2907 INFO   :: START        : Working dir: /root
+[ 1494386093 | Tue,  9 May 2017 22:14:53 -0500 ]              2907 INFO   :: START        : Parsed  Args: wp holyshovel.com
+[ 1494386093 | Tue,  9 May 2017 22:14:53 -0500 ]              2907 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli_wp /root/bin/.sak/modules/soft/wordpress/cli
+[ 1494386165 | Tue,  9 May 2017 22:16:05 -0500 ]              3068 INFO   :: START        : Command line: sak-cli wp info holyshovel.com
+[ 1494386165 | Tue,  9 May 2017 22:16:05 -0500 ]              3068 INFO   :: START        : Working dir: /root
+[ 1494386165 | Tue,  9 May 2017 22:16:05 -0500 ]              3068 INFO   :: START        : Parsed  Args: wp info holyshovel.com
+[ 1494386165 | Tue,  9 May 2017 22:16:05 -0500 ]              3068 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli_wp_info /root/bin/.sak/modules/soft/wordpress/cli
+[ 1507319746 | Fri,  6 Oct 2017 14:55:46 -0500 ]             15364 INFO   :: START        : Command line: sak-cli 
+[ 1507319747 | Fri,  6 Oct 2017 14:55:47 -0500 ]             15364 INFO   :: START        : Working dir: /root/bin
+[ 1507319747 | Fri,  6 Oct 2017 14:55:47 -0500 ]             15364 INFO   :: START        : Parsed  Args: 
+[ 1507319747 | Fri,  6 Oct 2017 14:55:47 -0500 ]             15364 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 329 sak_cli_get_installs /root/bin/.sak/modules/cli
+[ 1507319747 | Fri,  6 Oct 2017 14:55:47 -0500 ]             15364 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal ./sak-cli
+[ 1507321362 | Fri,  6 Oct 2017 15:22:42 -0500 ]             15925 INFO   :: START        : Command line: sak holyshovel.com
+[ 1507321362 | Fri,  6 Oct 2017 15:22:42 -0500 ]             15925 INFO   :: START        : Working dir: /root/bin
+[ 1507321362 | Fri,  6 Oct 2017 15:22:42 -0500 ]             15925 INFO   :: START        : Parsed  Args: holyshovel.com
+[ 1507321362 | Fri,  6 Oct 2017 15:22:42 -0500 ]             15925 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 235 sak_add_targets /root/bin/sak
+[ 1507321362 | Fri,  6 Oct 2017 15:22:42 -0500 ]             15925 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak
+[ 1507321369 | Fri,  6 Oct 2017 15:22:49 -0500 ]             15962 INFO   :: START        : Command line: sak holyshovel
+[ 1507321369 | Fri,  6 Oct 2017 15:22:49 -0500 ]             15962 INFO   :: START        : Working dir: /root/bin
+[ 1507321369 | Fri,  6 Oct 2017 15:22:49 -0500 ]             15962 INFO   :: START        : Parsed  Args: holyshovel
+[ 1507321369 | Fri,  6 Oct 2017 15:22:49 -0500 ]             15962 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 235 sak_add_targets /root/bin/sak
+[ 1507321369 | Fri,  6 Oct 2017 15:22:49 -0500 ]             15962 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak
+[ 1507321374 | Fri,  6 Oct 2017 15:22:54 -0500 ]             15992 INFO   :: START        : Command line: sak --help
+[ 1507321374 | Fri,  6 Oct 2017 15:22:54 -0500 ]             15992 INFO   :: START        : Working dir: /root/bin
+[ 1507321374 | Fri,  6 Oct 2017 15:22:54 -0500 ]             15992 WARN   :: EXIT         : Script exit. Caller = 1 parse_args /root/bin/sak
+[ 1510515812 | Sun, 12 Nov 2017 13:43:32 -0600 ]             18206 INFO   :: START        : Command line: sak-cli --hlep
+[ 1510515812 | Sun, 12 Nov 2017 13:43:32 -0600 ]             18206 INFO   :: START        : Working dir: /root
+[ 1510515812 | Sun, 12 Nov 2017 13:43:32 -0600 ]             18206 WARN   :: EXIT         : Script exit. Caller = 1 main /root/bin/sak-cli
+[ 1510515817 | Sun, 12 Nov 2017 13:43:37 -0600 ]             18232 INFO   :: START        : Command line: sak-cli --help
+[ 1510515817 | Sun, 12 Nov 2017 13:43:37 -0600 ]             18232 INFO   :: START        : Working dir: /root
+[ 1510515817 | Sun, 12 Nov 2017 13:43:37 -0600 ]             18232 INFO   :: START        : Parsed  Args: --help
+[ 1510515817 | Sun, 12 Nov 2017 13:43:37 -0600 ]             18232 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1518307192 | Sat, 10 Feb 2018 17:59:52 -0600 ]             15155 INFO   :: START        : Command line: sak-cli --help
+[ 1518307192 | Sat, 10 Feb 2018 17:59:52 -0600 ]             15155 INFO   :: START        : Working dir: /root/bin
+[ 1518307192 | Sat, 10 Feb 2018 17:59:52 -0600 ]             15155 INFO   :: START        : Parsed  Args: --help
+[ 1518307192 | Sat, 10 Feb 2018 17:59:52 -0600 ]             15155 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1518307272 | Sat, 10 Feb 2018 18:01:12 -0600 ]             15209 INFO   :: START        : Command line: sak-cli replace --help
+[ 1518307272 | Sat, 10 Feb 2018 18:01:12 -0600 ]             15209 INFO   :: START        : Working dir: /root/bin
+[ 1518307272 | Sat, 10 Feb 2018 18:01:12 -0600 ]             15209 INFO   :: START        : Parsed  Args: replace --help
+[ 1518307272 | Sat, 10 Feb 2018 18:01:12 -0600 ]             15209 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli_replace /root/bin/.sak/modules/cli
+[ 1518492703 | Mon, 12 Feb 2018 21:31:43 -0600 ]              8000 INFO   :: START        : Command line: sak-cli --help
+[ 1518492703 | Mon, 12 Feb 2018 21:31:43 -0600 ]              8000 INFO   :: START        : Working dir: /root
+[ 1518492703 | Mon, 12 Feb 2018 21:31:43 -0600 ]              8000 INFO   :: START        : Parsed  Args: --help
+[ 1518492703 | Mon, 12 Feb 2018 21:31:43 -0600 ]              8000 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1527099145 | Wed, 23 May 2018 13:12:25 -0500 ]             29187 INFO   :: START        : Command line: sak-cli --help
+[ 1527099145 | Wed, 23 May 2018 13:12:25 -0500 ]             29187 INFO   :: START        : Working dir: /root
+[ 1527099145 | Wed, 23 May 2018 13:12:25 -0500 ]             29187 INFO   :: START        : Parsed  Args: --help
+[ 1527099145 | Wed, 23 May 2018 13:12:25 -0500 ]             29187 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1527099189 | Wed, 23 May 2018 13:13:09 -0500 ]             29222 INFO   :: START        : Command line: sak-cli info
+[ 1527099189 | Wed, 23 May 2018 13:13:09 -0500 ]             29222 INFO   :: START        : Working dir: /home/holyshovel/public_html
+[ 1527099189 | Wed, 23 May 2018 13:13:09 -0500 ]             29222 INFO   :: START        : Parsed  Args: info
+[ 1527099191 | Wed, 23 May 2018 13:13:11 -0500 ]             29222 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1527099299 | Wed, 23 May 2018 13:14:59 -0500 ]             29392 INFO   :: START        : Command line: sak-cli info
+[ 1527099299 | Wed, 23 May 2018 13:14:59 -0500 ]             29392 INFO   :: START        : Working dir: /home/holyshovel/public_html/joomla.holyshovel.com
+[ 1527099299 | Wed, 23 May 2018 13:14:59 -0500 ]             29392 INFO   :: START        : Parsed  Args: info
+[ 1527099299 | Wed, 23 May 2018 13:14:59 -0500 ]             29392 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 329 sak_cli_get_installs /root/bin/.sak/modules/cli
+[ 1527099299 | Wed, 23 May 2018 13:14:59 -0500 ]             29392 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak-cli
+[ 1527099314 | Wed, 23 May 2018 13:15:14 -0500 ]             29443 INFO   :: START        : Command line: sak-cli info
+[ 1527099314 | Wed, 23 May 2018 13:15:14 -0500 ]             29443 INFO   :: START        : Working dir: /home/holyshovel/public_html/drupal.holyshovel.com
+[ 1527099314 | Wed, 23 May 2018 13:15:14 -0500 ]             29443 INFO   :: START        : Parsed  Args: info
+[ 1527099315 | Wed, 23 May 2018 13:15:15 -0500 ]             29443 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 329 sak_cli_get_installs /root/bin/.sak/modules/cli
+[ 1527099315 | Wed, 23 May 2018 13:15:15 -0500 ]             29443 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak-cli
+[ 1527099342 | Wed, 23 May 2018 13:15:42 -0500 ]             29481 INFO   :: START        : Command line: sak-cli info
+[ 1527099342 | Wed, 23 May 2018 13:15:42 -0500 ]             29481 INFO   :: START        : Working dir: /home/holyshovel/site.holyshovel.com
+[ 1527099342 | Wed, 23 May 2018 13:15:42 -0500 ]             29481 INFO   :: START        : Parsed  Args: info
+[ 1527099342 | Wed, 23 May 2018 13:15:42 -0500 ]             29481 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 329 sak_cli_get_installs /root/bin/.sak/modules/cli
+[ 1527099342 | Wed, 23 May 2018 13:15:42 -0500 ]             29481 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak-cli
+[ 1537498120 | Thu, 20 Sep 2018 21:48:40 -0500 ]              2098 INFO   :: START        : Command line: sak-cli --help
+[ 1537498120 | Thu, 20 Sep 2018 21:48:40 -0500 ]              2098 INFO   :: START        : Working dir: /home/holyshovel/joomla.holyshovel.com
+[ 1537498120 | Thu, 20 Sep 2018 21:48:40 -0500 ]              2098 INFO   :: START        : Parsed  Args: --help
+[ 1537498120 | Thu, 20 Sep 2018 21:48:40 -0500 ]              2098 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1537498249 | Thu, 20 Sep 2018 21:50:49 -0500 ]              2149 INFO   :: START        : Command line: sak-cli info
+[ 1537498249 | Thu, 20 Sep 2018 21:50:49 -0500 ]              2149 INFO   :: START        : Working dir: /home/holyshovel/joomla.holyshovel.com
+[ 1537498249 | Thu, 20 Sep 2018 21:50:49 -0500 ]              2149 INFO   :: START        : Parsed  Args: info
+[ 1537498250 | Thu, 20 Sep 2018 21:50:50 -0500 ]              2149 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 329 sak_cli_get_installs /root/bin/.sak/modules/cli
+[ 1537498250 | Thu, 20 Sep 2018 21:50:50 -0500 ]              2149 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak-cli
+[ 1537498266 | Thu, 20 Sep 2018 21:51:06 -0500 ]              2192 INFO   :: START        : Command line: sak-cli --help
+[ 1537498266 | Thu, 20 Sep 2018 21:51:06 -0500 ]              2192 INFO   :: START        : Working dir: /home/holyshovel/joomla.holyshovel.com
+[ 1537498266 | Thu, 20 Sep 2018 21:51:06 -0500 ]              2192 INFO   :: START        : Parsed  Args: --help
+[ 1537498266 | Thu, 20 Sep 2018 21:51:06 -0500 ]              2192 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1537498283 | Thu, 20 Sep 2018 21:51:23 -0500 ]              2219 INFO   :: START        : Command line: sak-cli jos --help
+[ 1537498283 | Thu, 20 Sep 2018 21:51:23 -0500 ]              2219 INFO   :: START        : Working dir: /home/holyshovel/joomla.holyshovel.com
+[ 1537498283 | Thu, 20 Sep 2018 21:51:23 -0500 ]              2219 INFO   :: START        : Parsed  Args: jos --help
+[ 1537498283 | Thu, 20 Sep 2018 21:51:23 -0500 ]              2219 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1537498349 | Thu, 20 Sep 2018 21:52:29 -0500 ]              2253 INFO   :: START        : Command line: sak-cli jos info
+[ 1537498349 | Thu, 20 Sep 2018 21:52:29 -0500 ]              2253 INFO   :: START        : Working dir: /home/holyshovel/joomla.holyshovel.com
+[ 1537498349 | Thu, 20 Sep 2018 21:52:29 -0500 ]              2253 INFO   :: START        : Parsed  Args: jos info
+[ 1537498349 | Thu, 20 Sep 2018 21:52:29 -0500 ]              2253 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 325 sak_cli_get_installs /root/bin/.sak/modules/cli
+[ 1537498349 | Thu, 20 Sep 2018 21:52:29 -0500 ]              2253 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak-cli
+[ 1537498446 | Thu, 20 Sep 2018 21:54:06 -0500 ]              2372 INFO   :: START        : Command line: sak-cli jos info
+[ 1537498446 | Thu, 20 Sep 2018 21:54:06 -0500 ]              2372 INFO   :: START        : Working dir: /home/holyshovel/joomla.holyshovel.com
+[ 1537498446 | Thu, 20 Sep 2018 21:54:06 -0500 ]              2372 INFO   :: START        : Parsed  Args: jos info
+[ 1537498446 | Thu, 20 Sep 2018 21:54:06 -0500 ]              2372 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 325 sak_cli_get_installs /root/bin/.sak/modules/cli
+[ 1537498446 | Thu, 20 Sep 2018 21:54:06 -0500 ]              2372 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak-cli
+[ 1537498489 | Thu, 20 Sep 2018 21:54:49 -0500 ]              2416 INFO   :: START        : Command line: sak-cli jos replace
+[ 1537498489 | Thu, 20 Sep 2018 21:54:49 -0500 ]              2416 INFO   :: START        : Working dir: /home/holyshovel/joomla.holyshovel.com
+[ 1537498489 | Thu, 20 Sep 2018 21:54:49 -0500 ]              2416 INFO   :: START        : Parsed  Args: jos replace
+[ 1537498489 | Thu, 20 Sep 2018 21:54:49 -0500 ]              2416 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 325 sak_cli_get_installs /root/bin/.sak/modules/cli
+[ 1537498489 | Thu, 20 Sep 2018 21:54:49 -0500 ]              2416 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak-cli
+[ 1537498618 | Thu, 20 Sep 2018 21:56:58 -0500 ]              2482 INFO   :: START        : Command line: sak-cli info
+[ 1537498618 | Thu, 20 Sep 2018 21:56:58 -0500 ]              2482 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1537498618 | Thu, 20 Sep 2018 21:56:58 -0500 ]              2482 INFO   :: START        : Parsed  Args: info
+[ 1537498619 | Thu, 20 Sep 2018 21:56:59 -0500 ]              2482 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1539716175 | Tue, 16 Oct 2018 13:56:15 -0500 ] dbiniek     21840 INFO   :: START        : Command line: sak 
+[ 1539716175 | Tue, 16 Oct 2018 13:56:15 -0500 ] dbiniek     21840 INFO   :: START        : Working dir: /home/holyshovel/public_html
+[ 1539716175 | Tue, 16 Oct 2018 13:56:15 -0500 ] dbiniek     21840 INFO   :: START        : Parsed  Args: 
+[ 1539716176 | Tue, 16 Oct 2018 13:56:16 -0500 ] dbiniek     21840 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 235 sak_add_targets /root/bin/sak
+[ 1539716176 | Tue, 16 Oct 2018 13:56:16 -0500 ] dbiniek     21840 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak
+[ 1539716188 | Tue, 16 Oct 2018 13:56:28 -0500 ] dbiniek     21872 INFO   :: START        : Command line: sak 
+[ 1539716188 | Tue, 16 Oct 2018 13:56:28 -0500 ] dbiniek     21872 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1539716188 | Tue, 16 Oct 2018 13:56:28 -0500 ] dbiniek     21872 INFO   :: START        : Parsed  Args: 
+[ 1539716188 | Tue, 16 Oct 2018 13:56:28 -0500 ] dbiniek     21872 ERROR  :: SAK_FATAL    : sak_fatal called. Caller = 235 sak_add_targets /root/bin/sak
+[ 1539716188 | Tue, 16 Oct 2018 13:56:28 -0500 ] dbiniek     21872 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal /root/bin/sak
+[ 1539716193 | Tue, 16 Oct 2018 13:56:33 -0500 ] dbiniek     21903 INFO   :: START        : Command line: sak -u holyshovel
+[ 1539716193 | Tue, 16 Oct 2018 13:56:33 -0500 ] dbiniek     21903 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1539716193 | Tue, 16 Oct 2018 13:56:33 -0500 ] dbiniek     21903 WARN   :: EXIT         : Script exit. Caller = 1 main /root/bin/sak
+[ 1542160947 | Tue, 13 Nov 2018 20:02:27 -0600 ]             18962 INFO   :: START        : Command line: sak-cli wp plugin
+[ 1542160947 | Tue, 13 Nov 2018 20:02:27 -0600 ]             18962 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542160947 | Tue, 13 Nov 2018 20:02:27 -0600 ]             18962 INFO   :: START        : Parsed  Args: wp plugin
+[ 1542160949 | Tue, 13 Nov 2018 20:02:29 -0600 ]             18962 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542160962 | Tue, 13 Nov 2018 20:02:42 -0600 ]             19032 INFO   :: START        : Command line: sak-cli wp plugin disable wp-super-cache/wp-cache.php
+[ 1542160962 | Tue, 13 Nov 2018 20:02:42 -0600 ]             19032 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542160962 | Tue, 13 Nov 2018 20:02:42 -0600 ]             19032 INFO   :: START        : Parsed  Args: wp plugin disable wp-super-cache/wp-cache.php
+[ 1542160963 | Tue, 13 Nov 2018 20:02:43 -0600 ]             19032 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542160991 | Tue, 13 Nov 2018 20:03:11 -0600 ]             19140 INFO   :: START        : Command line: sak-cli wp plugin disable wp-super-cache/wp-cache.php
+[ 1542160991 | Tue, 13 Nov 2018 20:03:11 -0600 ]             19140 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542160991 | Tue, 13 Nov 2018 20:03:11 -0600 ]             19140 INFO   :: START        : Parsed  Args: wp plugin disable wp-super-cache/wp-cache.php
+[ 1542160993 | Tue, 13 Nov 2018 20:03:13 -0600 ]             19140 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542161067 | Tue, 13 Nov 2018 20:04:27 -0600 ]             19300 INFO   :: START        : Command line: sak-cli wp plugin disable autoptimize/autoptimize.php
+[ 1542161067 | Tue, 13 Nov 2018 20:04:27 -0600 ]             19300 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542161067 | Tue, 13 Nov 2018 20:04:27 -0600 ]             19300 INFO   :: START        : Parsed  Args: wp plugin disable autoptimize/autoptimize.php
+[ 1542161068 | Tue, 13 Nov 2018 20:04:28 -0600 ]             19300 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542162694 | Tue, 13 Nov 2018 20:31:34 -0600 ]             20888 INFO   :: START        : Command line: sak-cli wp plugin
+[ 1542162694 | Tue, 13 Nov 2018 20:31:34 -0600 ]             20888 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542162694 | Tue, 13 Nov 2018 20:31:34 -0600 ]             20888 INFO   :: START        : Parsed  Args: wp plugin
+[ 1542162695 | Tue, 13 Nov 2018 20:31:35 -0600 ]             20888 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542162716 | Tue, 13 Nov 2018 20:31:56 -0600 ]             20960 INFO   :: START        : Command line: sak-cli wp plugin enable wp-super-cache/wp-cache.php autoptimize/autoptimize.php
+[ 1542162716 | Tue, 13 Nov 2018 20:31:56 -0600 ]             20960 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542162716 | Tue, 13 Nov 2018 20:31:56 -0600 ]             20960 INFO   :: START        : Parsed  Args: wp plugin enable wp-super-cache/wp-cache.php autoptimize/autoptimize.php
+[ 1542162720 | Tue, 13 Nov 2018 20:32:00 -0600 ]             20960 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542162730 | Tue, 13 Nov 2018 20:32:10 -0600 ]             21065 INFO   :: START        : Command line: sak-cli wp plugin enable theme-check/theme-check.php
+[ 1542162730 | Tue, 13 Nov 2018 20:32:10 -0600 ]             21065 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542162730 | Tue, 13 Nov 2018 20:32:10 -0600 ]             21065 INFO   :: START        : Parsed  Args: wp plugin enable theme-check/theme-check.php
+[ 1542162731 | Tue, 13 Nov 2018 20:32:11 -0600 ]             21065 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542162739 | Tue, 13 Nov 2018 20:32:19 -0600 ]             21164 INFO   :: START        : Command line: sak-cli wp theme
+[ 1542162739 | Tue, 13 Nov 2018 20:32:19 -0600 ]             21164 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542162739 | Tue, 13 Nov 2018 20:32:19 -0600 ]             21164 INFO   :: START        : Parsed  Args: wp theme
+[ 1542162740 | Tue, 13 Nov 2018 20:32:20 -0600 ]             21164 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542162751 | Tue, 13 Nov 2018 20:32:31 -0600 ]             21234 INFO   :: START        : Command line: sak-cli wp info
+[ 1542162751 | Tue, 13 Nov 2018 20:32:31 -0600 ]             21234 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542162751 | Tue, 13 Nov 2018 20:32:31 -0600 ]             21234 INFO   :: START        : Parsed  Args: wp info
+[ 1542162752 | Tue, 13 Nov 2018 20:32:32 -0600 ]             21234 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542162915 | Tue, 13 Nov 2018 20:35:15 -0600 ]             21473 INFO   :: START        : Command line: sak-cli wp plugin --help
+[ 1542162915 | Tue, 13 Nov 2018 20:35:15 -0600 ]             21473 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542162915 | Tue, 13 Nov 2018 20:35:15 -0600 ]             21473 INFO   :: START        : Parsed  Args: wp plugin --help
+[ 1542162915 | Tue, 13 Nov 2018 20:35:15 -0600 ]             21473 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1542162945 | Tue, 13 Nov 2018 20:35:45 -0600 ]             21500 INFO   :: START        : Command line: sak-cli wp plugins test
+[ 1542162945 | Tue, 13 Nov 2018 20:35:45 -0600 ]             21500 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1542162945 | Tue, 13 Nov 2018 20:35:45 -0600 ]             21500 INFO   :: START        : Parsed  Args: wp plugins test
+[ 1542162980 | Tue, 13 Nov 2018 20:36:20 -0600 ]             21500 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1543928765 | Tue,  4 Dec 2018 07:06:05 -0600 ] dbiniek     30776 INFO   :: START        : Command line: sak-cli wp info
+[ 1543928765 | Tue,  4 Dec 2018 07:06:05 -0600 ] dbiniek     30776 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1543928765 | Tue,  4 Dec 2018 07:06:05 -0600 ] dbiniek     30776 INFO   :: START        : Parsed  Args: wp info
+[ 1543928773 | Tue,  4 Dec 2018 07:06:13 -0600 ] dbiniek     30776 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1543928798 | Tue,  4 Dec 2018 07:06:38 -0600 ] dbiniek     30989 INFO   :: START        : Command line: sak-cli wp diff
+[ 1543928798 | Tue,  4 Dec 2018 07:06:38 -0600 ] dbiniek     30989 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1543928798 | Tue,  4 Dec 2018 07:06:38 -0600 ] dbiniek     30989 INFO   :: START        : Parsed  Args: wp diff
+[ 1543928861 | Tue,  4 Dec 2018 07:07:41 -0600 ] dbiniek     30989 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli_diff /root/bin/.sak/modules/cli
+[ 1548856940 | Wed, 30 Jan 2019 08:02:20 -0600 ] dbiniek     27662 INFO   :: START        : Command line: sak-cli wp info
+[ 1548856940 | Wed, 30 Jan 2019 08:02:20 -0600 ] dbiniek     27662 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1548856940 | Wed, 30 Jan 2019 08:02:20 -0600 ] dbiniek     27662 INFO   :: START        : Parsed  Args: wp info
+[ 1548856950 | Wed, 30 Jan 2019 08:02:30 -0600 ] dbiniek     27662 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1548856960 | Wed, 30 Jan 2019 08:02:40 -0600 ] dbiniek     27828 INFO   :: START        : Command line: sak-cli wp plugins install help
+[ 1548856960 | Wed, 30 Jan 2019 08:02:40 -0600 ] dbiniek     27828 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1548856960 | Wed, 30 Jan 2019 08:02:40 -0600 ] dbiniek     27828 INFO   :: START        : Parsed  Args: wp plugins install help
+[ 1548856960 | Wed, 30 Jan 2019 08:02:40 -0600 ] dbiniek     27828 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1548856967 | Wed, 30 Jan 2019 08:02:47 -0600 ] dbiniek     27855 INFO   :: START        : Command line: sak-cli wp plugins install jetpack
+[ 1548856967 | Wed, 30 Jan 2019 08:02:47 -0600 ] dbiniek     27855 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1548856967 | Wed, 30 Jan 2019 08:02:47 -0600 ] dbiniek     27855 INFO   :: START        : Parsed  Args: wp plugins install jetpack
+[ 1548856969 | Wed, 30 Jan 2019 08:02:49 -0600 ] dbiniek     27855 ERROR  :: SAK_FATAL    : sak_fatal_backtrace called. Caller = 379 sak_wp_plugins_install /root/bin/.sak/modules/soft/wordpress/main
+[ 1548856969 | Wed, 30 Jan 2019 08:02:49 -0600 ] dbiniek     27855 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal_backtrace /root/bin/sak-cli
+[ 1548857000 | Wed, 30 Jan 2019 08:03:20 -0600 ] dbiniek     27956 INFO   :: START        : Command line: sak-cli wp plugins install jetpack
+[ 1548857000 | Wed, 30 Jan 2019 08:03:20 -0600 ] dbiniek     27956 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1548857000 | Wed, 30 Jan 2019 08:03:20 -0600 ] dbiniek     27956 INFO   :: START        : Parsed  Args: wp plugins install jetpack
+[ 1548857001 | Wed, 30 Jan 2019 08:03:21 -0600 ] dbiniek     27956 ERROR  :: SAK_FATAL    : sak_fatal_backtrace called. Caller = 379 sak_wp_plugins_install /root/bin/.sak/modules/soft/wordpress/main
+[ 1548857001 | Wed, 30 Jan 2019 08:03:21 -0600 ] dbiniek     27956 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal_backtrace /root/bin/sak-cli
+[ 1548857036 | Wed, 30 Jan 2019 08:03:56 -0600 ] dbiniek     28052 INFO   :: START        : Command line: sak-cli wp plugins install jetpack
+[ 1548857036 | Wed, 30 Jan 2019 08:03:56 -0600 ] dbiniek     28052 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1548857036 | Wed, 30 Jan 2019 08:03:56 -0600 ] dbiniek     28052 INFO   :: START        : Parsed  Args: wp plugins install jetpack
+[ 1548857037 | Wed, 30 Jan 2019 08:03:57 -0600 ] dbiniek     28052 ERROR  :: SAK_FATAL    : sak_fatal_backtrace called. Caller = 379 sak_wp_plugins_install /root/bin/.sak/modules/soft/wordpress/main
+[ 1548857037 | Wed, 30 Jan 2019 08:03:57 -0600 ] dbiniek     28052 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal_backtrace /root/bin/sak-cli
+[ 1548857089 | Wed, 30 Jan 2019 08:04:49 -0600 ] dbiniek     28202 INFO   :: START        : Command line: sak-cli wp plugins install help
+[ 1548857089 | Wed, 30 Jan 2019 08:04:49 -0600 ] dbiniek     28202 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1548857089 | Wed, 30 Jan 2019 08:04:49 -0600 ] dbiniek     28202 INFO   :: START        : Parsed  Args: wp plugins install help
+[ 1548857089 | Wed, 30 Jan 2019 08:04:49 -0600 ] dbiniek     28202 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1551508529 | Sat,  2 Mar 2019 00:35:29 -0600 ]             24140 INFO   :: START        : Command line: sak-cli wp info
+[ 1551508529 | Sat,  2 Mar 2019 00:35:29 -0600 ]             24140 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1551508529 | Sat,  2 Mar 2019 00:35:29 -0600 ]             24140 INFO   :: START        : Parsed  Args: wp info
+[ 1551508535 | Sat,  2 Mar 2019 00:35:35 -0600 ]             24140 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1551508679 | Sat,  2 Mar 2019 00:37:59 -0600 ]             24431 INFO   :: START        : Command line: sak-cli wp info
+[ 1551508679 | Sat,  2 Mar 2019 00:37:59 -0600 ]             24431 INFO   :: START        : Working dir: /home/holyshovel/blog
+[ 1551508679 | Sat,  2 Mar 2019 00:37:59 -0600 ]             24431 INFO   :: START        : Parsed  Args: wp info
+[ 1551508681 | Sat,  2 Mar 2019 00:38:01 -0600 ]             24431 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1580494773 | Fri, 31 Jan 2020 13:19:33 -0500 ]             12137 INFO   :: START        : Command line: sak-cli 
+[ 1580494773 | Fri, 31 Jan 2020 13:19:33 -0500 ]             12137 INFO   :: START        : Working dir: /var/www/davidbiniek.com/html/family
+[ 1580494773 | Fri, 31 Jan 2020 13:19:33 -0500 ]             12137 INFO   :: START        : Parsed  Args: 
+[ 1580494773 | Fri, 31 Jan 2020 13:19:33 -0500 ]             12137 ERROR  :: SAK_FATAL    : sak_fatal_backtrace called. Caller = 328 sak_get_installations /root/bin/sak-cli
+[ 1580494773 | Fri, 31 Jan 2020 13:19:33 -0500 ]             12137 WARN   :: EXIT         : Script exit. Caller = 1 sak_fatal_backtrace /root/bin/sak-cli
+[ 1580614049 | Sat,  1 Feb 2020 22:27:29 -0500 ]             17412 INFO   :: START        : Command line: sak-cli 
+[ 1580614049 | Sat,  1 Feb 2020 22:27:29 -0500 ]             17412 INFO   :: START        : Working dir: /var/www/davidbiniek.com/html/family
+[ 1580614049 | Sat,  1 Feb 2020 22:27:29 -0500 ]             17412 INFO   :: START        : Parsed  Args: 
+[ 1580614050 | Sat,  1 Feb 2020 22:27:30 -0500 ]             17412 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1580614173 | Sat,  1 Feb 2020 22:29:33 -0500 ]             17926 INFO   :: START        : Command line: sak-cli 
+[ 1580614173 | Sat,  1 Feb 2020 22:29:33 -0500 ]             17926 INFO   :: START        : Working dir: /var/www/davidbiniek.com/html/family
+[ 1580614173 | Sat,  1 Feb 2020 22:29:33 -0500 ]             17926 INFO   :: START        : Parsed  Args: 
+[ 1580614175 | Sat,  1 Feb 2020 22:29:35 -0500 ]             17926 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1582238092 | Thu, 20 Feb 2020 17:34:52 -0500 ]             13981 INFO   :: START        : Command line: sak-cli 
+[ 1582238092 | Thu, 20 Feb 2020 17:34:52 -0500 ]             13981 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1582238092 | Thu, 20 Feb 2020 17:34:52 -0500 ]             13981 INFO   :: START        : Parsed  Args: 
+[ 1582238093 | Thu, 20 Feb 2020 17:34:53 -0500 ]             13981 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1582238127 | Thu, 20 Feb 2020 17:35:27 -0500 ]             14103 INFO   :: START        : Command line: sak-cli --help
+[ 1582238127 | Thu, 20 Feb 2020 17:35:27 -0500 ]             14103 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1582238127 | Thu, 20 Feb 2020 17:35:27 -0500 ]             14103 INFO   :: START        : Parsed  Args: --help
+[ 1582238127 | Thu, 20 Feb 2020 17:35:27 -0500 ]             14103 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1582238184 | Thu, 20 Feb 2020 17:36:24 -0500 ]             14130 INFO   :: START        : Command line: sak-cli db --help
+[ 1582238184 | Thu, 20 Feb 2020 17:36:24 -0500 ]             14130 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1582238184 | Thu, 20 Feb 2020 17:36:24 -0500 ]             14130 INFO   :: START        : Parsed  Args: db --help
+[ 1582238184 | Thu, 20 Feb 2020 17:36:24 -0500 ]             14130 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1582238224 | Thu, 20 Feb 2020 17:37:04 -0500 ]             14158 INFO   :: START        : Command line: sak-cli 
+[ 1582238224 | Thu, 20 Feb 2020 17:37:04 -0500 ]             14158 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1582238224 | Thu, 20 Feb 2020 17:37:04 -0500 ]             14158 INFO   :: START        : Parsed  Args: 
+[ 1582238225 | Thu, 20 Feb 2020 17:37:05 -0500 ]             14158 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1582238823 | Thu, 20 Feb 2020 17:47:03 -0500 ]             14322 INFO   :: START        : Command line: sak-cli 
+[ 1582238823 | Thu, 20 Feb 2020 17:47:03 -0500 ]             14322 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1582238823 | Thu, 20 Feb 2020 17:47:03 -0500 ]             14322 INFO   :: START        : Parsed  Args: 
+[ 1582238824 | Thu, 20 Feb 2020 17:47:04 -0500 ]             14322 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1582240646 | Thu, 20 Feb 2020 18:17:26 -0500 ]             14587 INFO   :: START        : Command line: sak-cli 
+[ 1582240646 | Thu, 20 Feb 2020 18:17:26 -0500 ]             14587 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1582240646 | Thu, 20 Feb 2020 18:17:26 -0500 ]             14587 INFO   :: START        : Parsed  Args: 
+[ 1582240647 | Thu, 20 Feb 2020 18:17:27 -0500 ]             14587 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1582240740 | Thu, 20 Feb 2020 18:19:00 -0500 ]             14710 INFO   :: START        : Command line: sak-cli 
+[ 1582240740 | Thu, 20 Feb 2020 18:19:00 -0500 ]             14710 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1582240740 | Thu, 20 Feb 2020 18:19:00 -0500 ]             14710 INFO   :: START        : Parsed  Args: 
+[ 1582240741 | Thu, 20 Feb 2020 18:19:01 -0500 ]             14710 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1582240838 | Thu, 20 Feb 2020 18:20:38 -0500 ]             14837 INFO   :: START        : Command line: sak-cli 
+[ 1582240838 | Thu, 20 Feb 2020 18:20:38 -0500 ]             14837 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1582240838 | Thu, 20 Feb 2020 18:20:38 -0500 ]             14837 INFO   :: START        : Parsed  Args: 
+[ 1582240839 | Thu, 20 Feb 2020 18:20:39 -0500 ]             14837 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1583337548 | Wed,  4 Mar 2020 10:59:08 -0500 ]             21709 INFO   :: START        : Command line: sak-cli 
+[ 1583337548 | Wed,  4 Mar 2020 10:59:08 -0500 ]             21709 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1583337548 | Wed,  4 Mar 2020 10:59:08 -0500 ]             21709 INFO   :: START        : Parsed  Args: 
+[ 1583337549 | Wed,  4 Mar 2020 10:59:09 -0500 ]             21709 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1583337563 | Wed,  4 Mar 2020 10:59:23 -0500 ]             21832 INFO   :: START        : Command line: sak-cli -h
+[ 1583337563 | Wed,  4 Mar 2020 10:59:23 -0500 ]             21832 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1583337563 | Wed,  4 Mar 2020 10:59:23 -0500 ]             21832 INFO   :: START        : Parsed  Args: -h
+[ 1583337563 | Wed,  4 Mar 2020 10:59:23 -0500 ]             21832 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1583337574 | Wed,  4 Mar 2020 10:59:34 -0500 ]             21860 INFO   :: START        : Command line: sak-cli db --help
+[ 1583337574 | Wed,  4 Mar 2020 10:59:34 -0500 ]             21860 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1583337574 | Wed,  4 Mar 2020 10:59:34 -0500 ]             21860 INFO   :: START        : Parsed  Args: db --help
+[ 1583337574 | Wed,  4 Mar 2020 10:59:34 -0500 ]             21860 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1583337623 | Wed,  4 Mar 2020 11:00:23 -0500 ]             21887 INFO   :: START        : Command line: sak-cli -V
+[ 1583337623 | Wed,  4 Mar 2020 11:00:23 -0500 ]             21887 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1583337623 | Wed,  4 Mar 2020 11:00:23 -0500 ]             21887 WARN   :: EXIT         : Script exit. Caller = 1 main /root/bin/sak-cli
+[ 1583337632 | Wed,  4 Mar 2020 11:00:32 -0500 ]             21914 INFO   :: START        : Command line: sak-cli -V wp info
+[ 1583337632 | Wed,  4 Mar 2020 11:00:32 -0500 ]             21914 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1583337632 | Wed,  4 Mar 2020 11:00:32 -0500 ]             21914 WARN   :: EXIT         : Script exit. Caller = 1 main /root/bin/sak-cli
+[ 1583337647 | Wed,  4 Mar 2020 11:00:47 -0500 ]             21940 INFO   :: START        : Command line: sak-cli --verbose wp info
+[ 1583337647 | Wed,  4 Mar 2020 11:00:47 -0500 ]             21940 INFO   :: START        : Working dir: /var/www/recipes.davehasroot.com/html
+[ 1583337647 | Wed,  4 Mar 2020 11:00:47 -0500 ]             21940 INFO   :: START        : Parsed  Args: wp info
+[ 1583337648 | Wed,  4 Mar 2020 11:00:48 -0500 ]             21940 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1592285667 | Mon, 15 Jun 2020 23:34:27 -0600 ]             22010 INFO   :: START        : Command line: sak-cli 
+[ 1592285667 | Mon, 15 Jun 2020 23:34:27 -0600 ]             22010 INFO   :: START        : Working dir: /home/davein5/public_html
+[ 1592285667 | Mon, 15 Jun 2020 23:34:27 -0600 ]             22010 INFO   :: START        : Parsed  Args: 
+[ 1592285668 | Mon, 15 Jun 2020 23:34:28 -0600 ]             22010 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1614730378 | Tue,  2 Mar 2021 17:12:58 -0700 ]              4090 INFO   :: START        : Command line: sak-cli davehasroot.com
+[ 1614730378 | Tue,  2 Mar 2021 17:12:58 -0700 ]              4090 INFO   :: START        : Working dir: /
+[ 1614730378 | Tue,  2 Mar 2021 17:12:58 -0700 ]              4090 INFO   :: START        : Parsed  Args: davehasroot.com
+[ 1614730378 | Tue,  2 Mar 2021 17:12:58 -0700 ]              4090 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli
+[ 1614730393 | Tue,  2 Mar 2021 17:13:13 -0700 ]              4119 INFO   :: START        : Command line: sak-cli 
+[ 1614730393 | Tue,  2 Mar 2021 17:13:13 -0700 ]              4119 INFO   :: START        : Working dir: /home/davein5/public_html
+[ 1614730393 | Tue,  2 Mar 2021 17:13:13 -0700 ]              4119 INFO   :: START        : Parsed  Args: 
+[ 1614730394 | Tue,  2 Mar 2021 17:13:14 -0700 ]              4119 WARN   :: EXIT         : Script exit. Caller = 1 sak_cli /root/bin/.sak/modules/cli

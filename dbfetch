@@ -1,0 +1,2634 @@
+#!/usr/bin/perl
+
+###########
+# Script name: dbfetch
+# Description: Command line interface to list and download databases from phpMyAdmin or dump.php.
+# Wiki:        https://confluence.endurance.com/display/HGS2/Migrations%3A+dbfetch
+# Please submit all bug reports at https://projects.hostgator.com/projects/hg_migrations
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+package pmafetch;
+
+use Cwd;
+use LWP::UserAgent;
+use HTTP::Request::Common qw{ POST };
+use Term::ANSIColor qw(:constants);
+use HTML::Form;
+use MIME::Base64;
+use Data::Dumper;
+use Getopt::Long;
+if (eval {require JSON;}) {# JSON is needed for GoDaddy.
+     require JSON;
+}
+
+sub main {
+     $|++;
+
+     my $loginlist;
+     # Command line options
+     my $dbuser;     # Username for phpMyAdmin/control panel/dump.php
+     my $dbpass;     # Password for phpMyAdmin/control panel/dump.php
+     my $cpuser;     # Username for phpMyAdmin (used if both a control panel and phpMyAdmin login are needed).
+     my $cppass;     # Password for phpMyAdmin (used if both a control panel and phpMyAdmin login are needed).
+     my $configs;    # directory path or filename of a file with usernames to search for config files.
+     my $db;         # Database name.
+     my $dbhost;     # Database host to use for MySQL connections (dump.php)
+     my $httphost;   # HTTP host header to use when connecting to dump.php.
+     my $logintype;  # Type of login (i.e. Plesk, dumpphp, etc).  Try to guess if not specified.
+     my $exporttype; # When using dump.php, specify whether to use direct php SQL connection or passthrough to mysqldump.
+     my $domain;     # Domain to look under for databases in a Plesk panel.
+     my $dump;       # Indicate that we want to download a database dump rather than listing the database name.
+     my $tables;     # Indicate that we want a table breakdown.
+     my $examples;   # Show examples of usage.
+
+     GetOptions ('dbuser=s'       => \$dbuser,
+                 'dbpass=s'       => \$dbpass,
+                 'cpuser=s'       => \$cpuser,
+                 'cppass=s'       => \$cppass,
+                 'configs=s'      => \$configs,
+                 'db=s'           => \$db,
+                 'dbhost=s'       => \$dbhost,
+                 'httphost=s'     => \$httphost,
+                 'domain=s'       => \$domain,
+                 'type=s'         => \$logintype,
+                 'exporttype=s'   => \$exporttype,
+                 'dump'           => \$dump,
+                 'tables=s'       => \$tables,
+                 'examples'       => \$examples,
+                 'bind-address=s' => \$bindaddress
+     );
+
+     if ($examples) { #If we don't have just 1 argument, then show usage and exit.
+          examples();
+          exit(1);
+     }
+
+     # Make sure we have the url arg.
+     if ($#ARGV != 0) { #If we don't have just 1 argument, then show usage and exit.
+          usage();
+          exit(1);
+     }
+
+     # Find out if we're on a cPanel server or a Plesk server.
+     my $plesk;
+     if (-e "/etc/psa/.psa.shadow") {
+          $plesk = 1;
+     }else { #If the password file doesn't exist, this must be a cPanel server.  Run the cPanel methods.
+          $plesk = 0;
+     }
+
+     if (!dependency_check()) { # If a dependency is out of date or missing, then exit.
+          exit(1);
+     }
+
+     my $url = $ARGV[0];
+
+     # Gather up the auth info.
+     if ($configs) {
+          $loginlist = find_configs($configs); #Search directories for configs if --configs=... was used.
+          if (scalar(@{$loginlist}) < 1) {
+               print RED . "No database configs found\n" . RESET;
+          }
+     }elsif ($dbuser && $dbpass) {
+          my $logininfo = ConfigInfo->new();      #Add login for single database if --dbuser and --dbpass used.
+          $logininfo->{dbhost}   = $dbhost;
+          $logininfo->{dbuser}   = $dbuser;
+          $logininfo->{password} = $dbpass;
+          push (@{$loginlist}, $logininfo);
+     }elsif ($cpuser && $cppass) {
+          my $logininfo = ConfigInfo->new();      #Add login for single database if --cpuser and --cppass used.
+          $logininfo->{dbhost}   = $dbhost;
+          $logininfo->{dbuser}   = $cpuser;
+          $logininfo->{password} = $cppass;
+          push (@{$loginlist}, $logininfo);
+     }else {
+          usage();
+          print RED . "\nNo database login info. provided.\n" . RESET;
+     }
+
+     # Loop through the database logins (not to be confused with databases themselves)
+     foreach my $logininfo (@{$loginlist}) {
+          #Log into the current database.
+          my $pma = pmafetch->new('url'         => $url,
+                                  'dbhost'      => $logininfo->{dbhost},
+                                  'dbuser'      => $logininfo->{dbuser},
+                                  'dbpass'      => $logininfo->{password},
+                                  'cpuser'      => $cpuser,
+                                  'cppass'      => $cppass,
+                                  'logintype'   => $logintype,
+                                  'domain'      => $domain,
+                                  'httphost'    => $httphost,
+                                  'exporttype'  => $exporttype,
+                                  'bindaddress' => $bindaddress);
+
+          if ($dbhost) { # Override the dbhost from the logininfo (i.e. config file) if --dbhost specified.
+               $pma->{dbhost} = $dbhost;
+          }
+
+          if (!$pma->login()) {
+               print "Login failed.\n";
+               next;
+          }
+
+          #Now that we're logged in, we have to decide which databases to work with.
+          my $dbs = $pma->list_databases();
+          if (!$dbs) {
+               print "No databases found.\n";
+               next;
+          }
+          if ($db eq "all") { #Process all databases.
+               foreach my $db (@{$dbs}) {
+                    $pma->process_database($db, $tables, $dump);
+               }
+          }elsif($db) { # Process the named database.
+               $pma->process_database($db, $tables, $dump);
+          }elsif($logininfo->{olddb}) { #Process the database from the config file if it is in the config file info.
+               $pma->process_database($logininfo->{olddb}, $tables, $dump);
+          }else{ # Process the first database we find.
+               $pma->process_database(${$dbs}[0], $tables, $dump); 
+          }
+     }
+
+     exit(0);
+
+     #---------------------------------------------------------------
+     #---------------------- Subroutines ----------------------------
+     #---------------------------------------------------------------
+
+     # Find config files. 
+     # Input:  list filename or directory name.  Directory name must be a full path (i.e. /home/user/public_html)
+     # Output: reference to an array of ConfigInfo objects.
+     #         or if there's a problem, undef is returned.
+     sub find_configs {
+          my $listfile    = shift;
+          my $dbdir       = getcwd();
+          my @list;       #Content of a list file.  On cpanel, this will be usernames.  On Plesk, it will be domains.
+          my @dirlist = (); #Unpruned direcory list (may have duplicates)
+          my @pruneddirlist; #Pruned directory list with duplicates removed.
+          my $filesize = -s $listfile;    #  check to see if there's a file with that name.
+          my $configlist; # An array of ConfigInfo objects.
+          my $dbc = dbconnect->new();
+          if (!$dbc) {    #If the dbconnect module instantiation fails, exit now.
+               return undef;
+          }
+          if ($filesize > 0 && ! -d $listfile) { #If our file has size and it is not a directory, then treat it like a user list. 
+               eval {
+                    open (my $INFILE, $listfile);
+                    @list = <$INFILE>;
+                    close $INFILE;
+               } or do {
+                    print "Error reading file $listfile\n";
+                    return undef;
+               };
+               foreach my $tmpline (@list) { #Remove extra newlines. 
+                    chomp($tmpline);       #Remove newlines. 
+                    $tmpline =~ s/\s+//;   #Remove leading spaces. 
+                    $tmpline =~ s/\s+$//;  #Remove trailing spaces. 
+               }
+               if ($plesk) { # Now that @list is populated, convert it into a directory list.
+                    @dirlist = plesk_domlist_2_dirlist(@list);   # If we're on plesk, the list is expected to have domains.
+               }else{
+                    @dirlist = cpanel_userlist_2_dirlist(@list); # If we're on cPanel, the list is expected to have usernames.
+               }
+          }else {
+               push (@dirlist, $listfile);   #If there's no file with the name of the argument, then assume that the argument is a directory. 
+          }
+          $dbc->prune_dirs(\@dirlist, \@pruneddirlist); #Prune out unnecessary directories from the list.
+          $configlist = $dbc->find_configs(\@pruneddirlist);
+          return $configlist;
+     }
+     
+     # Convert a user list into a directory list.
+     # Input:  An array of cPanel users
+     # Output: An array of directories.
+     sub cpanel_userlist_2_dirlist {
+          my @userlist = shift;
+          my @dirlist;
+          print "Building a list of directories...\n";
+          foreach my $dbuser (@userlist) {
+               print "User: $dbuser...\n";
+               my $ud = Userdata->new("localhost", $dbuser);
+               my $primarydir = "/" . $ud->{partition} . "/" . $ud->{username} . "/public_html";
+               push (@dirlist, $primarydir);
+               foreach my $addondir (@{$ud->{addondirs}}) {
+                    push (@dirlist, $addondir);
+               }
+               foreach my $subdomaindir (@{$ud->{subdomaindirs}}) {
+                    push (@dirlist, $subdomaindir);
+               }
+          }
+          return @dirlist;
+     }
+     
+     # Convert a domain list into a directory list.
+     # Input:  An array of domains
+     # Output: An array of directories.
+     sub plesk_domlist_2_dirlist {
+          my @domlist = shift;
+          my @dirlist;
+          my $dir;
+          my @subdomdirs; #Subdomain document roots.
+          foreach my $dom (@domlist) {  #Then convert each element of @dirlist to its corresponding directory.
+              chomp($dom); #First let's find the document root for the domain name.
+              $dir = `mysql -uadmin -p'$mysqlpass' -ss -e"select hosting.www_root from hosting inner join domains on domains.id=hosting.dom_id where domains.name = '$dom' limit 1;" psa`;
+              chomp($dir);
+              push (@dirlist, $dir);
+              $dir = "";   #Next, let's add any subdomain directories.
+              @subdomdirs = `mysql -uadmin -p'$mysqlpass' -ss -e"select subdomains.www_root from hosting inner join domains on domains.id=hosting.dom_id inner join subdomains on domains.id=subdomains.dom_id where domains.name = '$dom';" psa`;
+              foreach my $subdomdir (@subdomdirs) {
+                   chomp($subdomdir);
+                   if (length($subdomdir) > 0) {
+                        push (@dirlist, $subdomdir);
+                   }
+              }
+          }
+          return @dirlist;
+     }
+
+     # Print Usage Info.
+     sub usage {
+          print <<END;
+  Usage: dbfetch URL [options]
+
+       An effective way to find the URL is to use a browser first, then copy the phpMyAdmin URL from there.
+       This works well for GoDaddy and Dreamhost, for example.  But be aware that some hosts such as GoDaddy
+       will have different URLs for different databases.
+
+       - Authentication options:
+         --cpuser=control_panel_user
+         --cppass=control_panel_pass
+         --dbuser=database_user
+         --dbpass=database_pass
+         --configs=list
+       
+       - Databases:
+         --db=dbname
+         --db=all will process all of the databases the login(s) have access to
+         If --db is not given, then the first accessible database will be used.
+
+       - Tables:
+         --tables=tablename
+         --tables=all will process all of the tables.
+         If --tables is not given, then the database will be listed or downloaded as a whole.
+
+       - What to do:
+         --dump
+         If --dump is not given, then the database or tables(s) will be listed.
+       
+       - Special options:
+         --domain=mydom.tld   - Look under this domain in the Plesk panel for databases when logging in as "admin".
+         --dbhost=hostname/ip - Used when connecting to dump.php on the server.  Default=localhost
+         --exporttype=value   - Used when connecting to dump.php on the server.  value can be "mysqldump" (default) or "sql"
+         --httphost=host.tld  - Used when connecting to dump.php on the server.
+                                Will be used as "Host:" header for when DNS is not pointed.
+         --bind-address=<ip address> Bind to a specific local IP address for network connections.
+
+       Host notes:
+         - dbfetch can be used with dump.php if we can't use phpMyAdmin at the old host.
+         - cPanel hosts are supported.  Pass the control panel login with --cpuser and --cppass.
+           Some cPanels will require a database user/pass.  If so, pass that with --dbuser and --dbpass.
+         - Plesk is supported.  It has been tested with our VPS's and our Windows staff accounts.
+           If the username is 'admin' then the --domain option will need to be used.
+         - GoDaddy is just like a standard phpMyAdmin install.  But be aware that GoDaddy can have different URLs for
+           different databases in the same control panel.
+         - Dreamhost is also like a standard phpMyAdmin installation.
+           Their URL is of the form: http://somedomain.com/dh_phpmyadmin/somedomain.com/ but verify if needed by checking
+           the url with a browser.
+         - 1and1 is not supported.  phpMyAdmin is authenticated with a cookie after the main control panel login.
+         - vDeck hosts such as Netfirms are not supported.  They also use cookies/Javascript to authenticate
+           phpMyAdmin.
+
+         ************ To see examples of usage ***********
+         --examples
+END
+     }
+
+sub examples {
+     print <<END;
+  Examples (See https://gatorwiki.hostgator.com/Migrations/Dbfetch for full output):
+
+       - Show first database in a standard phpMyAdmin installation:
+         dbfetch http://somedomain.com/phpmyadmin/ --dbuser=mss001 --dbpass=mysecret
+
+       - Download a database dump from Dreamhost:
+         dbfetch http://somedomain.com/dh_phpmyadmin/somedomain.com/ --dbuser=dbuser --dbpass=dbpass --db=wordpress1
+
+       - Dump all databases from a cPanel login:
+         dbfetch http://50.23.99.227:2082/ --cpuser=someuser --cppass=mysecret --db=all --dump
+
+       - Dump the database mydb from a cPanel that has an additional login for phpMyAdmin:
+         dbfetch http://50.23.99.227:2082/ --cpuser=myuser --cppass=mysecret --dbuser=myuser_wrdp1 --dbpass=mydbpass --db=myuser_wrdp1 --dump
+
+       - List the tables in a database in a standard phpMyAdmin installation:
+         dbfetch http://50.23.99.227/~mss001/phpmyadmin/ --dbuser=mss001 --dbpass=mysecret --db=mss001_wp112 --table=all
+
+       - Dump all of the tables of a database in a standard phpMyAdmin installation:
+         dbfetch http://50.23.99.227/~mss001/phpmyadmin/ --dbuser=mss001 --dbpass=mysecret --db=mss001_wp112 --table=all --dump
+
+       - List all of the databases in the mydomain.org control panel section of a Plesk VPS:
+         dbfetch https://50.22.142.130:8443/ --domain=mydomain.org --cpuser=admin --cppass=mysecret --db=all
+
+       - List all of the databases in a Windows staff account (i.e. user is not admin):
+         dbfetch 'https://staff.win.hostgator.com:8443/' --cpuser=jsmith --cppass='mysecret' --db=all
+
+       - Dump a database using dump.php:
+         dbfetch http://50.23.99.227/dump.php --httphost=mssdomain1.com --dbhost=localhost --dbuser=mss001 --dbpass='Zom9chak' --db=mss001_wp112 --dump
+
+       - Find known config files in a directory and dump the databases using the logins in those config files with dump.php
+         dbfetch http://50.23.99.227/dump.php --httphost=mssdomain1.com --configs=/home/mss001 --dump
+END
+     }
+
+     # Check for dependencies and load the dependencies.
+     # Input:  $plesk global variable
+     # Output: 1=Success, 0=Fail
+     sub dependency_check {
+          #************** Check for xfermodules ****************
+          if (eval {require "/root/bin/xfermodules.pm";}) {  #Is xfermodules available?
+               require "/root/bin/xfermodules.pm";           #Yes, load it.
+               if ($xfermodules::VERSION lt "1.00") {
+                    print "This server appears to have an outdated version of the transfers modules.\n";
+                    print "Please update them or have a level 2 admin install them if this is a shared/reseller server.\n";
+                    print "Install with: ".YELLOW."yum install ESO-utils\n".RESET;
+                    print "If the repository is not installed, you can create it with:\n\n";
+                    print "cat <<'EOF'> /etc/yum.repos.d/dedi.repo\n";
+                    print "[hgdedi]\n";
+                    print "name=HG Monitoring Repo\n";
+                    print "baseurl=http://repo.websitewelcome.com/dedi/centos/\$releasever/\$basearch\n";
+                    print "enabled=1\n";
+                    print "gpgcheck=0\n";
+                    print "timeout=5\n";
+                    print "EOF\n";
+                    return 0;
+               }
+          }else{
+               if (! -s "/root/bin/xfermodules.pm") {
+                    print "The transfers modules do not appear to be on this server.\n";
+                    print "Please install them or have a level 2 admin install them if this is a shared/reseller server.\n";
+                    print "Install with: ".YELLOW."yum install ESO-utils\n".RESET;
+                    print "If the repository is not installed, you can create it with:\n\n";
+                    print "cat <<'EOF'> /etc/yum.repos.d/dedi.repo\n";
+                    print "[hgdedi]\n";
+                    print "name=HG Monitoring Repo\n";
+                    print "baseurl=http://repo.websitewelcome.com/dedi/centos/\$releasever/\$basearch\n";
+                    print "enabled=1\n";
+                    print "gpgcheck=0\n";
+                    print "timeout=5\n";
+                    print "EOF\n";
+                    return 0;
+               }else{
+                    $|++;
+                    print RED . "Error while trying to load xfermodules.pm\n".RESET;
+                    delete $INC{'/root/bin/xfermodules.pm'};
+                    require "/root/bin/xfermodules.pm";
+                    return 0;
+               }
+          }
+          #************** Check for JSON ****************
+          if (!eval {require JSON;} && $plesk == 0) { #JSON is needed by the Userdata module within xfermodules.pm.
+               print "the JSON perl module does not appear to be on this server.\n";
+               print "Please install it or have a level 2 admin install it if this is a shared/reseller server.\n";
+               print "Install with: ".YELLOW."/scripts/perlinstaller JSON\n".RESET;
+               return 0;
+          }
+          return 1;
+     }
+}
+
+# Constructor for a pmafetch object.
+sub new {
+     my ($class, %cnf) = @_;
+     my $self  = {};
+     $self->{class}            = $class;
+     $self->{progress_counter} = 0;
+     # Set any defaults from key => value pairs.
+     $self->{url}        = delete $cnf{url};
+     $self->{cpuser}     = delete $cnf{cpuser};     # Control panel user
+     $self->{cppass}     = delete $cnf{cppass};     # Control panel pass
+     $self->{dbuser}     = delete $cnf{dbuser};     # Database user
+     $self->{dbpass}     = delete $cnf{dbpass};     # Database pass
+     $self->{dbhost}     = delete $cnf{dbhost};     # Used by dumpphp_download_db
+     $self->{logintype}  = delete $cnf{logintype};
+     $self->{domain}     = delete $cnf{domain};
+     $self->{httphost}   = delete $cnf{httphost};
+     $self->{exporttype} = delete $cnf{exporttype}; # Used by dumpphp_download_db
+     $self->{bindaddress}= delete $cnf{bindaddress};# Local IP to bind to when connecting.
+     $self->{browser}    = LWP::UserAgent->new();
+     $self->{browser}->cookie_jar( {} );
+     $self->{browser}->ssl_opts( 'verify_hostname' => 0);
+     if ($self->{bindaddress}) {               # Bind to a specific IP address if one was given.
+          $self->{browser}->local_address($self->{bindaddress});
+     }
+     $self->{token}      = undef;                   # cPanel security token or 1and1 session ID.
+     $self->{db_link}    = {};                      # Hash with database name as key and database link as the value.  Used for oneandone, and possibly others.
+     if (!$self->{dbhost}) {
+          $self->{dbhost} = "localhost";
+     }
+     bless($self, $class);
+     return $self;
+}
+
+
+# Log into the control panel or phpMyAdmin.
+sub login {
+     my $self = shift;
+     my $result;
+     $self->guess_logintype();
+     $self->cleanup_url();
+     if ($self->{logintype} eq "pleskadmin") {
+          $result = $self->plesk_login();
+     }elsif ($self->{logintype} eq "pleskuser") {
+          $result = $self->plesk_login();
+     }elsif ($self->{logintype} eq "cpanel") {
+          $result = $self->cpanel_login();
+     }elsif ($self->{logintype} eq "dumpphp") {
+          $result = $self->dumpphp_login();
+     }elsif ($self->{logintype} eq "oneandone") {
+          $result = $self->oneandone_login();
+     }elsif ($self->{logintype} eq "godaddy") {
+          $result = $self->godaddy_login();
+     }else{
+          $result = $self->generic_login();
+     }
+     return $result;
+}
+
+# Try to guess the login type based on the url.
+# Input:  url
+#         username
+# Output: $self->{logintype} is set if it appears guessable.
+sub guess_logintype {
+     my $self = shift;
+     if ($self->{logintype}) {
+          return; # If the user already specified the logintype, then don't try to guess it.
+     }
+     if ($self->{url} =~ /dump\.php/) {
+          $self->{logintype} = "dumpphp";
+     }elsif ($self->{url} =~ /:2082/ || $self->{url} =~ /:2083/) {
+          $self->{logintype} = "cpanel";
+     }elsif ($self->{url} =~ /:8443/ || $self->{url} =~ /:8880/) {
+          if ($self->{cpuser} eq "admin") {
+               $self->{logintype} = "pleskadmin";
+          }else{
+               $self->{logintype} = "pleskuser";
+          }
+     }elsif ($self->{url} =~ /1and1.com/) {
+          $self->{logintype} = "oneandone";
+     }elsif ($self->{url} =~ /godaddy\.com/ || $self->{url} =~ /secureserver.net/ || $self->{url} =~ /hostedresource.com/) {
+          $self->{logintype} = "godaddy";
+     }
+}
+
+# Clean up unnecessary parts of a URL.
+sub cleanup_url { 
+     my $self = shift;
+     $self->{url} =~ s/\/[^\/]*$//; # Remove unnecessary part at the end.  This way user can paste a full url.
+     if ($self->{url} !~ /:\/\//) { # If a protocol isn't found, then add http:// to the beginning.
+          $self->{url} = "http://" . $self->{url};
+     }
+}
+
+
+# List phpMyAdmin databases.
+# Input:  Nothing other than $self
+# Output: Array with a database in each element.
+#         0=Error
+sub list_databases {
+     my $self = shift;
+     my $result;
+     if ($self->{logintype} eq "pleskadmin") {
+          $result = $self->pleskadmin_list_databases();
+     }elsif ($self->{logintype} eq "pleskuser") {
+          $result = $self->pleskuser_list_databases();
+     }elsif ($self->{logintype} eq "cpanel") {
+          $result = $self->cpanel_list_databases();
+     }elsif ($self->{logintype} eq "dumpphp") {
+          $result = $self->dumpphp_list_databases();
+     }elsif ($self->{logintype} eq "oneandone") {
+          $result = $self->oneandone_list_databases();
+     }elsif ($self->{logintype} eq "godaddy") {
+          $result = $self->godaddy_list_databases();
+     }else{
+          $result = $self->generic_list_databases();
+     }
+     return $result;
+}
+
+#Do something with a single database (i.e. list it's name or dump it)
+#Input:  A pmafetch object.
+#        A database name.
+#Output: 1=OK, 0=Error
+sub process_database {
+     my $self     = shift;
+     my $database = shift;
+     my $tables   = shift;
+     my $dump     = shift;
+     if ($dump) {
+          my $result = $self->download($database, $tables); # Download the database
+          if (!$result) {
+               print "Failed to download $database\n";
+               return 0;
+          }
+     }else {
+          my $result = $self->show($database, $tables);     # Show info. about the database.
+          if (!$result) {
+               print "Failed to list tables for $database\n";
+               return 0;
+          }
+     }
+     return 1;
+}
+
+# Show a database or tables.
+# Input:  Database name
+#         Table name (can be "all" or "")
+# Output: Information about this database is printed.
+sub show() {
+     my $self     = shift;
+     my $database = shift;
+     my $tables   = shift;
+     if ($tables eq "all") {
+          $self->show_tables($database);
+     }elsif($tables) {
+          print "$database.$tables\n";
+     }else {
+          print "$database\n";
+     }
+}
+
+
+# Download a database or individual tables.
+# Input:  Datbase name
+#         Table name (can be "all" or "")
+# Output: The database is downloaded as a whole or in separate tables.
+sub download() {
+     my $self     = shift;
+     my $database = shift;
+     my $tables   = shift;
+     if ($tables eq "all") {
+          $self->download_tables($database);
+     }elsif($tables) {
+          $self->download_table($database, $tables);
+     }else {
+          $self->download_db($database);
+     }
+}
+
+
+# Print the list of tables in a database.
+# Input:  Database to show the tables for.
+# Output: A list of tables is printed for the database.
+sub show_tables {
+     my $self     = shift;
+     my $database = shift;
+     my $tables = $self->list_tables($database);
+     if (!$tables) {
+          return undef;
+     }
+     foreach my $table (@{$tables}) {
+          print "$database.$table\n";
+     }
+     return 1;
+}
+
+
+# List the tables in a database.
+# Input:  Database to list the tables for.
+# Output: Array of table names
+#         or undef if there's an Error
+sub list_tables {
+     my $self     = shift;
+     my $database = shift;
+     my $result;
+     if ($self->{logintype} eq "dumpphp") {
+          $result = $self->dumpphp_list_tables($database);
+     }elsif ($self->{logintype} eq "pleskadmin") {
+          $result = $self->pleskadmin_list_tables($database);
+     }elsif ($self->{logintype} eq "pleskuser") {
+          $result = $self->pleskuser_list_tables($database);
+     }elsif ($self->{logintype} eq "cpanel") {
+          $result = $self->cpanel_list_tables($database);
+     }elsif ($self->{logintype} eq "oneandone") {
+          $result = $self->oneandone_list_tables($database);
+     }elsif ($self->{logintype} eq "godaddy") {
+          $result = $self->godaddy_list_tables($database);
+     }else{
+          $result = $self->generic_list_tables($database);
+     }
+     return $result;
+}
+
+# Print the list of tables in a database.
+# Input:  Database to show the tables for.
+# Output: A list of tables is printed for the database.
+sub download_tables {
+     my $self     = shift;
+     my $database = shift;
+     my $tables = $self->list_tables($database);
+     if (!$tables) {
+          return undef;
+     }
+     foreach my $table (@{$tables}) {
+          $self->download_table($database, $table);
+     }
+     return 1;
+}
+
+# List the tables in a database.
+# Input:  Database to list the tables for.
+# Output: Array of table names
+#         or undef if there's an Error
+sub download_table {
+     my $self     = shift;
+     my $database = shift;
+     my $table    = shift;
+     my $result;
+     if ($self->{logintype} eq "dumpphp") {
+          $result = $self->dumpphp_download_table($database, $table);
+     }elsif ($self->{logintype} eq "pleskadmin") {
+          $result = $self->pleskadmin_download_table($database, $table);
+     }elsif ($self->{logintype} eq "pleskuser") {
+          $result = $self->pleskuser_download_table($database, $table);
+     }elsif ($self->{logintype} eq "cpanel") {
+          $result = $self->cpanel_download_table($database, $table);
+     }elsif ($self->{logintype} eq "oneandone") {
+          $result = $self->oneandone_download_table($database, $table);
+     }elsif ($self->{logintype} eq "godaddy") {
+          $result = $self->godaddy_download_table($database, $table);
+     }else{
+          $result = $self->generic_download_table($database, $table);
+     }
+     if (!$result) {
+          print "Error downloading $database.$table\n";
+     }
+     return $result;
+}
+
+
+# Download a database as one file. 
+# Input:  Database name
+#         Filename to save to.
+# Output: 0=Error, 1=OK
+sub download_db {
+     my $self     = shift;
+     my $database = shift;
+     my $result;
+     if ($self->{logintype} eq "dumpphp") {
+          $result = $self->dumpphp_download_db($database);
+     }elsif ($self->{logintype} eq "pleskadmin") {
+          $result = $self->pleskadmin_download_db($database);
+     }elsif ($self->{logintype} eq "pleskuser") {
+          $result = $self->pleskuser_download_db($database);
+     }elsif ($self->{logintype} eq "cpanel") {
+          $result = $self->cpanel_download_db($database);
+     }elsif ($self->{logintype} eq "oneandone") {
+          $result = $self->oneandone_download_db($database);
+     }elsif ($self->{logintype} eq "godaddy") {
+          $result = $self->godaddy_download_db($database);
+     }else{ #Generic phpMyAdmin type
+          $result = $self->generic_download_db($database);
+     }
+     return $result;
+}
+
+
+#------------------------------------------------------------------------
+#--------------------------- GoDaddy Subs --------------------------------
+#------------------------------------------------------------------------
+# Log into a generic phpMyAdmin server.
+# Input:  Nothing (All input is from $self members)
+# Output: 1=Success, undef=Failure
+sub godaddy_login {
+     my $self = shift;
+     my $formnumber;
+     my $url = "https://idp.godaddy.com/login.aspx?spkey=GDHCCWEB01&redirect=true&returnUrl=/AccountList.aspx";
+     my $args = [validate=>"1", loginName=>$self->{cpuser}, password=>$self->{cppass}];
+     my $req = POST ($url, $args);
+     my $response = $self->{browser}->request($req);
+     if ($response->is_redirect()) {
+          $req = HTTP::Request->new(GET, $response->header('Location'));
+          $response = $self->{browser}->request($req); # Try loading the phpMyAdmin page to see if there's another login.
+          if ($response->is_success()) {
+               $self->godaddy_set_token($response->content());
+               return 1;
+          }
+     }
+}
+
+# Set the token (Account ID) from GoDaddy.
+# Input:  The html page that loads after login
+# Pattern to look for: ?accountuid=1436507a-41b6-4c5c-a4f4-db4db3f938c0"
+#                  or: &account_uid=1436507a-41b6-4c5c-a4f4-db4db3f938c0&
+# Output: $self->{token} is set after it is extracted from the page.
+#         Example token: 1436507a-41b6-4c5c-a4f4-db4db3f938c0
+sub godaddy_set_token {
+     my $self  =  shift;
+     my $page  =  shift;
+     my @lines =  split("\n", $page);
+
+     foreach my $line (@lines) {
+          if ($line =~ /account_?uid=/) {
+               $line =~ s/.*account_?uid=//;
+               $line =~ s/[&"].*//; 
+               if (length($line) > 11) {
+                    $self->{token} = $line;
+                    return 1;
+               }
+          }
+     }
+     $self->{token} = "";
+     return 0;
+}
+
+# List the databases at GoDaddy.
+sub godaddy_list_databases {
+     my $self = shift;
+     my $databases  = [];
+     #my $response_content_temp = "{\"data\":[{\"id\":\"2477606f-31db-4dc6-9bee-b675002867bd\",\"accountId\":\"1436507a-41b6-4c5c-a4f4-db4db3f938c0\",\"accessType\":2,\"adminUrl\":\"https://p3nlmysqladm001.secureserver.net/grid50/935\",\"description\":\"WordPress\",\"directAccess\":false,\"ipAddress\":\"184.168.154.63\",\"lastOperation\":{\"statusCode\":0,\"operationType\":3,\"fileName\":\"\",\"date\":\"2013-03-05T09:54:37\"},\"name\":\"cub1306409255681\",\"password\":null,\"readOnlyPassword\":null,\"status\":\"SETUP\",\"displayStatus\":\"Setup\",\"readOnlyUser\":\"\",\"schemaName\":\"\",\"serverUrl\":\"grid50mysql935.secureserver.net\",\"databaseType\":0,\"uniqueDNSEntry\":\"cub1306409255681.db.10555820.hostedresource.com\",\"user\":\"cub1306409255681\",\"version\":\"5.0\"}],\"page\":-1,\"pageSize\":-1,\"totalCount\":1}";
+     my $req = HTTP::Request->new( POST => "https://hostingmanager.secureserver.net/api/databases.aspx/Get");
+     $req->content_type('application/json; charset=utf-8');
+     my $json = "{\"type\":\"mysql\",\"accountId\":\"" . $self->{token} . "\",\"page\":-1,\"pageSize\":-1}";
+     $req->content($json);
+     my $response = $self->{browser}->request($req);
+     if ($response->is_success()) {
+          eval {$jsondata = JSON::decode_json($response->content); };
+#          eval {$jsondata = JSON::decode_json($response_content_temp); };
+          if ($jsondata) {
+               eval {$jsondata = JSON::decode_json($jsondata->{d}); };
+               if ($jsondata) {
+                    foreach my $db (@{$jsondata->{data}}) {
+                         push (@{$databases}, $db->{name});
+                         $self->{db_link}{$db->{name}} = $db->{adminUrl};
+                    }
+               }
+          }else{
+               print "Error parsing database list from GoDaddy.\n";
+               return undef; #Error
+          }
+     }else{
+          print $response->status_line . "\n";
+     }
+     return $databases;
+}
+
+# Download a database with all tables in one file from generic phpMyAdmin installation.
+# Input:  URL (from $self)
+#         Database User (from $self)
+#         Database Password (from $self)
+#         Database name
+# Output: undef=Error, 1=OK
+sub godaddy_download_db {
+     my $self = shift;
+     my $database = shift;
+     $self->{url} = $self->{db_link}{$database};
+     if ($self->generic_login()) { 
+          return $self->generic_download_db($database);
+     }
+     return undef;
+}
+
+# List the tables in a database.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+# Output: Array of table names
+#         or undef if there's an Error
+sub godaddy_list_tables {
+     my $self     = shift;
+     my $database = shift;
+     $self->{url} = $self->{db_link}{$database};
+     if ($self->generic_login()) {
+          return $self->generic_list_tables($database);
+     }
+     return undef;
+}
+
+# Download a database table from generic phpMyAdmin installation.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+#         Table name
+# Output: undef=Error, 1=OK
+sub godaddy_download_table {
+     my $self     = shift;
+     my $database = shift;
+     my $table    = shift;
+     $self->{url} = $self->{db_link}{$database};
+     if ($self->generic_login()) {
+          return $self->generic_download_table($database, $table);
+     }
+     return undef;
+}
+
+#------------------------------------------------------------------------
+#--------------------------- oneandone Subs --------------------------------
+#------------------------------------------------------------------------
+
+# Log into a generic phpMyAdmin server.
+# Input:  Nothing (All input is from $self members)
+# Output: 1=Success, undef=Failure
+sub oneandone_login {
+     my $self = shift;
+     my $formnumber;
+     my $url = $self->{url}; #i.e. https://www.1and1.com
+     my $req = HTTP::Request->new(GET, "$self->{url}/login?__lf=Static");
+     my $response;
+     $response = $self->{browser}->request($req);   # Load the 1and1 login form.
+     if (!$response->is_success() && $response->code() != 401) {
+          print $response->status_line() . "\n";
+          return undef;
+     }
+     my @forms = HTML::Form->parse($response);
+     $formnumber = $self->oneandone_find_login_form(\@forms); 
+     if ($formnumber == -1) {
+          print "Could not find the 1and1 login form.\n";
+          return undef;
+     }
+
+     $forms[$formnumber]->value('login.User', $self->{cpuser});
+     $forms[$formnumber]->value('login.Pass', $self->{cppass});
+     $req = $forms[$formnumber]->click;
+     $response = $self->{browser}->request($req); # Submit the 1and1 login form.
+     if ($response->is_redirect()) {
+          $req = HTTP::Request->new(GET, $response->header('Location'));
+          $response = $self->{browser}->request($req); # Try loading the phpMyAdmin page to see if there's another login.
+          if ($response->is_success()) {
+               $self->oneandone_set_token($response->content()); # Set $self->{token}
+               return 1;
+          }
+     }
+     print $response->status_line() . "\n";
+     return undef;
+}
+
+# Find the array index number of the cPanel login form.
+# Input: reference to an array of HTML::Form objects.
+# Output: Form number
+#         or -1 if there's an error.
+sub oneandone_find_login_form {
+     my $self    = shift;
+     my $forms   = shift;
+     my $counter = 0;
+     foreach my $form (@{$forms}) {
+          if ($form->{attr}->{name} eq "loginform") {
+               return $counter;
+          }
+          $counter++;
+     }
+     return -1;
+}
+
+#https://my.1and1.com/xml/config/DBMySQLOverview
+
+# List phpMyAdmin databases.
+# Input:  Nothing
+# Output: Array with a database in each element.
+#         Also, $self->{db_link} is populated.  oneandone_download_db will depend on this.
+#         undef=Error
+sub oneandone_list_databases {
+     my $self       = shift;
+     my $databases  = [];
+     my $table_flag = 0;  #Indicates whether or not we're in the table where the databases are listed.
+     my $url = "https://my.1and1.com/xml/config/DBMySQLOverview;" . $self->{token} . "?__lf=HomeFlow";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+	  print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     # parse the page for databases
+     # The database name is on one line, and the phpMyAdmin link is likely on a later line, so we
+     #  loop through the lines, setting a flag after a database name is found so we can look for
+     #  the associated phpMyAdmin link.
+     my $db;
+     my $db_link;
+     my $dbflag = 0;
+     my @lines =  split("\n", $response->content());
+     foreach my $line (@lines) {
+          if ($line =~ /phpMyAdmin/ && $dbflag == 1) { # Does this line have a phpMyAdmin link and are we looking for one?
+               $db_link = $line;
+               $db_link =~ m/href="(.*PhpMyAdmin.*?)"/;
+               $db_link = $1;
+               #$db_link =~ s/&amp/&/g;
+               push (@{$databases}, $db);
+               $self->{db_link}{$db} = $db_link;
+               $db      = "";
+               $db_link = "";
+               $dbflag  = 0;
+          }
+          if ($line =~ /db\d\d\d\d\d\d\d/) { # Does this line have a database name?
+               $db = $line;   
+               $db =~ s/.*?(db\d\d\d\d\d\d\d)/\1/; # Chop off info. before the database name.
+               $db =~ s/<.*//;                    # Chop off info. after  the database name.
+               $dbflag = 1;
+          }
+     }
+     return $databases;
+}
+
+# List the tables in a oneandone database.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+# Output: undef=Error, 1=OK
+sub oneandone_list_tables {
+     my $self     = shift;
+     my $database = shift;
+     my $url;
+     my $database_server = $self->oneandone_prepare_pma_link($database); # Database server number associated with our database.
+     my $tables = [];
+
+     $url = "https://phpmyadmin.1and1.com/db_details_export.php?lang=en-utf-8&server=$database_server&collation_connection=utf8_general_ci&db=$database&goto=db_details_structure.php";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+
+     #print $response->content . "\n";
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               my $count = 1;
+               my $table;
+               do {
+                    $table = $form->find_input('table_select[]','',$count);
+                    if ($table) {
+                         push (@{$tables}, $table->{menu}[1]->{name});
+                    }
+                    $count++;
+               }while($table);
+          }
+     }
+     return $tables;
+}
+
+# Download a database from oneandone.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+# Output: undef=Error, 1=OK
+sub oneandone_download_db {
+     my $self     = shift;
+     my $database = shift;
+     my $filename = $database . ".sql";
+     my $url;
+     my $database_server = $self->oneandone_prepare_pma_link($database); # Database server number associated with our database.
+
+     #Open the file handle to save to.
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to.";
+
+     # Download and parse the phpMyAdmin export form.
+     $self->{progress_counter} = 0;
+     $url = "https://phpmyadmin.1and1.com/db_details_export.php?lang=en-utf-8&server=$database_server&collation_connection=utf8_general_ci&db=$database&goto=db_details_export.php";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+
+     my @forms = HTML::Form->parse($response);
+
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('drop', 1);         #Set any options as needed.
+               #$form->value('sql_insert_syntax', 'none');
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               $req = $form->click;
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last;
+          }
+     }
+
+     $self->close_download($handle, $database); #Close up shop.
+     return 1;
+}
+
+# Download a database table from oneandone.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+#         Table name
+# Output: undef=Error, 1=OK
+sub oneandone_download_table {
+     my $self     = shift;
+     my $database = shift;
+     my $table    = shift;
+     my $filename = "$database.$table.sql";
+     my $url;
+     my $database_server = $self->oneandone_prepare_pma_link($database); # Database server number associated with our database.
+
+     #Open the file handle to save to.
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to.";
+
+     # Download and parse the phpMyAdmin export form.
+     $self->{progress_counter} = 0;
+     $url = "https://phpmyadmin.1and1.com/db_details_export.php?lang=en-utf-8&server=$database_server&collation_connection=utf8_general_ci&db=$database&goto=db_details_export.php";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('drop', 1);         #Set any options as needed.
+               #$form->value('sql_insert_syntax', 'none');
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               my $count = 1;
+               my $current_table;
+               do { # Unselect all of the listed tables except the one we want.
+                    $current_table = $form->find_input('table_select[]','',$count);
+                    if ($current_table) {
+                         if ($current_table->{menu}[1]->{name} ne $table) {
+                              $current_table->{disabled} = '1';
+                         }
+                         $current_table->{current} = '1';
+                    }
+                    $count++;
+               }while($current_table);
+               $req = $form->click;
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last;
+          }
+     }
+     $self->close_download($handle, "$database.$table"); #Close up shop.
+     return 1;
+}
+
+# Take care of all of the hoops before the phpMyAdmin export page can be loaded.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+# Output: Server number to use in a link such as: https://phpmyadmin.1and1.com/db_details_export.php?...&server=$database_server&...
+#         undef=Error
+sub oneandone_prepare_pma_link {
+     my $self     = shift;
+     my $database = shift;
+     my $url;
+     my $database_server = ""; # Database server number associated with our database.
+
+     # First we follow the link that was on the database listing page for this database.
+     $url = "https://my.1and1.com" . $self->{db_link}{$database};
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          print $url . "\n";
+          return undef;               # and return a failure.
+     }
+
+     # The above request should return a page with a single link to the next page.
+     my $follow;  # Extract the href link to follow.
+     my @lines =  split("\n", $response->content());
+     foreach my $line (@lines) {
+          if ($line =~ /href=/) { # Does this line have a link?
+               $follow = $line;
+               $follow =~ s/.*href="//;
+               $follow =~ s/".*//;
+          }
+     }
+     my $req = HTTP::Request->new(GET, $follow);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          print $url . "\n";
+          return undef;               # and return a failure.
+     }
+
+     # Now we should be at a frames page.  So extract the link to the main frame and load that page.
+     $follow =~ s/\.com\/.*/\.com\//;
+     my $noscript_flag = 0;
+     my @lines =  split("\n", $response->content());
+     foreach my $line (@lines) {
+          if ($line =~ /<noscript>/) {
+               $noscript_flag = 1;
+          }
+          if ($line =~ /frame src="main/ && $noscript_flag == 1) { # Does this line have the link to the main frame?
+               $line =~ s/.*frame src="//;
+               $line =~ s/".*//;
+               $follow = $follow . $line;
+               last;
+          }
+     }
+     my $req = HTTP::Request->new(GET, $follow);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          print $url . "\n";
+          return undef;               # and return a failure.
+     }
+
+     # The first form on this page is a selection of databases.  The selection lists the server number
+     # for each database.  So we want to look up our database and find out the server number.
+     my @forms = HTML::Form->parse($response);
+     foreach my $input (@{$forms[0]->{inputs}}) {
+          if ($input->{name} eq "server") {
+               foreach my $db (@{$input->{menu}}) {
+                    if ($db->{name} =~ /$database/) {
+                         $database_server = $db->{value};
+                         last;
+                    }
+               }
+          }
+     }
+     return $database_server;
+}
+
+
+# Set the token.  We're looking for a line like this on the page:
+#  sessid="jsessionid=F090CE9D122B79B8537920D8EE6CB012.TCpfix17b";var
+# Input:  The html page that loads after login
+# Output: $self->{token} is set after it is extracted from the page.
+#         Example token: jsessionid=F090CE9D122B79B8537920D8EE6CB012.TCpfix17b
+sub oneandone_set_token {
+     my $self  =  shift;
+     my $page  =  shift;
+     my @lines =  split("\n", $page);
+     
+     foreach my $line (@lines) {
+          if ($line =~ /sessid="jsessionid=/) {
+               $line =~ s/.*sessid="jsessionid=/jsessionid=/;
+               $line =~ s/".*//;
+               if (length($line) > 11) {
+                    $self->{token} = $line;
+                    return 1;
+               }
+          }
+     }
+     $self->{token} = "";
+     return 0;
+}
+
+
+
+#------------------------------------------------------------------------
+#--------------------------- cPanel Subs --------------------------------
+#------------------------------------------------------------------------
+
+# Log into a generic phpMyAdmin server.
+# Input:  Nothing (All input is from $self members)
+# Output: 1=Success, undef=Failure
+sub cpanel_login {
+     my $self = shift;
+     my $formnumber;
+     my $url = $self->{url};
+     $url =~ s/(:2082|:2083).*/$1/;
+     my $req = HTTP::Request->new(GET, "$self->{url}/index.php");
+     my $response = $self->{browser}->request($req);   # Load the cPanel login form.
+     if (!$response->is_success() && $response->code() != 401) {
+          print $response->status_line() . "\n";
+          return undef;
+     }
+     my @forms = HTML::Form->parse($response);
+     $formnumber = $self->cpanel_find_login_form(\@forms); 
+     if ($formnumber == -1) {
+          print "Could not find the cPanel login form.\n";
+          return undef;
+     }
+     $forms[$formnumber]->value('user', $self->{cpuser});
+     $forms[$formnumber]->value('pass', $self->{cppass});
+     $req = $forms[$formnumber]->click;
+     $response = $self->{browser}->request($req); # Submit the cPanel login form.
+     if ($response->is_redirect()) {
+          $self->cpanel_set_token($response->header('Location'));
+          $url = $url . $self->{token} . "/3rdparty/phpMyAdmin/";
+          my $req = HTTP::Request->new(GET, $url);
+          $response = $self->{browser}->request($req); # Try loading the phpMyAdmin page to see if there's another login.
+     }
+     if (!$response->is_success()) {
+          print $response->status_line() . "\n";
+          return undef;
+     }
+     @forms = HTML::Form->parse($response); #Parse the forms on this page into form objects.
+     $formnumber = $self->generic_find_login_form(\@forms);
+     if ($formnumber > -1) { #If we have a phpMyAdmin login, then try logging into that.
+          $forms[$formnumber]->value('pma_username', $self->{dbuser});
+          $forms[$formnumber]->value('pma_password', $self->{dbpass});
+          $req = $forms[$formnumber]->click;
+          $response = $self->{browser}->request($req);
+          if (!$response->is_success() && !$response->is_redirect()) {
+               print $response->status_line() . "\n";
+               return undef; # Failed login into the phpMyAdmin form.
+          }
+          return 1;          # Successful login into the phpMyAdmin form.
+     }else {
+          return 1; # Login succeeded.
+     }
+     return undef;
+}
+
+# Input:  A url (i.e. /cpsess2528778714/frontend/x3/index.html?post_login=14386605437637)
+# Output: $self->{token} is set if there is one in the url.
+sub cpanel_set_token {
+     my $self = shift;
+     my $url  = shift;
+     if ($url =~ m/\/cpsess\d*/) {
+          $self->{token} = $&;
+     }else{
+          $self->{token} = "";
+     }
+}
+
+# Find the array index number of the cPanel login form.
+# Input: reference to an array of HTML::Form objects.
+# Output: Form number
+#         or -1 if there's an error.
+sub cpanel_find_login_form {
+     my $self    = shift;
+     my $forms   = shift;
+     my $counter = 0;
+     foreach my $form (@{$forms}) {
+          if ($form->{attr}->{id} eq "login_form") {
+               return $counter;
+          }
+          $counter++;
+     }
+     return -1;
+}
+
+# List phpMyAdmin databases.
+# Input:  Nothing
+# Output: Array with a database in each element.
+#         undef=Error
+sub cpanel_list_databases {
+     my $self       = shift;
+     my $databases  = [];
+     my $table_flag = 0;  #Indicates whether or not we're in the table where the databases are listed.
+     my $url = $self->{url};
+     $url =~ s/(:2082|:2083).*/$1/; #Chop off the part after :2082 or :2083
+     $url = $url . $self->{token} . "/3rdparty/phpMyAdmin/server_databases.php";
+     my $req = HTTP::Request->new(GET, $url);
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+	  print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @lines = split ("\n", $response->content);
+     foreach my $line (@lines) {
+          if ($line =~ /<tbody>/i) {
+               $table_flag = 1;
+          }
+          if ($line =~ /<\/tbody>/i) {
+               $table_flag = 0;
+          }
+          if ($line =~ /window.parent.openDb/ && $table_flag) {
+               $dbname = $line;
+               $dbname =~ s/.*window.parent.openDb\('//;
+               $dbname =~ s/'\).*//;
+               if ($dbname !~ /information_schema/) {
+                    push(@{$databases}, $dbname);
+               }
+          }
+     }
+     return $databases;
+}
+
+
+# List the tables in a database within cPanel.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+# Output: Array of table names
+#         or undef if there's an Error
+sub cpanel_list_tables {
+     my $self     = shift;
+     my $database = shift;
+     my $url = $self->{url};
+     $url =~ s/(:2082|:2083).*/$1/;
+     $url = $url . $self->{token} . "/3rdparty/phpMyAdmin/db_export.php?db=$database&server=1";
+     my $tables = [];
+     my $req = HTTP::Request->new(GET, $url);
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               my $count = 1;
+               my $table;
+               do {
+                    $table = $form->find_input('table_select[]','',$count);
+                    if ($table) {
+                         push (@{$tables}, $table->{menu}[1]->{name});
+                    }
+                    $count++;
+               }while($table);
+          }
+     }
+     return $tables;
+}
+
+# Download a database table from generic phpMyAdmin installation.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+#         Table name
+#         Filename to save to.
+# Output: undef=Error, 1=OK
+sub cpanel_download_table {
+     my $self     = shift;
+     my $database = shift;
+     my $table    = shift;
+     my $filename = "$database.$table.sql";
+     my $url = $self->{url};
+     $url =~ s/(:2082|:2083).*/$1/;
+     $url = $url . $self->{token} . "/3rdparty/phpMyAdmin/db_export.php?db=$database&server=1";
+ 
+     #Open the file handle to save to.
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to.";
+
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     my $req = HTTP::Request->new(GET, $url);
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('sql_drop_table', 1);         #Set any options as needed.
+               $form->value('sql_insert_syntax', 'none');
+               $form->value('sql_use_transaction', 1);
+               $form->value('sql_disable_fk', 1);
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               my $count = 1;
+               my $current_table;
+               do { # Unselect all of the listed tables except the one we want.
+                    $current_table = $form->find_input('table_select[]','',$count);
+                    if ($current_table) {
+                         if ($current_table->{menu}[1]->{name} ne $table) {
+                              $current_table->{disabled} = '1';
+                         }
+                    }
+                    $count++;
+               }while($current_table);
+               $req = $form->click;
+               $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last; 
+          }
+     }
+     $self->close_download($handle, "$database.$table"); #Close up shop.
+     return 1;
+}
+
+# Download a database from cPanel or a generic phpMyAdmin installation.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+#         Filename to save to.
+# Output: undef=Error, 1=OK
+sub cpanel_download_db {
+     my $self     = shift;
+     my $database = shift;
+     my $filename = $database . ".sql";
+     my $url = $self->{url};
+     $url =~ s/(:2082|:2083).*/$1/;
+     $url = $url . $self->{token} . "/3rdparty/phpMyAdmin/db_export.php?db=$database&server=1";
+
+     #Open the file handle to save to.
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to.";
+
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     my $req = HTTP::Request->new(GET, $url);
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('sql_drop_table', 1);         #Set any options as needed.
+               $form->value('sql_insert_syntax', 'none');
+               $form->value('sql_use_transaction', 1);
+               $form->value('sql_disable_fk', 1);
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               $req = $form->click;
+               $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last; 
+          }
+     }
+     $self->close_download($handle, $database); #Close up shop.
+     return 1;
+}
+
+
+
+#------------------------------------------------------------------------
+#------------------------- Plesk Admin Subs -----------------------------
+#------------------------------------------------------------------------
+
+# List databases in a login type of pleskadmin.
+# Output: reference to an array that lists the databases.
+#         undef = error
+sub pleskadmin_list_databases {
+     my $self = shift;
+     my $databases  = [];
+     if (!$self->pleskadmin_goto_userpanel()) {
+          return undef;
+     }
+     my $json_data = $self->plesk_lookup_dblist();
+     if (!$json_data) {
+          return undef;
+     }
+     foreach my $dbinfo (@{$json_data->{data}}) {  # Go through the decoded JSON and list the database names.
+          push (@{$databases}, $dbinfo->{name});
+     }
+     return $databases;
+}
+
+# List the tables in a database.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+# Output: Array of table names
+#         or undef if there's an Error
+sub pleskadmin_list_tables {
+     my $self         = shift;
+     my $database     = shift;
+     my $database_id;
+     my $response;
+     my $tables = [];
+     my $json_data = $self->plesk_lookup_dblist();
+     if (!$json_data) {
+          return undef;
+     }
+     foreach my $dbinfo (@{$json_data->{data}}) {  # Go through the decoded JSON and find our database.
+          if ($dbinfo->{name} eq $database) {
+               $database_id = $dbinfo->{id};
+          }
+     }
+     if (!$database_id) {
+          print "Database $database not found.\n";
+          return undef;
+     }
+     my $url = $self->{url} . "/smb/database/webadmin/id/" . $database_id;
+     my $req = HTTP::Request->new(GET, $url);     # This request will automatically follow a 302 redirect to 
+     $response = $self->{browser}->request($req); #  something like "/domains/databases/phpMyAdmin/index.php?pleskStartSession".
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     $url = "$self->{url}/domains/databases/phpMyAdmin/db_export.php?db=$database&server=1";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               my $count = 1;
+               my $table;
+               do {
+                    $table = $form->find_input('table_select[]','',$count);
+                    if ($table) {
+                         push (@{$tables}, $table->{menu}[1]->{name});
+                    }
+                    $count++;
+               }while($table);
+          }
+     }
+     return $tables;
+}
+
+# Download a database table in a login type of pleskadmin.
+# Output: 1     = OK
+#         undef = error
+sub pleskadmin_download_table {
+     my $self         = shift;
+     my $database     = shift;
+     my $table        = shift;
+     my $database_id;
+     my $response;
+     my $filename = "$database.$table.sql";
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to."; #Open the file handle to save to.
+     if (!$self->pleskadmin_goto_userpanel()) {
+          return undef;
+     }
+     my $json_data = $self->plesk_lookup_dblist();
+     if (!$json_data) {
+          return undef;
+     }
+     foreach my $dbinfo (@{$json_data->{data}}) {  # Go through the decoded JSON and find our database.
+          if ($dbinfo->{name} eq $database) {
+               $database_id = $dbinfo->{id};
+          }
+     }
+     if (!$database_id) {
+          print "Database $database not found.\n";
+          return undef;
+     }
+     my $url = $self->{url} . "/smb/database/webadmin/id/" . $database_id;
+     my $req = HTTP::Request->new(GET, $url);     # This request will automatically follow a 302 redirect to 
+     $response = $self->{browser}->request($req); #  something like "/domains/databases/phpMyAdmin/index.php?pleskStartSession".
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     $url = "$self->{url}/domains/databases/phpMyAdmin/db_export.php?db=$database&server=1";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('sql_drop_table', 1);         #Set any options as needed.
+               $form->value('sql_insert_syntax', 'none');
+               $form->value('sql_use_transaction', 1);
+               $form->value('sql_disable_fk', 1);
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               my $count = 1;
+               my $current_table;
+               do { # Unselect all of the listed tables except the one we want.
+                    $current_table = $form->find_input('table_select[]','',$count);
+                    if ($current_table) {
+                         if ($current_table->{menu}[1]->{name} ne $table) {
+                              $current_table->{disabled} = '1';
+                         }
+                    }
+                    $count++;
+               }while($current_table);
+               $req = $form->click;
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last;
+          }
+     }
+     $self->close_download($handle, "$database.$table"); #Close up shop.
+     return 1;
+}
+
+# Download a database in a login type of pleskadmin.
+# Output: 1     = OK
+#         undef = error
+sub pleskadmin_download_db {
+     my $self         = shift;
+     my $database     = shift;
+     my $database_id;
+     my $response;
+     my $filename     = $database . ".sql";
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to."; #Open the file handle to save to.
+     if (!$self->pleskadmin_goto_userpanel()) {
+          return undef;
+     }
+     my $json_data = $self->plesk_lookup_dblist();
+     if (!$json_data) {
+          return undef;
+     }
+     foreach my $dbinfo (@{$json_data->{data}}) {  # Go through the decoded JSON and find our database.
+          if ($dbinfo->{name} eq $database) {
+               $database_id = $dbinfo->{id};
+          }
+     }
+     if (!$database_id) {
+          print "Database $database not found.\n";
+          return undef;
+     }
+     my $url = $self->{url} . "/smb/database/webadmin/id/" . $database_id;
+     my $req = HTTP::Request->new(GET, $url);     # This request will automatically follow a 302 redirect to 
+     $response = $self->{browser}->request($req); #  something like "/domains/databases/phpMyAdmin/index.php?pleskStartSession".
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     $url = "$self->{url}/domains/databases/phpMyAdmin/db_export.php?db=$database&server=1";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('sql_drop_table', 1);         #Set any options as needed.
+               $form->value('sql_insert_syntax', 'none');
+               $form->value('sql_use_transaction', 1);
+               $form->value('sql_disable_fk', 1);
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               $req = $form->click;
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last;
+          }
+     }
+     $self->close_download($handle, $database); #Close up shop.
+     return 1;
+}
+
+# Do the equivalent of going to a user's control panel in a Plesk admin login.
+# Output: 1     = OK
+#         undef = error
+sub pleskadmin_goto_userpanel {
+     my $self = shift;
+     my $response;
+     if (!$self->{domain}) {
+          print "--domain is needed for Plesk.\n";
+          return undef;
+     }
+     # This will return a page that includes JSON data that associates the domain with the webspaceId.
+     my $url  = $self->{url} . "/admin/domain/list?context=domains";
+     my $req  = HTTP::Request->new(GET, $url);
+     $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my $webspaceid =  $self->pleskadmin_extract_wid($response->content);
+     if (!$webspaceid) {
+          print "webspaceId not found.  So I don't know which hosting panel of Plesk to look in for the database(s).\n";
+          print "Is the --domain option correct?\n";
+          return undef;
+     }
+     $url = $self->{url} . "/admin/subscription/login/id/$webspaceid/"; # Load the hosting panel for this domain.
+     my $req  = HTTP::Request->new(GET, $url);    # The only purpose for loading this page is to set cookies                    
+     $response = $self->{browser}->request($req); #  so we can load the next page.
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     #Todo: check $response for success.
+     return 1;
+}
+
+# Extract the webspaceId from the page with the domains.
+#  This will be used to build the url to the control panel that has the database we want.
+#  i.e. https://somedomain.com:8443/admin/subscription/login/id/5/  <-- 5 is the webspaceId.
+# Input:  $response->content of the page with the domains.
+# Output: webspaceID associated with that domain.
+#         or undef if the webspaceID was not found.
+sub pleskadmin_extract_wid {
+     my $self    = shift;
+     my $content = shift;
+     my @lines   = split ("\n", $content);
+     foreach my $line (@lines) {
+          if ($line =~ /\"$self->{domain}\"/i) { #If we find the domain name, this must be the line we want.
+               $line =~ s/.*?\"$self->{domain}\"//;     # Remove everything up to and including the first occurence of the domain name.
+               $line =~ s/.*?webspaceId":"//; # The next occurence of "webspaceId" should be the one we want.  So remove up to the id.
+               $line =~ s/\".*//;            # Now remove the quote after the ID and everything after.
+               if ($line) {
+                    return $line; # If there's anything there, then return it.
+               }else{
+                    return undef; # Otherwise, return undef.
+               }
+          }
+     }
+     return undef;
+}
+
+# Extract the URL of the <a> tag on a web page.
+# Input:  $response->content of the initial page from the user supplied Plesk panel URL.
+#         i.e. <a href="/login.php3?window_id=&amp;requested_url=http%3A%2F%2F50.22.142.130%3A8880%2F"
+# Output: The URL in the <a> tag.
+#         or undef if an <a> tag was not found.
+sub pleskadmin_extract_link {
+     my $self    = shift;
+     my $content = shift;
+     my @lines   = split ("\n", $content);
+     foreach my $line (@lines) {
+          if ($line =~ /<a href="/i) { #If we find the login form tag then this must be the login form.
+               $line =~ s/.*<a href="//;
+               $line =~ s/".*//;
+               return $line;
+          }
+     }
+     return undef;
+}
+
+# Read through the content of a page and determine if the page has a frameset tag.
+# The page after a successful login is the only one with a frameset, so we use this to tell if login was successful.
+# Input:  Page content
+# Output: 1 = Yes, it has a frameset.
+#         0 = No, it does not have a frameset.
+sub pleskadmin_has_frameset {
+     my $self    = shift;
+     my $content = shift;
+     my @lines   = split ("\n", $content);
+     foreach my $line (@lines) {
+          if ($line =~ /<FRAMESET /i) { #If we find the login form tag then this must be the login form.
+               return 1;
+          }
+     }
+     return 0;
+}
+
+# Read through the content of a page and determine if the page has a link.
+# Input:  Page content
+# Output: 1 = Yes, it has a link.
+#         0 = No, it does not have a link.
+sub pleskadmin_has_link {
+     my $self    = shift;
+     my $content = shift;
+     my @lines   = split ("\n", $content);
+     foreach my $line (@lines) {
+          if ($line =~ /<a /i) { #If we find the login form tag then this must be the login form.
+               return 1;
+          }
+     }
+     return 0;
+}
+
+# Read through the content of a page and determine if the page has a form.
+# Input:  Page content
+# Output: 1 = Yes, it has a form.
+#         0 = No, it does not have a form.
+sub pleskadmin_has_form {
+     my $self    = shift;
+     my $content = shift;
+     my @lines   = split ("\n", $content);
+     foreach my $line (@lines) {
+          if ($line =~ /<form /i) { #If we find the login form tag then this must be the login form.
+               return 1;
+          }
+     }
+     return 0;
+}
+
+# Read through the content of a page and determine if the page is a login form.
+# Input:  Page content
+# Output: 1 = Yes, it's a login form.
+#         0 = No, it is not a login form.
+sub pleskadmin_is_login_form {
+     my $self    = shift;
+     my $content = shift;
+     my @lines   = split ("\n", $content);
+     foreach my $line (@lines) {
+          if ($line =~ /form id="form-login"/i) { #If we find the login form tag then this must be the login form.
+               return 1;
+          }
+     }
+     return 0;
+}
+
+#------------------------------------------------------------------------
+#------------------------- Plesk User Subs ---------------------------
+#------------------------------------------------------------------------
+# Read through the content of a page and determine if the page has a navbar.
+# The page after a successful login to Windows shared hosting has a navbar, so we use this to tell if login was successful.
+# Input:  Page content
+# Output: 1 = Yes, it has a navbar.
+#         0 = No, it does not have a navbar.
+sub pleskuser_has_navbar {
+     my $self    = shift;
+     my $content = shift;
+     my @lines   = split ("\n", $content);
+     foreach my $line (@lines) {
+          if ($line =~ /Smb\.NavigationTabs/i) {
+               return 1;
+          }
+     }
+     return 0;
+}
+
+# Input:  $self->{browser} should be logged into Plesk.
+# Output: Populated $databases array ref.        
+sub pleskuser_list_databases {
+     my $self      = shift;
+     my $databases = [];
+     my $json_data = $self->plesk_lookup_dblist();
+     if (!$json_data) {
+          return undef;
+     }
+     foreach my $dbinfo (@{$json_data->{data}}) {  # Go through the decoded JSON and list the database names.
+          push (@{$databases}, $dbinfo->{name});
+     }
+     return $databases;
+}
+
+# List the tables in a database.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+# Output: Array of table names
+#         or undef if there's an Error
+sub pleskuser_list_tables {
+     my $self         = shift;
+     my $database     = shift;
+     my $database_id;
+     my $response;
+     my $tables = [];
+     my $json_data = $self->plesk_lookup_dblist();
+     if (!$json_data) {
+          return undef;
+     }
+     foreach my $dbinfo (@{$json_data->{data}}) {  # Go through the decoded JSON and find our database.
+          if ($dbinfo->{name} eq $database) {
+               $database_id = $dbinfo->{id};
+          }
+     }
+     if (!$database_id) {
+          print "Database $database not found.\n";
+          return undef;
+     }
+     my $url = $self->{url} . "/smb/database/webadmin/id/" . $database_id;
+     my $req = HTTP::Request->new(GET, $url);     # This request will automatically follow a 302 redirect to 
+     $response = $self->{browser}->request($req); #  something like "/domains/databases/phpMyAdmin/index.php?pleskStartSession".
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     $url = "$self->{url}/domains/databases/phpMyAdmin/db_export.php?db=$database&server=1";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               my $count = 1;
+               my $table;
+               do {
+                    $table = $form->find_input('table_select[]','',$count);
+                    if ($table) {
+                         push (@{$tables}, $table->{menu}[1]->{name});
+                    }
+                    $count++;
+               }while($table);
+          }
+     }
+     return $tables;
+}
+
+# Download a table
+# Output: 1     = OK
+#         undef = error
+sub pleskuser_download_table {
+     my $self         = shift;
+     my $database     = shift;
+     my $table        = shift;
+     my $database_id;
+     my $response;
+     my $filename = "$database.$table.sql";
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to."; #Open the file handle to save to.
+     my $json_data = $self->plesk_lookup_dblist();
+     if (!$json_data) {
+          return undef;
+     }
+     foreach my $dbinfo (@{$json_data->{data}}) {  # Go through the decoded JSON and find our database.
+          if ($dbinfo->{name} eq $database) {
+               $database_id = $dbinfo->{id};
+          }
+     }
+     if (!$database_id) {
+          print "Database $database not found.\n";
+          return undef;
+     }
+     my $url = $self->{url} . "/smb/database/webadmin/id/" . $database_id;
+     my $req = HTTP::Request->new(GET, $url);     # This request will automatically follow a 302 redirect to 
+     $response = $self->{browser}->request($req); #  something like "/domains/databases/phpMyAdmin/index.php?pleskStartSession".
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     $url = "$self->{url}/domains/databases/phpMyAdmin/db_export.php?db=$database&server=1";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('sql_drop_table', 1);         #Set any options as needed.
+               $form->value('sql_insert_syntax', 'none');
+               $form->value('sql_use_transaction', 1);
+               $form->value('sql_disable_fk', 1);
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               my $count = 1;
+               my $current_table;
+               do { # Unselect all of the listed tables except the one we want.
+                    $current_table = $form->find_input('table_select[]','',$count);
+                    if ($current_table) {
+                         if ($current_table->{menu}[1]->{name} ne $table) {
+                              $current_table->{disabled} = '1';
+                         }
+                    }
+                    $count++;
+               }while($current_table);
+               $req = $form->click;
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last;
+          }
+     }
+     $self->close_download($handle, "$database.$table"); #Close up shop.
+     return 1;
+}
+
+
+# Download a database.
+# Output: 1     = OK
+#         undef = error
+sub pleskuser_download_db {
+     my $self         = shift;
+     my $database     = shift;
+     my $database_id;
+     my $response;
+     my $filename     = $database . ".sql";
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to."; #Open the file handle to save to.
+     my $json_data = $self->plesk_lookup_dblist();
+     if (!$json_data) {
+          return undef;
+     }
+     foreach my $dbinfo (@{$json_data->{data}}) {  # Go through the decoded JSON and find our database.
+          if ($dbinfo->{name} eq $database) {
+               $database_id = $dbinfo->{id};
+          }
+     }
+     if (!$database_id) {
+          print "Database $database not found.\n";
+          return undef;
+     }
+     my $url = $self->{url} . "/smb/database/webadmin/id/" . $database_id;
+     my $req = HTTP::Request->new(GET, $url);     # This request will automatically follow a 302 redirect to 
+     $response = $self->{browser}->request($req); #  something like "/domains/databases/phpMyAdmin/index.php?pleskStartSession".
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     $url = "$self->{url}/domains/databases/phpMyAdmin/db_export.php?db=$database&server=1";
+     my $req = HTTP::Request->new(GET, $url);
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('sql_drop_table', 1);         #Set any options as needed.
+               $form->value('sql_insert_syntax', 'none');
+               $form->value('sql_use_transaction', 1);
+               $form->value('sql_disable_fk', 1);
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               $req = $form->click;
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last;
+          }
+     }
+     $self->close_download($handle, $database); #Close up shop.
+     return 1;
+}
+
+
+
+#------------------------------------------------------------------------
+#------------------------- Plesk General Subs ---------------------------
+#------------------------------------------------------------------------
+
+# Output: 1     = OK
+#         undef = error
+sub plesk_login {
+     my $self          = shift;
+     my $max_redirects = 10;
+     my $redirects     =  0;
+     my $response;
+     my $req = HTTP::Request->new(GET, $self->{url});
+     # Plesk 10.4.4 VPSs have several redirect pages that are either:
+     #     1) forms with javascript that automatically submit them, or
+     #     2) links with javascript to automatically follow them.
+     # So we will load the user-supplied URL and follow the pages by following the
+     #  link or by automatically submitting the form.
+     # Windows Plesk shared accounts have a similar login, so we use this code and check for a navbar for a
+     #  successful login after sending login_name and passwd.
+     do {
+          $response = $self->{browser}->request($req);          # Submit the most recent request.
+          if (!$response->is_success()) {  #If the page request failed,
+               print $response->status_line() . "\n"; # try to print what went wrong
+               return undef;               # and return a failure.
+          }
+          $redirects++;
+          if ($self->pleskadmin_has_frameset($response->content) || $self->pleskuser_has_navbar($response->content)) {
+               return 1;                                        # Since we see a frameset, we will assume the login was successful.
+          }elsif ($self->pleskadmin_has_form($response->content)) {      # If the returned page has a form, then we'll create our request from the form.
+               my @forms = HTML::Form->parse($response);
+               if ($self->pleskadmin_is_login_form($response->content)) { # But first, fill in the user/pass if it's the login form.
+                    $forms[0]->value('user_name', $self->{cpuser}); #Linux VPS's have these form fields.
+                    $forms[0]->value('user_password', $self->{cppass});
+                    $forms[0]->value('login_name', $self->{cpuser}); #Windows shared has these form fields.
+                    $forms[0]->value('passwd', $self->{cppass});
+               }
+               $req = $forms[0]->click;                         # Create a request object from the form.
+          }elsif ($self->pleskadmin_has_link($response->content)) {
+               my $url = $self->pleskadmin_extract_link($response->content);
+               if (!$url) {return 0;}
+               $url = $self->{url} . $url;
+               $req = HTTP::Request->new(GET, $url);            # Create a request from the link on the page.
+          }else {
+               $redirects = $max_redirects; # The page doesn't have a link or a form.  So we're either logged in or there's a problem.
+                                            # Artificially setting $redirects as a way to break out of the loop.
+          }
+     }while($redirects < $max_redirects);
+     return undef;
+}
+
+# Find the database list in the Plesk control panel and return a Perl reference to the database list
+# Input:  Nothing directly
+# Output: Reference to the decoded json data containing the database names.
+#         undef in there was an error.
+sub plesk_lookup_dblist {
+     my $self = shift;
+     my $response;
+     my $json_data = undef;
+     $url = $self->{url} . "/smb/database/list";  # Load the page with the database list.
+     my $req  = HTTP::Request->new(GET, $url);
+     $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @lines   = split ("\n", $response->content); # Search the page for the JSON line.
+     foreach my $line (@lines) {
+          if ($line =~ /data: {/i) {
+               $line =~ s/.*?data: {/{/;
+               $line =~ s/,[\r\n\t ]*$//;
+               $json_data = JSON::decode_json($line);      # Decode the JSON into a perl reference.
+               last;
+          }
+     }
+     return $json_data;
+}
+
+
+
+
+#------------------------------------------------------------------------
+#----------------------- Dump.php Subs -----------------------------------
+#------------------------------------------------------------------------
+
+# Skeleton function to login to a dump.php session.
+# Input:  Nothing
+# Output: Always 1 for success because a pre-login is not applicable for the dump.php login type.
+sub dumpphp_login {
+     my $self = shift;
+     return 1;
+}
+
+# List dump.php databases.
+# Input:  Nothing
+# Output: Array with a database in each element.
+#         undef=Error
+sub dumpphp_list_databases {
+     my $self      = shift;
+     my $databases = [];
+     my $list_flag = 0;  #Indicates whether or not we're reading part of the database list.
+     my $req = POST("$self->{url}/dump.php", [
+	       'action'      => 'List Databases',
+	       'db_host'     => $self->{dbhost},
+	       'db_user'     => $self->{dbuser},
+	       'db_password' => $self->{dbpass},
+	  ]);
+     if ($self->{httphost}) { # Set host if --httphost given.  (Used when DNS not pointed to the host) 
+	  $req->header(Host => $self->{httphost});
+     }
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+	  print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @lines = split ("\n", $response->content);
+     foreach my $line (@lines) {
+          if ($line =~ /Access denied/) {
+               print "Access denied while listing databases for database user: $self->{dbuser}.  ";
+               return undef;
+          }
+          if ($line =~ /^</i) {
+               $list_flag = 0;
+          }
+          if ($list_flag == 1 && $line !~ /information_schema/) {
+               $dbname = $line;
+               $dbname =~ s/<.*//;
+               push(@{$databases}, $dbname);
+          }
+          if ($line =~ /Databases:/i) {
+               $list_flag = 1;
+          }
+     }
+     return $databases;
+}
+
+# List dump.php tables.
+# Input:  Nothing
+# Output: Array with a table in each element.
+#         undef=Error
+sub dumpphp_list_tables {
+     my $self      = shift;
+     my $database  = shift;
+     my $tables = [];
+     my $list_flag = 0;  #Indicates whether or not we're reading part of the database list.
+     my $req = POST("$self->{url}/dump.php", [
+	       'action'      => 'List Tables',
+	       'db_host'     => $self->{dbhost},
+               'db_name'     => $database,
+	       'db_user'     => $self->{dbuser},
+	       'db_password' => $self->{dbpass},
+	  ]);
+     if ($self->{httphost}) { # Set host if --httphost given.  (Used when DNS not pointed to the host) 
+	  $req->header(Host => $self->{httphost});
+     }
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+	  print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @lines = split ("\n", $response->content);
+     foreach my $line (@lines) {
+          if ($line =~ /Access denied/) {
+               print "Access denied while listing tables for database user: $self->{dbuser}.  ";
+               return undef;
+          }
+          if ($line =~ /^</i) {
+               $list_flag = 0;
+          }
+          if ($list_flag == 1 && $line !~ /information_schema/) {
+               $dbname = $line;
+               $dbname =~ s/<.*//;
+               push(@{$tables}, $dbname);
+          }
+          if ($line =~ /Tables:/i) {
+               $list_flag = 1;
+          }
+     }
+     return $tables;
+}
+
+# Download a database from dump.php installation.
+# Input:  URL      (from $self)
+#         User     (from $self)
+#         Password (from $self)
+#         Database name
+#         Database host (from $dbhost command line option)
+# Output: 0=Error, 1=OK
+sub dumpphp_download_db {
+     my $self = shift;
+     my $database = shift;
+     my $filename = $database . ".sql";
+     my $exporttype = "Export Using MySQLDump";
+     if ($self->{exporttype} eq "sql") {
+          $exporttype = "Export Using SQL";        # Have dump.php export using php SQL commands.
+     }
+ 
+     #Open the file handle to save to.
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to.";
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     my $req = POST("$self->{url}/dump.php", [ 
+               'action'      => $exporttype,
+               'db_host'     => $self->{dbhost},
+               'db_name'     => $database,
+               'db_user'     => $self->{dbuser},
+               'db_password' => $self->{dbpass},
+          ]);
+     if ($self->{httphost}) { # Set host if --httphost given.  (Used when DNS not pointed to the host)
+          $req->header(Host => $self->{httphost});
+     }
+     my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          close($handle);
+          return undef;               # and return a failure.
+     }
+     $self->close_download($handle, $database); #Close up shop.
+     return 1;
+}
+
+# Download a database table from a dump.php installation.
+# Input:  URL      (from $self)
+#         User     (from $self)
+#         Password (from $self)
+#         Database name
+#         Database host (from $dbhost command line option)
+# Output: 0=Error, 1=OK
+sub dumpphp_download_table {
+     my $self       = shift;
+     my $database   = shift;
+     my $table      = shift;
+     my $filename   = "$database.$table.sql";
+     my $exporttype = "Export Table Using MySQLDump";
+     if ($self->{exporttype} eq "sql") {
+          $exporttype = "Export Table Using SQL";        # Have dump.php export using php SQL commands.
+     }
+ 
+     #Open the file handle to save to.
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to.";
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     my $req = POST("$self->{url}/dump.php", [ 
+               'action'      => $exporttype,
+               'db_host'     => $self->{dbhost},
+               'db_name'     => $database,
+               'db_user'     => $self->{dbuser},
+               'db_password' => $self->{dbpass},
+               'db_table'    => $table
+          ]);
+     if ($self->{httphost}) { # Set host if --httphost given.  (Used when DNS not pointed to the host)
+          $req->header(Host => $self->{httphost});
+     }
+     my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          close($handle);
+          return undef;               # and return a failure.
+     }
+     $self->close_download($handle, "$database.$table"); #Close up shop.
+     return 1;
+}
+
+
+
+#------------------------------------------------------------------------
+#----------------------- Generic Subs -----------------------------------
+#------------------------------------------------------------------------
+
+# Log into a generic phpMyAdmin server.
+# Input:  Nothing (All input is from $self members)
+# Output: 1=Success, undef=Failure
+sub generic_login {
+     my $self = shift;
+     my $req = HTTP::Request->new(GET, "$self->{url}/index.php");
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response); #Parse the forms on this page into form objects.
+     my $formnumber = $self->generic_find_login_form(\@forms); 
+     if ($formnumber == -1) {
+          if ($self->generic_has_frameset($response->content)) {
+               return 1; #We must already be logged in.
+          }else{
+               print "Could not find the phpMyAdmin login form.\n";
+               return undef;
+          }
+     }
+     $forms[$formnumber]->value('pma_username', $self->{dbuser});
+     $forms[$formnumber]->value('pma_password', $self->{dbpass});
+     $req = $forms[$formnumber]->click;
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     $response = $self->{browser}->request($req);
+     if ($response->is_redirect()) {
+          my $req = HTTP::Request->new(GET, $response->{_headers}->{location});
+          $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+          $response = $self->{browser}->request($req);
+     }
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     # If login failed, we should see the login form.  Otherwise, it should be the frames page.
+     @forms = HTML::Form->parse($response); #Parse the forms on this page into form objects.
+     if ($self->generic_find_login_form(\@forms) > -1) {
+          return undef; # Login failed.
+     }else {
+          return 1; # Assume the login succeeded (We could also check for a frameset here if we wanted).
+     }
+     return undef;
+}
+
+# List phpMyAdmin databases.
+# Input:  Nothing
+# Output: Array with a database in each element.
+#         undef=Error
+sub generic_list_databases {
+     my $self       = shift;
+     my $databases  = [];
+     my $table_flag = 0;  #Indicates whether or not we're in the table where the databases are listed.
+     my $req = HTTP::Request->new(GET, "$self->{url}/server_databases.php");
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+	  print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @lines = split ("\n", $response->content);
+     foreach my $line (@lines) {
+          if ($line =~ /<tbody>/i) {
+               $table_flag = 1;
+          }
+          if ($line =~ /<\/tbody>/i) {
+               $table_flag = 0;
+          }
+          if ($line =~ /window.parent.openDb/ && $table_flag) {
+               $dbname = $line;
+               $dbname =~ s/.*window.parent.openDb\('//;
+               $dbname =~ s/'\).*//;
+               if ($dbname && $dbname !~ /information_schema/) {
+                    push(@{$databases}, $dbname);
+               }
+          }
+     }
+     return $databases;
+}
+
+# Download a database with all tables in one file from generic phpMyAdmin installation.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+#         Filename to save to.
+# Output: undef=Error, 1=OK
+sub generic_download_db {
+     my $self     = shift;
+     my $database = shift;
+     my $filename = $database . ".sql";
+
+     #Open the file handle to save to.
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to.";
+
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     my $req = HTTP::Request->new(GET, "$self->{url}/db_export.php?db=$database&server=1");
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('sql_drop_table', 1);         #Set any options as needed.
+               $form->value('sql_insert_syntax', 'none');
+               $form->value('output_format', 'sendit');
+               $form->value('sql_use_transaction', 1);
+               $form->value('sql_disable_fk', 1);
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               $req = $form->click;
+               $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last; 
+          }
+     }
+     $self->close_download($handle, $database); #Close up shop.
+     return 1;
+}
+  
+# Download a database table from generic phpMyAdmin installation.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+#         Table name
+# Output: undef=Error, 1=OK
+sub generic_download_table {
+     my $self     = shift;
+     my $database = shift;
+     my $table    = shift;
+     my $filename = "$database.$table.sql";
+
+     #Open the file handle to save to.
+     open (my $handle, ">", $filename) or die "Cannot open $filename to write the database dump to.";
+
+     # Download and parse the form.
+     $self->{progress_counter} = 0;
+     my $req = HTTP::Request->new(GET, "$self->{url}/db_export.php?db=$database&server=1");
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               $form->value('sql_drop_table', 1);         #Set any options as needed.
+               $form->value('sql_insert_syntax', 'none');
+               $form->value('sql_use_transaction', 1);
+               $form->value('sql_disable_fk', 1);
+               $form->value('output_format', 'sendit');
+               $form->value('asfile', 1); #Same setting as output_format, but for different PMA version.
+               my $count = 1;
+               my $current_table;
+               do { # Unselect all of the listed tables except the one we want.
+                    $current_table = $form->find_input('table_select[]','',$count);
+                    if ($current_table) {
+                         if ($current_table->{menu}[1]->{name} ne $table) {
+                              $current_table->{disabled} = '1';
+                         }
+                    }
+                    $count++;
+               }while($current_table);
+               $req = $form->click;
+               $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+               my $response = $self->{browser}->request($req, sub {$self->download_progress_callback(@_, $database, $handle)});
+               if (!$response->is_success()) {  #If the page request failed,
+                    print $response->status_line() . "\n"; # try to print what went wrong
+                    close($handle);
+                    return undef;               # and return a failure.
+               }
+               last; 
+          }
+     }
+     $self->close_download($handle, "$database.$table"); #Close up shop.
+     return 1;
+}
+
+# List the tables in a database.
+# Input:  URL (from $self)
+#         User (from $self)
+#         Password (from $self)
+#         Database name
+# Output: Array of table names
+#         or undef if there's an Error
+sub generic_list_tables {
+     my $self     = shift;
+     my $database = shift;
+     my $tables = [];
+     my $req = HTTP::Request->new(GET, "$self->{url}/db_export.php?db=$database&server=1");
+     $req->authorization_basic($self->{dbuser}, $self->{dbpass});
+     my $response = $self->{browser}->request($req);
+     if (!$response->is_success()) {  #If the page request failed,
+          print $response->status_line() . "\n"; # try to print what went wrong
+          return undef;               # and return a failure.
+     }
+     my @forms = HTML::Form->parse($response);
+     foreach my $form (@forms) {                          #Look for the dump form.
+          if ($form->{attr}->{name} eq "dump") {
+               my $count = 1;
+               my $table;
+               do {
+                    $table = $form->find_input('table_select[]','',$count);
+                    if ($table) {
+                         push (@{$tables}, $table->{menu}[1]->{name});
+                    }
+                    $count++;
+               }while($table);
+          }
+     }
+     return $tables;
+}
+
+
+
+# Callback for a download.
+# Input:  Standard callback args: data, response, protocol
+#         File handle to save the data to.
+sub download_progress_callback {
+     my $self = shift;
+     my ($data, $response, $protocol, $database, $handle) = @_;
+     my @progress_indicator = ("-", "\\", "|", "/");
+     #print {$self->{download_handle}} "$data";
+     if ($self->{progress_counter} % 20 == 0) {
+          print "\rDownloading $database..." . $progress_indicator[($self->{progress_counter}/20) % 4];
+     }
+     $self->{progress_counter}++;
+     print $handle "$data";
+}
+
+# Finish up a download and close up shop.
+# Input: File handle to close
+#        Database name
+# Output: Nothing (except that file is closed and some info. is printed)
+sub close_download {
+     my $self     = shift;
+     my $handle   = shift;
+     my $database = shift;
+     close $handle;
+     if ($self->{progress_counter}) {
+          print "\rDownloaded $database.sql     \n";
+     }else{
+          print "\rNo data downloaded for the database: $database\n";
+     }
+}
+
+# Find the array index number of the cPanel login form.
+# Input: reference to an array of HTML::Form objects.
+# Output: Form number
+#         or undef if there's an error.
+sub generic_find_login_form {
+     my $self    = shift;
+     my $forms   = shift;
+     my $counter = 0;
+     foreach my $form (@{$forms}) {
+          if ($form->{attr}->{name} eq "login_form") {
+               return $counter;
+          }
+          $counter++;
+     }
+     return -1;
+}
+
+# Read through the content of a page and determine if the page has a frameset tag.
+# The page after a successful login is the only one with a frameset, so we use this to tell if login was successful.
+# Input:  Page content
+# Output: 1 = Yes, it has a frameset.
+#         0 = No, it does not have a frameset.
+sub generic_has_frameset {
+     my $self    = shift;
+     my $content = shift;
+     my @lines   = split ("\n", $content);
+     foreach my $line (@lines) {
+          if ($line =~ /<FRAMESET /i) { #If we find the login form tag then this must be the login form.
+               return 1;
+          }
+     }
+     return 0;
+}
+
+
+__PACKAGE__->main unless caller;
+
+1;
+

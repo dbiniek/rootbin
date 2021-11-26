@@ -1,0 +1,752 @@
+#!/usr/bin/env python
+
+#########################################
+#					#
+# Script: Archive Malicious Content	#
+# Author: Andrew Narunsky		#
+# Version: 0.23				#
+#					#
+#########################################
+#					#
+# Updated:				#
+# Added file restore feature.		#
+# Retain archive group attribute.	#
+# Added compiled log delimiter regex.	#
+# Updated ticket regex and switch.	#
+# Updated yesno function and some post	#
+#	function calls.			#
+# Added check to see if argparse is	#
+#	installed on the server.	#
+# Corrected bug in logging of username.	#
+# Changes permissions to 0400 for       #
+#       security purposes               #
+#					#
+#########################################
+#					#
+# To Do:				#
+#					#
+#########################################
+
+import sys
+import platform
+
+try:
+	import argparse
+except:
+	print '\nIt appears that argparse is not installed for the Python {0} environment on this server.\nPlease run `yum install python-argparse` to install it and then rerun amc.\n'.format(platform.python_version())
+	sys.exit()
+
+import os
+import re
+import calendar
+import time
+import pwd
+import string
+import hashlib
+import tarfile
+import shutil
+import socket
+import subprocess
+
+desk_format = re.compile("([A-Z]{3}-)?(\d{3}-?\d{5}|\d{5}-\d{3})")
+
+def ticket_validator(deskid):
+	desk_error = "Please use only standard ticket ID or Salesforce case formats (ABC-12345678 / ABC-123-45678 / ABC-12345-678 / 01234567)."
+	if not re.match(desk_format, deskid):
+		raise argparse.ArgumentTypeError(desk_error)
+	return deskid
+
+listargs = argparse.ArgumentParser(prog='Archive Malicious Content', usage='python amc.py (FILE(s)|FOLDER(s))', description='Stats and archives malicious content.')
+listargs.add_argument('malware', nargs='*', help=argparse.SUPPRESS)
+listargs.add_argument('-k', '--keep', action='store_true', default=False, help='Keep content in location.  Useful for md5 and ctime searches.')
+listargs.add_argument('-r', '--restore', action='store', dest="restore_log", metavar='/path/to/amclogfile', default=False, help='Use this switch to restore file archives listed in an amc log file.\n**Warning!!** This option should only be used to assist clients who wish to clean their files or are reporting false positive malware quarentines.')
+listargs.add_argument('-m', '--md5search', action='store_true', default=False, help='Search by md5sum')
+listargs.add_argument('-c', '--ctime', action='store', dest="ctime", metavar='ctime_in_minutes', type=int, default=False, help='Search by or near ctime in minutes.')
+listargs.add_argument('-t', '--targz', action='store_true', default=False, help='Compress the archive to tar.gz format.')
+listargs.add_argument('--force-archive', action='store', dest="archive_folder", metavar='/path/to/archive/', default=False, help='Forces archiving of files not owned by cPanel users.\nMust provide archive location.  Auto-disables search feature.')
+listargs.add_argument('-a', '--abuseid', action='store', dest="desk", metavar='ticket_number',type=ticket_validator, default=False, help='Add an abuse ticket ID or Salesforce case to the archive information.')
+listargs.add_argument('-v', '--version', action='version', version='%(prog)s 0.22')
+listargs.add_argument('-V', '--verbose', action='store_true', default=False, help='Provides verbose output of processes.')
+listargs.add_argument('-l', '--logsearch', action='store', dest="logfile", metavar='/path/to/amclogfile', default=False, help='Search by ctime or md5sum from existing amc log file.\nMust be used in combination with other search switches.')
+args = listargs.parse_args()
+
+current = calendar.timegm(time.gmtime())
+logfile = "amclog.{0}".format(current)
+loopcount = 0
+matchlistcount = 0
+searchlist = []
+searchentry = 1
+safetomove = False
+formaterror = "\nPlease answer in one of the formats provided."
+log_delimeter = re.compile(',?[\w\s]+:\s')
+
+# Function to get file info.
+
+def getinfo(infile):
+	filestat = os.stat(infile)
+	fullinfo = [infile]
+	for s in filestat:
+		fullinfo.append(s)
+	return fullinfo;
+
+# Function to verify if the reported file is owned by a cPanel user.
+
+def checkown(owner):
+	username = pwd.getpwuid(owner)[0]
+	if os.path.exists('/var/cpanel/users/' + username):
+		safe = True
+	else:
+		safe = False
+	return safe, username
+
+# Function to block default user files from being archived.
+
+def blockreg(check_item):
+	if (re.search("^/home[1-4]*/[^/]+/?(access-logs|.bash_logout|.bash_profile|.bashrc|.contactemail|.cpanel|.cpanel-logs|.dns|etc|.htpasswds|.lastlogin|logs|mail|perl5|public_ftp|public_html|.security|tmp|www|.zshrc)?/?$", check_item)):
+		if os.path.isfile(check_item):
+			item_type = "file"
+		if os.path.isdir(check_item):
+			item_type = "folder"
+		reg_fileerror = "\n{0} cannot be archived due to being a default cPanel {1}.  Skipping...".format(check_item, item_type)
+		check_item = None
+	else:
+		reg_fileerror = ""
+	return (check_item, reg_fileerror)
+
+# Function to log malware.
+
+def logmalware(path, filestat):
+	loguname = pwd.getpwuid(filestat[5])[0]
+	log=open(path + '/' + logfile, 'a+')
+	if args.desk != False:
+		if not log.readlines():
+			log.write("The {0} file has been generated for ticket / case {1}.\n\n".format( logfile, args.desk))
+	if os.path.isfile(filestat[0]):
+		log.write("Filename: {0}, Owner: {1}, Size: {2}, Modify Time: {3}, Change time: {4}, md5sum: {5}, sha1sum: {6}, Permissions: {7}\n".format( filestat[0], loguname, filestat[7], filestat[9], filestat[10], filestat[11], filestat[12], oct(filestat[1] & 0777)))
+	elif os.path.isdir(filestat[0]):
+		log.write("Directory: {0}, Owner: {1}, Size: {2}, Modify Time: {3}, Change time: {4}, Permissions: {5}\n".format( filestat[0], loguname, filestat[7], filestat[9], filestat[10], oct(filestat[1] & 0777)))
+	log.close()
+	return;
+
+# Function to get file hashes.
+
+def hashing(filetohash, hashtype, sizeoffile):
+	if sizeoffile >= "1048576":
+		if hashtype == "md5":
+			hashway = hashlib.md5()
+		elif hashtype == "sha1":
+			hashway = hashlib.sha1()
+		sizetoread = 65536
+		with open(filetohash, 'rb') as openfile:
+			filechunk = openfile.read(sizetoread)
+			while len(filechunk) > 0:
+				hashway.update(filechunk)
+				filechunk = openfile.read(sizetoread)
+		filehashed = hashway.hexdigest()
+
+	else:
+		with open(filetohash, 'rb') as openfile:
+			fullfile = openfile.read()
+			if hashtype == "md5":
+				filehashed = hashlib.md5(fullfile).hexdigest()
+			if hashtype == "sha1":
+				filehashed = hashlib.sha1(fullfile).hexdigest()
+	return filehashed;
+
+# Function to define the archive folder.
+
+def storepoint(storename):
+	if args.archive_folder == False:
+		secpath = '/home/%s/.security' % storename
+	else:
+		secpath = args.archive_folder
+	if not os.path.exists(secpath):
+		os.makedirs(secpath)
+	if args.desk != False:
+		archivepath = '{0}/amc_archive.{1}.{2}'.format(secpath, args.desk, current)
+	else:
+		archivepath = '{0}/amc_archive.{1}'.format(secpath, current)
+	if not os.path.exists(archivepath):
+		os.makedirs(archivepath)
+	return archivepath;
+
+# Function to define archive location.
+
+def archivefile(filewpath, archivepath):
+	archiveloc = filewpath.replace("/", "", 1)
+	archtoloc = '{0}/{1}'.format(archivepath, archiveloc)
+	finalsubdir = re.sub(r'[^/]+$', '', archtoloc)
+	if not os.path.exists(finalsubdir):
+		os.makedirs(finalsubdir)
+	return archtoloc;
+
+# Function to prepare directory archives.
+
+def prepdir(dir_to_archive, prepuser):
+	for parent_dir, sub_dir, base_file in list(os.walk(dir_to_archive, topdown=True, onerror=None, followlinks=False)):
+		for dirprep in sub_dir:
+			fulldir = os.path.join(parent_dir, dirprep)
+			subprocess.call(["chattr","-ia",fulldir])
+			if os.path.islink(fulldir):
+				os.unlink(fulldir)
+			else:
+				os.chown(fulldir, 0, -1)
+		for fileprep in base_file:
+			fullprep = os.path.join(parent_dir, fileprep)
+			if os.path.islink(fullprep):
+				subprocess.call(["chattr","-ia",fullprep])
+				os.unlink(fullprep)
+			else:
+				prepinfo = getinfo(fullprep)
+				prepinfo.append(hashing(prepinfo[0], "md5", prepinfo[7]))
+				prepinfo.append(hashing(prepinfo[0], "sha1", prepinfo[7]))
+				preppath = storepoint(prepuser)
+	                        logmalware(preppath, prepinfo)
+				if args.verbose == True:
+					print "Logging file:  {0}".format(prepinfo[0])
+				subprocess.call(["chattr","-ia",fullprep])
+				os.chown(fullprep, 0, -1)
+	return;
+
+# Function to verify list answers.
+
+def listverify(question, volume, alloption):
+	allowtopass = False
+	searchval = ""
+	searchnum = ""
+	error = ""
+	while allowtopass == False:
+		if alloption == False:
+			searchval = raw_input("\n{0}:  ".format(question))
+		if alloption == True:
+			searchval = raw_input("\n{0} or \"all\":  ".format(question))
+		if (searchval.lower() != "all"):
+			try:
+                        	searchnum = int(searchval)
+                	except ValueError:
+                        	error = "  The value entered was not a whole number."
+                	if (searchnum > volume) or (searchnum < 1):
+                        	allowtopass = False
+                        	print "\nPlease be sure to use only numbers that correspond to the list above.{0}".format(error)
+                	else:
+                        	allowtopass = True
+				searchval = searchnum
+		elif alloption == True:
+			allowtopass = True
+		else:
+			print "\"All\" option not permited here."
+	return searchval;
+
+# Function to verify yes/no questions.
+
+def yesno(question):
+	yesnoanswer = ""
+	while yesnoanswer != "y" and yesnoanswer != "yes" and yesnoanswer != "n" and yesnoanswer != "no":
+		yesnoquestion = raw_input("\n{0} (y/yes/n/no):  ".format(question))
+		yesnoanswer = yesnoquestion.lower()
+		if not re.match('^(y(es)?|no?)$', yesnoanswer):
+			print formaterror
+	return yesnoanswer;
+
+# Function to search.
+
+def search( value ):
+
+# Define searchable folders.
+
+	searchdirs = []
+	matched = []
+	if args.verbose == True:
+		print "\nRunning search for {0}.".format(value[1])
+	homedir = pwd.getpwnam(value[2])[5]
+	no_search_dir = ['.security']
+	for searchdir in next(os.walk(homedir))[1]:
+		if os.path.islink(os.path.join(homedir,searchdir)):
+			no_search_dir.append(searchdir)
+		if not searchdir in no_search_dir:
+			searchdirs.append('{0}/{1}'.format(homedir, searchdir))
+
+# Begin search
+
+	for path in searchdirs:
+		for topdir, subdir, mapped in list(os.walk(path, topdown=True, onerror=None, followlinks=False)):
+			for filecheck in mapped:
+				if not re.match(r"\d+\.\w+\." + socket.gethostname() + r",S\=.*$", filecheck):
+					filetocheck = os.path.join(topdir, filecheck)
+					if not os.path.islink(filetocheck):
+						if not blockreg(filetocheck)[0] is None:
+							if args.md5search == True:
+								md5searchsize = os.stat(filetocheck)[6]
+								if md5searchsize == int(value[3]):
+									filemd5 = hashing(filetocheck, "md5", md5searchsize)
+									if filemd5 == value[5]:
+										matched.append(filetocheck)
+							if args.ctime != False:
+								ctimevar = args.ctime * 60
+								filectime = getinfo(filetocheck)[9]
+								fileclow = filectime - ctimevar
+								filechigh = filectime + ctimevar
+								if fileclow <= int(value[4]) <= filechigh:
+									matched.append(filetocheck)
+	return matched;
+
+# Function to review files.
+
+def review(file):
+	os.system('less {0}'.format(file))
+	return file;
+
+# Function to check tar filters.
+
+def check_include(tar_check):
+	exclude_list = [logfile]
+	if not tar_check.name in exclude_list:
+		if args.verbose == True and os.path.isfile(tar_check.name):
+			print "Adding {0} to archive.".format(tar_check.name)
+		return tar_check;
+
+# Function to tar, gzip, and remove archived content.
+
+def targz(what_to_tar):
+	tar_root = "{0}/".format(what_to_tar)
+	final_tgz = "{0}/amc_archive.{1}.tar.gz".format(what_to_tar, current)
+	tar_gz = tarfile.open(final_tgz, "w:gz")
+	tar_gz.add(tar_root, arcname=os.path.basename(tar_root), filter=check_include)
+	tar_gz.close()
+        for tarrmdir in next(os.walk(what_to_tar))[1]:
+                if not tarrmdir in (logfile):
+                        shutil.rmtree('{0}/{1}'.format(what_to_tar, tarrmdir))
+	if args.verbose == True:
+		print "\nAll files have been archived to {0}".format(final_tgz)
+	return;
+
+# Function to restore files.
+
+def restore_proc(restorethisfile):
+	origuser = args.restore_log.split("/")[2]
+	origuid = pwd.getpwnam(origuser).pw_uid
+	origgid = pwd.getpwnam(origuser).pw_gid
+	archive_dir_regex = r"^/home\d?/[^/]+/\.security/amc_archive(\." + desk_format.pattern + ")?\.\d+"
+	currentarchivedir = re.match(archive_dir_regex, args.restore_log).group(0)
+	currentarchivepath = currentarchivedir + restorethisfile[0]
+	if os.path.isfile(currentarchivepath) == False:
+		print '\nThe quarantine backup for {0} does not exist.  This file will not be able to be restored.'.format(restorethisfile[0])
+		return False;
+	elif os.path.isfile(restorethisfile[0]) == True:
+		overwriterestore = yesno("The file {0} already exists.  Would you like to overwrite the file?\nThe current file will be backed up in it's current directory.".format(restorethisfile[0]))
+		if overwriterestore.startswith('y'):
+			restorebackup = restorethisfile[0] + '.backup_{0}'.format(current)
+			shutil.move(restorethisfile[0], restorebackup)
+			shutil.copy(currentarchivepath, restorethisfile[0])
+			os.chown(restorethisfile[0], origuid, origgid)
+			os.chmod(restorethisfile[0], int(restorethisfile[1], 8))
+			try:
+				restoreperms = int(restorethisfile[1], 8)
+				if restoreperms <= 0o777 and restoreperms >= 0:
+					os.chmod(restorethisfile[0], restoreperms)
+			except Exception:
+				pass
+		else:
+			return False;
+	else:
+		restoredir = re.match('^.*/', restorethisfile[0]).group(0)
+		if not os.path.exists(restoredir):
+			os.mkdir(restoredir)
+			os.chown(restoredir, origuid, origgid)
+		shutil.copy(currentarchivepath, restorethisfile[0])
+		os.chown(restorethisfile[0], origuid, origgid)
+		try:
+			restoreperms = int(restorethisfile[1], 8)
+			if restoreperms <= 0o777 and restoreperms >= 0:
+				os.chmod(restorethisfile[0], restoreperms)
+		except Exception:
+			pass
+	return;
+
+# Few checks on flags provided to make sure they don't interfere with each other.
+
+if args.malware != [] and args.logfile != False:
+	decisions = ""
+	print "\nThis script was designed to archive malware or parse logs.  It appears you have entered options for both."
+	while decisions != "archive" and decisions != "search":
+		selectanoption = raw_input("Please indicate here whether you would prefer to \"archive\" the malware entries provided or \"search\" through the log file.:  ")
+		decisions = selectanoption.lower()
+		if decisions != "archive" and decisions != "search":
+			print formaterror
+	if decisions == "archive":
+		args.logfile = False
+
+if args.malware == [] and args.logfile == False and args.restore_log == False:
+	print "\nThis program is designed to archive malware or parse logs.  It appears you did not enter an option for either one."
+
+if args.md5search == True and args.ctime != False:
+	searchdecide = ""
+	print "\nThis script was designed to search on md5 or ctime.  It appears you have entered options for both."
+	while searchdecide != "md5" and searchdecide != "ctime":
+		searchoption = raw_input("Please indicate here whether you would prefer to search using \"md5\" or \"ctime\".:  ")
+		searchdecide = searchoption.lower()
+		if searchdecide != "md5" and searchdecide != "ctime":
+			print formaterror
+	if searchdecide == "md5":
+		args.ctime = False
+	else:
+		args.md5search = False
+
+# Run process.
+
+if args.logfile == False and args.restore_log == False:
+	for i in args.malware:
+		j = os.path.abspath(i)
+		if not os.path.islink(j) and not os.path.exists(j):
+			fileerror = "\n{0} does not exist.  Skipping...".format(j)
+			j = None
+		elif os.path.islink(i):
+			fileerror = "\n{0} is a symlink.  Skipping...".format(j)
+			j = None
+		if not j is None:
+			if blockreg(j)[0] is None:
+				fileerror = blockreg(j)[1]
+				j = blockreg(j)[0]
+		if j is None:
+			print fileerror
+		else:
+			loopcount += 1
+			if args.keep == False and args.verbose == True:
+				print "\nChecking {0}".format(j)
+			elif args.verbose == True:
+				print "\nListing {0}".format(j)
+			fileinfo = getinfo(j)
+
+# Check if file belongs to a cPanel user and continue if so.
+
+			succeeded, username = checkown(fileinfo[5])
+			if succeeded or args.archive_folder != False:
+
+# Append file hash info.
+
+				if os.path.isfile(fileinfo[0]):
+					fileinfo.append(hashing(fileinfo[0], "md5", fileinfo[7]))
+					fileinfo.append(hashing(fileinfo[0], "sha1", fileinfo[7]))
+
+# Log file.
+
+				arcpath = storepoint(username)
+				logmalware(arcpath, fileinfo)
+
+# Add file information to searchlist for searching with md5 or ctime functions.
+
+				if (args.md5search == True or args.ctime != False) and fileinfo[7] != 0 and os.path.isfile(fileinfo[0]):
+					searchlist.append([searchentry, fileinfo[0], username, fileinfo[7], fileinfo[10], fileinfo[11]])
+					searchentry +=1
+
+# Archive file.
+
+				if args.keep == False:
+					finalloc = archivefile(fileinfo[0], arcpath)
+					if os.path.isdir(fileinfo[0]):
+						prepdir(fileinfo[0], username)
+					subprocess.call(["chattr","-ia",fileinfo[0]])
+# Comment out the following three lines to avoid moving files while testing.
+					shutil.move(fileinfo[0], finalloc)
+					os.chown(finalloc, 0, -1)
+					os.chmod(finalloc, 0o400)
+					if args.verbose == True:
+						print "\n{0} has been archived to {1}".format(i, finalloc)
+
+# If the file does not belong to a valid user, the script ends or continues on with the next entry.
+
+			else:
+				if len(args.malware) == 1:
+					print "!!!!! {0} does not belong to a cPanel user and will not be archived. !!!!!".format(i)
+				else:
+					print "!!!!! {0} does not belong to a cPanel user and will be skipped. !!!!!".format(i)
+
+# Check to see if any files were archived and provide log output file if available.
+
+	try:
+		arcpath
+	except NameError:
+		arcpath = None
+	if arcpath is None:
+		print "\nThe script has completed.  No files were archived.\n"
+		sys.exit()
+	if (args.md5search == False and args.ctime == False) or args.archive_folder != False:
+		if args.targz == True:
+			targz(arcpath)
+		print "\nThe script has completed, and the log file can be found at {0}/{1}\n".format(arcpath, logfile)
+		sys.exit()
+
+# If no search/restore flags were triggered and/or no files were archived, the script ends here.
+
+elif args.logfile != False and args.restore_log != False:
+	print "\nThis scipt cannot be run with the logsearch and restore switches both enabled.\nPlease rerun the command selecting only one or the other."
+	sys.exit()
+
+# Begin restore feature.
+
+elif args.restore_log != False:
+
+	restorefiles = []
+	restorelist = []
+	goodpath = re.match("^/home\d?/[^/]+/", args.restore_log).group(0)
+	gooduserline = "Owner: {0}".format(goodpath.split('/')[2])
+
+# The amc restore option is setup to only be able to restore files listed in the amc logs.
+
+	with open(args.restore_log, 'r') as restorelog:
+		restorelines = restorelog.readlines()
+		for reslogline in restorelines:
+			if reslogline.startswith("Filename") and gooduserline in reslogline:
+				restoreperm = re.split(log_delimeter, reslogline)[-1:][0].rstrip()
+				restorefile = re.split(log_delimeter, reslogline)[1]
+				restorefiles.append([restorefile,restoreperm])
+
+# This is to make sure that only files that are in the /home/user path for the amc archive can be restored (i.e., no /var/tmp restores).
+	for pathcheck in restorefiles:
+		if pathcheck[0].startswith(goodpath):
+			restorelist.append(pathcheck)
+
+# This section addresses instances where only one allowed file exists in the log file selected.
+
+	if len(restorelist) == 1:
+		good_pass = False
+		only_option_quesiton = "{0} is the only file in the log.  Is this the file you would like to restore?".format(restorelist[0][0])
+		single_choice = yesno(only_option_quesiton)
+		if single_choice.startswith('y'):
+			single_restore_run = restore_proc(restorelist[0])
+			if single_restore_run == False:
+				print "\nNo files have been restored.  If you did not find the file you are looking for, try checking for other amc log files.\n"
+			else:
+				print "\namc Restore Summary:\n\nThe following file has been restored:\n\n{0}\n".format(restorelist[0][0])
+		else:
+			print "\nNo files have been restored.  If you did not find the file you are looking for, try checking for other amc log files.\n"
+
+# This section addresses instances where no allowed file options exist in the selected log file.
+
+	elif len(restorelist) == 0:
+		print "\nIt appears there are no files in the selected amc log which are permitted to be restored.  Please check for other amc log files if necessary.\n"
+
+# This section addresses instances where multiple allowed file options exist in the selected log file.
+
+	else:
+		nomorerestores = False
+		filesrestored = []
+		firstrestorerun = True
+		while nomorerestores == False:
+			if firstrestorerun == True:
+				print '\nThe following files are listed in the amc archive log:\n'
+				firstrestorerun = False
+			else:
+				print '\nThe following files remain in the list:\n'
+			reslistcount = 1
+			for reslistfile in restorelist:
+				print "{0} -- {1}".format(reslistcount, reslistfile[0])
+				reslistcount += 1
+			list_question = '\nPlease select an item number (or all) from the list above for restoration.'
+			restoreanswer = listverify(list_question, len(restorelist), True)
+			if restoreanswer == "all":
+				for restorenumber in range(len(restorelist)):
+					restorerun = restore_proc(restorelist[restorenumber])
+					if restorerun != False:
+						filesrestored.append(restorelist[restorenumber][0])
+				nomorerestores = True
+			elif restoreanswer != 0:
+				restorerun = restore_proc(restorelist[restoreanswer - 1])
+				if restorerun != False:
+					filesrestored.append(restorelist[restoreanswer - 1][0])
+				del restorelist[restoreanswer -1]
+				morerestores = yesno('Would you like to restore any additional files?')
+				if morerestores.startswith("n"):
+					nomorerestores = True
+			else:
+				nomorerestores = True
+		if len(filesrestored) == 0:
+			print "\namc Restore Summary:\n\nNo files have been restored.  If you did not find the file you are looking for, try checking for other amc log files.\n"
+		else:
+			if len(filesrestored) == 1:
+				filestext = 'file has'
+			else:
+				filestext = '{0} files have'.format(len(filesrestored))
+			print "\namc Restore Summary:\n\nThe following {0} been restored:\n\n".format(filestext)
+			for restoredfile in filesrestored:
+				print restoredfile
+		print
+	sys.exit()
+
+# Begin search feature.
+
+# If searching from a log file, the following section will import the log file into a list to be reviewed.
+
+else:
+	with open(args.logfile, 'r') as logfilereview:
+		loglines = logfilereview.readlines()
+		parsedlines = []
+		for linetoparse in loglines:
+			if linetoparse.startswith("Filename"):
+				parsedlines.append(re.split(log_delimeter, linetoparse))
+	for l in parsedlines:
+		if l[6] != "0":
+			searchlist.append([searchentry, l[2], l[4], l[6], l[10], l[12]])
+			searchentry +=1
+	if args.md5search == False and args.ctime == False:
+		print "\nLog searching requires a format (usually passed through the command line)."
+		searchformat = False
+		while searchformat != "md5" and searchformat != "ctime":
+			searchformat = raw_input("\nPlease select either \"md5\" or \"ctime\" for your search format:  ")
+			if searchformat != "md5" and searchformat != "ctime":
+				print formaterror
+		if searchformat == "md5":
+			args.md5search = True
+		if searchformat == "ctime":
+			while args.ctime == False:
+				try:
+					ctimeminsvar = int(raw_input("\nPlease enter the numbers of minutes +/- to search within.:  "))
+				except ValueError:
+					print "The value entered was not a whole number."
+			args.ctime = ctimeminsvar
+
+
+# Request which item to search for if the list has more than one item.
+
+if len(searchlist) == 0:
+	print "\nNo items are available to search from.  **The search function is disabled for 0 byte files and folders."
+	keepsearching = False
+else:
+	keepsearching = True
+	if args.verbose == True:
+		print"\nStarting search mode."
+
+while keepsearching == True:
+	if len(searchlist) > 1:
+		print ""
+		for l in searchlist:
+			print "Item: {0} -- {1}".format(l[0], l[1])
+		searchmessage = "Please select an item number from the list above to begin the search"
+		searchanswer = listverify(searchmessage, len(searchlist), False)
+		for l in searchlist:
+			if l[0] == searchanswer:
+				searchmatches = search( l )
+	else:
+		searchmatches = search( searchlist[0] )
+		keepsearching = False
+	matchlist = []
+	matchlistcount = 0
+	for match in searchmatches:
+		matchlistcount +=1
+		matchlist.append([matchlistcount, match, False])
+	if len(matchlist) > 0:
+		samelist = True
+	else:
+		print "\nNo Items were found in the search."
+		samelist = False
+	while samelist == True:
+		print ""
+		for matchitem in matchlist:
+			print "Item: {0} -- {1}".format(matchitem[0], matchitem[1])
+
+# Review found items.
+
+		examinemessage = "Please select an item number from the list above to review or archive"
+		examineanswer = listverify(examinemessage, len(matchlist), args.md5search)
+		if examineanswer != "all":
+			for k in matchlist:
+				archivereviewed = False
+				if k[0] == examineanswer:
+					raanswer = ""
+					sureanswer = ""
+					while raanswer != "review" and raanswer != "archive":
+						raquestion = raw_input("\nWould you like to review or archive {0}?  ".format(k[1]))
+						raanswer = raquestion.lower()
+						if raanswer != "review" and raanswer != "archive":
+							print "\nPlease answer only with \"review\" or \"archive\"."
+					if raanswer == "review":
+						review(k[1])
+						k[2] = True
+						reviewedanswer = yesno("Now that the file has been reviewed, would you like to archive it?")
+		                                if reviewedanswer.startswith('y'):
+		                                	archivereviewed = True
+		                                else:
+		                                        archivereviewed = False
+					if raanswer == "archive":
+						if k[2] == False:
+							sureanswer = yesno("The file has not been reviewed.  Are you sure you want to archive it?")
+						if sureanswer.startswith('y'):
+							archivereviewed = True
+						else:
+							archivereviewed = False
+
+# If search found file is approved for archiving, log and archive.
+
+				if archivereviewed == True:
+					fileinfo = getinfo(k[1])
+					succeeded, username = checkown(fileinfo[5])
+				        if succeeded or args.archive_folder != False:
+						fileinfo.append(hashing(fileinfo[0], "md5", fileinfo[7]))
+						fileinfo.append(hashing(fileinfo[0], "sha1", fileinfo[7]))
+						arcpath = storepoint(username)
+						logmalware(arcpath, fileinfo)
+						finalloc = archivefile(fileinfo[0], arcpath)
+						subprocess.call(["chattr","-ia",fileinfo[0]])
+# Comment out the following line to avoid moving files while testing.
+						shutil.move(fileinfo[0], finalloc)
+						os.chown(finalloc, 0, -1)
+						if args.verbose == True:
+							print "\n{0} has been archived to {1}".format(fileinfo[0], finalloc)
+						matchlist.remove(k)
+					else:
+						print "\n{0} could not be archived due to being a non-cPanel user".format(k[1])
+						matchlist.remove(k)
+			if len(matchlist) == 0:
+				samelist = False
+			else:
+				samelistanswer = yesno("Would you like to search through this list again?")
+				if samelistanswer.startswith('n'):
+					samelist = False
+		else:
+			print ""
+			tracklist = [copy for copy in matchlist]
+			looprunrm = 0
+			for rmallitems in matchlist:
+				looprunrm += 1
+				fileinfo = getinfo(rmallitems[1])
+				succeeded, username = checkown(fileinfo[5])
+				if succeeded or args.archive_folder != False:
+					tracklist.remove(rmallitems)
+					fileinfo.append(hashing(fileinfo[0], "md5", fileinfo[7]))
+					fileinfo.append(hashing(fileinfo[0], "sha1", fileinfo[7]))
+					arcpath = storepoint(username)
+					logmalware(arcpath, fileinfo)
+					finalloc = archivefile(fileinfo[0], arcpath)
+					subprocess.call(["chattr","-ia",fileinfo[0]])
+# Comment out the following line to avoid moving files while testing.
+					shutil.move(fileinfo[0], finalloc)
+					os.chown(finalloc, 0, -1)
+					if args.verbose == True:
+						print "{0} has been archived to {1}".format(fileinfo[0], finalloc)
+				else:
+					print "!!! {0} could not be archived due to being a non-cPanel user. !!!".format(rmallitems[1])
+			samelist = False
+			if len(tracklist) != 0:
+				print "\nAll files except for the following have been logged and archived."
+				for unarched in tracklist:
+					print unarched[1]
+			else:
+				print "All files have been archived in {0}/".format(arcpath)
+
+	if keepsearching == True:
+		answercontinue = yesno("Would you like to search for another item?")
+		if answercontinue.startwith('n'):
+			keepsearching = False
+
+
+try:
+	arcpath
+except NameError:
+	arcpath = None
+if arcpath is None:
+	print "\nThe script has completed.  No files were archived.\n"
+else:
+	if args.targz == True:
+		targz(arcpath)
+	print "\nThe script has completed, and the log file can be found at {0}/{1}\n".format(arcpath, logfile)
+

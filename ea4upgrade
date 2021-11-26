@@ -1,0 +1,382 @@
+#!/bin/sh
+
+##EA3 --> EA4 UPGRADE SCRIPT
+#Script written by Darien Jones, contact darien.jones@endurance.com with any questions or suggestions.
+
+echo -e "\e[1;36mWelcome to the Easy Apache 3 --> Easy Apache 4 upgrade script. \e[0m \n"
+
+
+#Did you run the pre-checks check.
+
+	read -p "Have the pre-checks been done to see if this server is compatible with upgrading to Easy Apache 4? [y/n]: " PRECHECK
+
+	if  test ! $PRECHECK = "y" && test ! $PRECHECK = "Y" && test ! $PRECHECK = "yes" && test ! $PRECHECK = "Yes" && test ! $PRECHECK = "YES"
+    then echo -e "\nExiting Easy Apache 3 --> Easy Apache 4 upgrade script. \n 
+			Please run the ea4prechecks script or manually pre-check the server for\n\
+			contraindicted conditions that would prevent a successful EA4 upgrade." 
+			exit 1
+	fi
+
+
+#Just for extra safety, here's some of the basic checks again anyway. If any of these fail, the ea4upgrade script will exit.
+
+#Check if cPanel is installed, and if server has already been upgraded to EA4. 
+if test ! -x /etc/init.d/cpanel ; then 
+	{
+		echo -e >&2 "\n\\033[0;31mWarning:\033[0m cPanel is not installed on this server. Exiting."
+		exit 1
+	}
+	fi 
+
+if test -f /etc/cpanel/ea4/is_ea4 ; then
+	{
+		echo >&2 "\n\\033[0;31mWarning:\033[0m This box already uses EA4, exiting EA3-->EA4 upgrade script."
+		exit 1
+	}
+	fi
+
+#Disk usage check on main drive
+DISK_USAGE_PERCENT=$(df -h | head -2 | tail -1 | awk '{print $5}')
+if test "$DISK_USAGE_PERCENT" = "100%" || test "$DISK_USAGE_PERCENT" = "99%" || test "$DISK_USAGE_PERCENT" = "98%" ; then
+	{
+		 echo -e "\n\\033[0;31mWarning:\033[0m server's disk space usage is at ${DISK_USAGE_PERCENT} full. Reduce disk space usage before running script. Exiting."
+		exit 1
+	}
+	fi
+
+#Inode % usage check on main drive
+INODE_USAGE_PERCENT=$(df -i | head -2 | tail -1 | awk '{print $5}')
+if test "$INODE_USAGE_PERCENT" = "100%" || test "$INODE_USAGE_PERCENT" = "99%" || test "$INODE_USAGE_PERCENT" = "98%"; then
+	{
+		echo -e "\n\\033[0;31mWarning:\033[0m server's inode usage is at ${INODE_USAGE_PERCENT} full. Reduce inode usage before running script. Exiting."
+		exit 1
+	}
+	fi
+
+#cPanel version check
+CPANEL_VERSION=$( /usr/local/cpanel/cpanel -V | awk '{print $1}' )
+
+if test "$(echo $CPANEL_VERSION | cut -c1-1)" -lt 6 ; then
+	{
+		echo -e  "\n\\033[0;31mWarning:\033[0m cPanel version is ${CPANEL_VERSION}, this is significantly out of date. Please re-do the prechecks \n\
+        and update cPanel to a modern release version prior to upgrading Easy Apache. Exiting." 
+		exit 1
+	}
+	fi
+
+#Check for old MySQL passwords in use on database users. 
+if test "$(mysql -BNe "SELECT COUNT(User) FROM mysql.user WHERE length(Password) <= 40")" -gt 0 ; then
+{
+echo -e "\n\\033[0;31mWarning:\033[0m There are old MySQL passwords in use on the following database users. \nThese database users' passwords will need to be reset in order to update the \npassword encryption hash type before Easy Apache can be upgraded. Before \nre-running the ea4upgrade script, please re-do the pre-checks after having \nthe customer update the following database users' passwords: "; echo; mysql -sse "select distinct(user) from mysql.user where user not like 'cpses\_%' and length(password) < 40"|sort 
+echo -e "\n\nExiting script"
+exit 1
+}
+fi
+
+#Screen check
+if test "$(echo $STY | grep -c .)" -lt 1 
+	then echo -e  "\033[0;31mWarning:\033[0m It has been detected that this script has been initiated outside of a screen. \n\
+It's recommended to run this script in a screen due to how long it can take for a EA3 --> EA4 upgrade to complete."  
+	read -p "Would you like to continue running the upgrade script outside of a screen? [y/n]: " SCREEN
+
+	if  test ! $SCREEN = "y" && test ! $SCREEN = "Y" && test ! $SCREEN = "yes" && test ! $SCREEN = "Yes" && test ! $SCREEN = "YES"
+	then echo -e "\nExiting Easy Apache 3 --> Easy Apache 4 upgrade script. \n 
+You can start a screen with the command 'screen -S EA4_Migration' and then \n\
+re-run the Easy Apache 3 --> Easy Apache 4 upgrade script within the screen." 
+	exit 1
+	fi
+fi
+
+##End pre-checks checks
+
+
+#Set variable for what PHP version should be set as default post-upgrade.
+read -p "What version of PHP should be set as the default version on the server post-upgrade? The current default PHP version is $(php -v |  head -1 | awk '{print $2}' | cut -d. -f1,2| tr -d . ).  Please enter 54, 55, 56, 70, or 71: " PHP_EA4VERSION
+
+#Sanity check added to ensure ONLY 54,55,56,70,71 are accepted as a value for $PHP_EA4VERSION.
+while test ! $PHP_EA4VERSION = "54" && test ! $PHP_EA4VERSION = "55" && test ! $PHP_EA4VERSION = "56" && test ! $PHP_EA4VERSION = "70" && test ! $PHP_EA4VERSION = "71"
+	do echo -e "\nAn invalid PHP version has been entered. Did you perhaps include a period in your entry?"
+	read -p "Please enter 54, 55, 56, 70, or 71: " PHP_EA4VERSION 
+done
+
+#Check for side-by-side installations at /opt/php##. If found, .bak them so Quickinstall .htaccess handlers don't break sites after the upgrade.
+test -d /opt/php52 && mv /opt/php52{,.bak} 
+test -d /opt/php53 && mv /opt/php53{,.bak} 
+test -d /opt/php54 && mv /opt/php54{,.bak} 
+test -d /opt/php55 && mv /opt/php55{,.bak} 
+test -d /opt/php56 && mv /opt/php56{,.bak} 
+test -d /opt/php70 && mv /opt/php70{,.bak} 
+
+
+#Ensure custom profile directory exists
+test ! -d /etc/cpanel/ea4/profiles/custom &&
+mkdir -vp /etc/cpanel/ea4/profiles/custom  > /dev/null 2>&1
+
+#Create custom EIG standard profile if it doesn't exist.
+test ! -f /etc/cpanel/ea4/profiles/custom/eig.json &&
+cat > /etc/cpanel/ea4/profiles/custom/eig.json << EOF
+{
+   "name" : "eig",
+   "pkgs" : [
+      "ea-apache24",
+      "ea-apache24-config",
+      "ea-apache24-config-runtime",
+      "ea-apache24-mod_asis",
+      "ea-apache24-mod_bwlimited",
+      "ea-apache24-mod_cache",
+      "ea-apache24-mod_cgid",
+      "ea-apache24-mod_dav",
+      "ea-apache24-mod_dav_fs",
+      "ea-apache24-mod_dbd",
+      "ea-apache24-mod_deflate",
+      "ea-apache24-mod_env",
+      "ea-apache24-mod_expires",
+      "ea-apache24-mod_headers",
+      "ea-apache24-mod_mpm_worker",
+      "ea-apache24-mod_proxy",
+      "ea-apache24-mod_proxy_http",
+      "ea-apache24-mod_security2",
+      "ea-apache24-mod_speling",
+      "ea-apache24-mod_ssl",
+      "ea-apache24-mod_suexec",
+      "ea-apache24-mod_suphp",
+      "ea-apache24-mod_unique_id",
+      "ea-apache24-mod_version",
+      "ea-apache24-tools",
+      "ea-apr",
+      "ea-apr-util",
+      "ea-cpanel-tools",
+      "ea-documentroot",
+      "ea-libmcrypt",
+      "ea-php-cli",
+      "ea-php54",
+      "ea-php54-libc-client",
+      "ea-php54-pear",
+      "ea-php54-php-bcmath",
+      "ea-php54-php-bz2",
+      "ea-php54-php-calendar",
+      "ea-php54-php-cli",
+      "ea-php54-php-common",
+      "ea-php54-php-curl",
+      "ea-php54-php-devel",
+      "ea-php54-php-ftp",
+      "ea-php54-php-gd",
+      "ea-php54-php-gettext",
+      "ea-php54-php-iconv",
+      "ea-php54-php-imap",
+      "ea-php54-php-intl",
+      "ea-php54-php-ioncube",
+      "ea-php54-php-mbstring",
+      "ea-php54-php-mcrypt",
+      "ea-php54-php-mysqlnd",
+      "ea-php54-php-pdo",
+      "ea-php54-php-posix",
+      "ea-php54-php-pspell",
+      "ea-php54-php-soap",
+      "ea-php54-php-sockets",
+      "ea-php54-php-sourceguardian",
+      "ea-php54-php-tidy",
+      "ea-php54-php-xml",
+      "ea-php54-php-xmlrpc",
+      "ea-php54-php-zendguard",
+      "ea-php54-php-zip",
+      "ea-php54-runtime",
+      "ea-php55",
+      "ea-php55-libc-client",
+      "ea-php55-pear",
+      "ea-php55-php-bcmath",
+      "ea-php55-php-bz2",
+      "ea-php55-php-calendar",
+      "ea-php55-php-cli",
+      "ea-php55-php-common",
+      "ea-php55-php-curl",
+      "ea-php55-php-devel",
+      "ea-php55-php-ftp",
+      "ea-php55-php-gd",
+      "ea-php55-php-gettext",
+      "ea-php55-php-iconv",
+      "ea-php55-php-imap",
+      "ea-php55-php-intl",
+      "ea-php55-php-ioncube",
+      "ea-php55-php-mbstring",
+      "ea-php55-php-mcrypt",
+      "ea-php55-php-mysqlnd",
+      "ea-php55-php-pdo",
+      "ea-php55-php-posix",
+      "ea-php55-php-pspell",
+      "ea-php55-php-soap",
+      "ea-php55-php-sockets",
+      "ea-php55-php-sourceguardian",
+      "ea-php55-php-tidy",
+      "ea-php55-php-xml",
+      "ea-php55-php-xmlrpc",
+      "ea-php55-php-zendguard",
+      "ea-php55-php-zip",
+      "ea-php55-runtime",
+      "ea-php56",
+      "ea-php56-libc-client",
+      "ea-php56-pear",
+      "ea-php56-php-bcmath",
+      "ea-php56-php-bz2",
+      "ea-php56-php-calendar",
+      "ea-php56-php-cli",
+      "ea-php56-php-common",
+      "ea-php56-php-curl",
+      "ea-php56-php-devel",
+      "ea-php56-php-ftp",
+      "ea-php56-php-gd",
+      "ea-php56-php-gettext",
+      "ea-php56-php-iconv",
+      "ea-php56-php-imap",
+      "ea-php56-php-intl",
+      "ea-php56-php-ioncube",
+      "ea-php56-php-mbstring",
+      "ea-php56-php-mcrypt",
+      "ea-php56-php-mysqlnd",
+      "ea-php56-php-pdo",
+      "ea-php56-php-posix",
+      "ea-php56-php-pspell",
+      "ea-php56-php-soap",
+      "ea-php56-php-sockets",
+      "ea-php56-php-sourceguardian",
+      "ea-php56-php-tidy",
+      "ea-php56-php-xml",
+      "ea-php56-php-xmlrpc",
+      "ea-php56-php-zendguard",
+      "ea-php56-php-zip",
+      "ea-php56-runtime",
+      "ea-php70",
+      "ea-php70-libc-client",
+      "ea-php70-pear",
+      "ea-php70-php-bcmath",
+      "ea-php70-php-bz2",
+      "ea-php70-php-calendar",
+      "ea-php70-php-cli",
+      "ea-php70-php-common",
+      "ea-php70-php-curl",
+      "ea-php70-php-devel",
+      "ea-php70-php-ftp",
+      "ea-php70-php-gd",
+      "ea-php70-php-gettext",
+      "ea-php70-php-iconv",
+      "ea-php70-php-imap",
+      "ea-php70-php-intl",
+      "ea-php70-php-ioncube6",
+      "ea-php70-php-mbstring",
+      "ea-php70-php-mcrypt",
+      "ea-php70-php-mysqlnd",
+      "ea-php70-php-pdo",
+      "ea-php70-php-posix",
+      "ea-php70-php-pspell",
+      "ea-php70-php-soap",
+      "ea-php70-php-sockets",
+      "ea-php70-php-sourceguardian",
+      "ea-php70-php-tidy",
+      "ea-php70-php-xml",
+      "ea-php70-php-xmlrpc",
+      "ea-php70-php-zip",
+      "ea-php70-runtime",
+      "ea-php71",
+      "ea-php71-libc-client",
+      "ea-php71-pear",
+      "ea-php71-php-bcmath",
+      "ea-php71-php-bz2",
+      "ea-php71-php-calendar",
+      "ea-php71-php-cli",
+      "ea-php71-php-common",
+      "ea-php71-php-curl",
+      "ea-php71-php-devel",
+      "ea-php71-php-ftp",
+      "ea-php71-php-gd",
+      "ea-php71-php-gettext",
+      "ea-php71-php-iconv",
+      "ea-php71-php-imap",
+      "ea-php71-php-intl",
+      "ea-php71-php-ioncube10",
+      "ea-php71-php-mbstring",
+      "ea-php71-php-mcrypt",
+      "ea-php71-php-mysqlnd",
+      "ea-php71-php-pdo",
+      "ea-php71-php-posix",
+      "ea-php71-php-pspell",
+      "ea-php71-php-soap",
+      "ea-php71-php-sockets",
+      "ea-php71-php-tidy",
+      "ea-php71-php-xml",
+      "ea-php71-php-xmlrpc",
+      "ea-php71-php-zip",
+      "ea-php71-runtime",
+      "ea-php72-php-bcmath",
+      "ea-php72-php-bz2",
+      "ea-php72-php-calendar",
+      "ea-php72-php-curl",
+      "ea-php72-php-dba",
+      "ea-php72-php-dbg",
+      "ea-php72-php-enchant",
+      "ea-php72-php-exif",
+      "ea-php72-php-fileinfo",
+      "ea-php72-php-gd",
+      "ea-php72-php-gettext",
+      "ea-php72-php-gmp",
+      "ea-php72-php-iconv",
+      "ea-php72-libc-client",
+      "ea-php72-php-imap",
+      "ea-php72-php-intl",
+      "ea-php72-php-ldap",
+      "ea-php72-php-mbstring",
+      "ea-php72-php-pdo",
+      "ea-php72-php-mysqlnd",
+      "ea-php72-php-odbc",
+      "ea-php72-php-pgsql",
+      "ea-php72-php-process",
+      "ea-php72-php-pspell",
+      "ea-php72-php-snmp",
+      "ea-php72-php-sockets",
+      "ea-php72-php-soap",
+      "ea-php72-php-tidy",
+      "ea-php72-php-xmlrpc",
+      "ea-php72-php-zip",
+      "ea-php72-runtime"
+   ],
+   "version" : "1.0",
+   "desc" : "EIG Custom Profile",
+   "tags" : [
+      "Apache 2.4",
+      "PHP 5.4",
+      "PHP 5.5",
+      "PHP 5.6",
+      "PHP 7.0",
+      "PHP 7.1",
+      "PHP 7.2"
+   ]
+}
+EOF
+
+
+#Location of json_pp file.
+JSON_PP=$(find /usr/local/cpanel/3rdparty/perl/*/bin/json_pp)
+test -z "$JSON_PP" && echo -e "\033[0;31mWarning:\033[0m json_pp file not found, cannot check syntax validity of /etc/cpanel/ea4/profiles/custom/eig.json"
+
+#Check validity of the eig.json profile.
+if test $( $JSON_PP -t null < /etc/cpanel/ea4/profiles/custom/eig.json 2>&1 )
+	then echo -e "\033[0;31mWarning:\033[0m There are syntax issues in the /etc/cpanel/ea4/profiles/custom/eig.json file. Please correct and then try again.\n"
+	echo "$($JSON_PP -t null < /etc/cpanel/ea4/profiles/custom/eig.json )"
+	exit 1
+fi
+
+#Print warning about not interrupting script while in process
+echo -e "\n\n\033[1;33mAlert\033[0m: Termination of the build process will result in data loss! It is normal for the process to take while to complete and to not show any output while running. Prematurely killing this process will leave your Apache/PHP configuration in an unusable state requiring restoration from backups. The EA3 --> EA4 upgrade process is now underway.\n"
+
+#Finally, we're ready to run the Easy Apache 4 migration script!
+/scripts/migrate_ea3_to_ea4 --run --install_profile /etc/cpanel/ea4/profiles/custom/eig.json --yes | tee -a /root/EA4_Migration 
+
+#Set default PHP version.
+php_vers=( $(/usr/local/cpanel/bin/rebuild_phpconf --available | cut -d: -f1 | sort -rn) ) ; /usr/local/cpanel/bin/rebuild_phpconf --default=ea-php$PHP_EA4VERSION$(printf -- ' --%s=suphp' "ea-php$PHP_EA4VERSION" ) 
+
+
+#POSTCHECKS
+test "$(service httpd status 2>/dev/null | grep -ci "running\|Scoreboard" )" -lt 1 && service httpd start
+
+echo -e "\n\e[1;36mEasy Apache 4 post-upgrade PHP and Apache details:\e[0m\n\n $(/usr/local/cpanel/bin/rebuild_phpconf --current )  \n\n $(httpd -v)\n\n $(checksites -a -v -f -t 10)\n"
+echo -e "If you wish to revert back to EasyApache 3, please run the following:\n\n/usr/local/cpanel/scripts/migrate_ea3_to_ea4 --revert --run\n"
+echo -e "For further information, please review the following cPanel Documentation:\n\nhttps://documentation.cpanel.net/display/EA4/How+to+Install+or+Uninstall+EasyApache+4\n"

@@ -1,0 +1,2309 @@
+#!/usr/bin/php -q
+<?php
+
+/**
+ *
+ * Safe Search and Replace on Database with Serialized Data v3.0.0
+ *
+ * This script is to solve the problem of doing database search and replace when
+ * some data is stored within PHP serialized arrays or objects.
+ *
+ * For more information, see
+ * http://interconnectit.com/124/search-and-replace-for-wordpress-databases/
+ *
+ * To contribute go to
+ * http://github.com/interconnectit/search-replace-db
+ *
+ * To use, load the script on your server and point your web browser to it.
+ * In some situations, consider using the command line interface version.
+ *
+ * BIG WARNING!  Take a backup first, and carefully test the results of this
+ * code. If you don't, and you vape your data then you only have yourself to
+ * blame. Seriously.  And if your English is bad and you don't fully
+ * understand the instructions then STOP. Right there. Yes. Before you do any
+ * damage.
+ *
+ * USE OF THIS SCRIPT IS ENTIRELY AT YOUR OWN RISK. I/We accept no liability
+ * from its use.
+ *
+ * First Written 2009-05-25 by David Coveney of Interconnect IT Ltd (UK)
+ * http://www.davidcoveney.com or http://interconnectit.com
+ * and released under the GPL v3
+ * ie, do what ever you want with the code, and we take no responsibility for it
+ * OK? If you don't wish to take responsibility, hire us at Interconnect IT Ltd
+ * on +44 (0)151 331 5140 and we will do the work for you at our hourly rate,
+ * minimum 1hr
+ *
+ * License: GPL v3
+ * License URL: http://www.gnu.org/copyleft/gpl.html
+ *
+ *
+ * Version 3.0:
+ *     * Major overhaul
+ *     * Multibyte string replacements
+ *     * Convert tables to InnoDB
+ *     * Convert tables to utf8_unicode_ci
+ *     * Preview/view changes in report
+ *     * Optionally use preg_replace()
+ *     * Better error/exception handling & reporting
+ *     * Reports per table
+ *     * Exclude/include multiple columns
+ *
+ * Version 2.2.0:
+ *     * Added remove script patch from David Anderson (wordshell.net)
+ *     * Added ability to replace strings with nothing
+ *     * Copy changes
+ *     * Added code to recursive_unserialize_replace to deal with objects not
+ *     just arrays. This was submitted by Tina Matter.
+ *     ToDo: Test object handling. Not sure how it will cope with object in the
+ *     db created with classes that don't exist in anything but the base PHP.
+ *
+ * Version 2.1.0:
+ *     - Changed to version 2.1.0
+ *     * Following change by Sergei Biryukov - merged in and tested by Dave Coveney
+ *     - Added Charset Support (tested with UTF-8, not tested on other charsets)
+ *     * Following changes implemented by James Whitehead with thanks to all the commenters and feedback given!
+ *     - Removed PHP warnings if you go to step 3+ without DB details.
+ *     - Added options to skip changing the guid column. If there are other
+ *     columns that need excluding you can add them to the $exclude_cols global
+ *     array. May choose to add another option to the table select page to let
+ *     you add to this array from the front end.
+ *     - Minor tweak to label styling.
+ *     - Added comments to each of the functions.
+ *     - Removed a dead param from icit_srdb_replacer
+ * Version 2.0.0:
+ *     - returned to using unserialize function to check if string is
+ *     serialized or not
+ *     - marked is_serialized_string function as deprecated
+ *     - changed form order to improve usability and make use on multisites a
+ *     bit less scary
+ *     - changed to version 2, as really should have done when the UI was
+ *     introduced
+ *     - added a recursive array walker to deal with serialized strings being
+ *     stored in serialized strings. Yes, really.
+ *     - changes by James R Whitehead (kudos for recursive walker) and David
+ *     Coveney 2011-08-26
+ *  Version 1.0.2:
+ *    - typos corrected, button text tweak - David Coveney / Robert O'Rourke
+ *  Version 1.0.1
+ *    - styling and form added by James R Whitehead.
+ *
+ *  Credits:  moz667 at gmail dot com for his recursive_array_replace posted at
+ *            uk.php.net which saved me a little time - a perfect sample for me
+ *            and seems to work in all cases.
+ *
+ */
+
+class icit_srdb {
+
+  /**
+   * @var array List of all the tables in the database
+   */
+  public $all_tables = array();
+
+  /**
+   * @var array Tables to run the replacement on
+   */
+  public $tables = array();
+
+  /**
+   * @var string Search term
+   */
+  public $search = false;
+
+  /**
+   * @var string Replacement
+   */
+  public $replace = false;
+
+  /**
+   * @var bool Use regular expressions to perform search and replace
+   */
+  public $regex = false;
+
+  /**
+   * @var bool Leave guid column alone
+   */
+  public $guid = false;
+
+
+  /**
+   * @var array Available engines
+   */
+  public $engines = array();
+
+  /**
+   * @var bool|string Convert to new engine
+   */
+  public $alter_engine = false;
+
+  /**
+   * @var bool|string Convert to new collation
+   */
+  public $alter_collate = false;
+
+  /**
+   * @var array Column names to exclude
+   */
+  public $exclude_cols = array();
+
+  /**
+   * @var array Column names to include
+   */
+  public $include_cols = array();
+
+  /**
+   * @var bool True if doing a dry run
+   */
+  public $dry_run = true;
+
+  /**
+   * @var string Database connection details
+   */
+  public $name = '';
+  public $user = '';
+  public $pass = '';
+  public $host = '127.0.0.1';
+  public $charset = 'utf8';
+  public $collate = '';
+
+
+  /**
+   * @var array Stores a list of exceptions
+   */
+  public $errors = array(
+            'search' => array(),
+            'db' => array(),
+            'tables' => array(),
+            'results' => array()
+          );
+
+  public $error_type = 'search';
+
+
+  /**
+   * @var array Stores the report array
+   */
+  public $report = array();
+
+
+  /**
+   * @var int Number of modifications to return in report array
+   */
+  public $report_change_num = 30;
+
+
+  /**
+   * @var bool Whether to echo report as script runs
+   */
+  public $verbose = false;
+
+
+  /**
+   * @var resource Database connection
+   */
+  public $db;
+
+
+  /**
+   * @var use PDO
+   */
+  public $use_pdo = true;
+
+
+  /**
+   * @var int How many rows to select at a time when replacing
+   */
+  public $page_size = 50000;
+
+
+  /**
+   * Searches for WP or Drupal context
+   * Checks for $_POST data
+   * Initialises database connection
+   * Handles ajax
+   * Runs replacement
+   *
+   * @param string $name    database name
+   * @param string $user    database username
+   * @param string $pass    database password
+   * @param string $host    database hostname
+   * @param string $search  search string / regex
+   * @param string $replace replacement string
+   * @param array $tables  tables to run replcements against
+   * @param bool $live    live run
+   * @param array $exclude_cols  tables to run replcements against
+   *
+   * @return void
+   */
+  public function __construct( $args ) {
+
+    $args = array_merge( array(
+      'name'            => '',
+      'user'            => '',
+      'pass'            => '',
+      'host'            => '',
+      'search'          => '',
+      'replace'         => '',
+      'tables'          => array(),
+      'exclude_cols'    => array(),
+      'include_cols'    => array(),
+      'dry_run'         => true,
+      'regex'           => false,
+      'pagesize'        => 50000,
+      'alter_engine'    => false,
+      'alter_collation' => false,
+      'verbose'         => false
+    ), $args );
+
+    // handle exceptions
+    set_exception_handler( array( $this, 'exceptions' ) );
+
+    // handle errors
+    set_error_handler( array( $this, 'errors' ), E_ERROR | E_WARNING );
+
+    // allow a string for columns
+    foreach( array( 'exclude_cols', 'include_cols', 'tables' ) as $maybe_string_arg ) {
+      if ( is_string( $args[ $maybe_string_arg ] ) )
+        $args[ $maybe_string_arg ] = array_filter( array_map( 'trim', explode( ',', $args[ $maybe_string_arg ] ) ) );
+    }
+
+    // set class vars
+    foreach( $args as $name => $value ) {
+      if ( is_string( $value ) )
+        $value = stripcslashes( $value );
+      if ( is_array( $value ) )
+        $value = array_map( 'stripcslashes', $value );
+      $this->set( $name, $value );
+    }
+
+    // only for non cli call, cli set no timeout, no memory limit
+    if( ! defined( 'STDIN' ) ) {
+
+      // increase time out limit
+      @set_time_limit( 60 * 10 );
+
+      // try to push the allowed memory up, while we're at it
+      @ini_set( 'memory_limit', '1024M' );
+
+    }
+
+    // set up db connection
+    $this->db_setup();
+
+    if ( $this->db_valid() ) {
+
+      // update engines
+      if ( $this->alter_engine ) {
+        $report = $this->update_engine( $this->alter_engine, $this->tables );
+      }
+
+      // update collation
+      elseif ( $this->alter_collation ) {
+        $report = $this->update_collation( $this->alter_collation, $this->tables );
+      }
+
+      // default search/replace action
+      else {
+        $report = $this->replacer( $this->search, $this->replace, $this->tables );
+      }
+
+    } else {
+
+      $report = $this->report;
+
+    }
+
+    // store report
+    $this->set( 'report', $report );
+    return $report;
+  }
+
+
+  /**
+   * Terminates db connection
+   *
+   * @return void
+   */
+  public function __destruct() {
+    if ( $this->db_valid() )
+      $this->db_close();
+  }
+
+
+  public function get( $property ) {
+    return $this->$property;
+  }
+
+  public function set( $property, $value ) {
+    $this->$property = $value;
+  }
+
+
+  public function exceptions( $exception ) {
+    echo $exception->getMessage() . "\n";
+  }
+
+
+  public function errors( $no, $message, $file, $line ) {
+    echo $message . "\n";
+  }
+
+
+  public function log( $type = '' ) {
+    $args = array_slice( func_get_args(), 1 );
+    if ( $this->get( 'verbose' ) ) {
+      echo "{$type}: ";
+      print_r( $args );
+      echo "\n";
+    }
+    return $args;
+  }
+
+
+  public function add_error( $error, $type = null ) {
+    if ( $type !== null )
+      $this->error_type = $type;
+    $this->errors[ $this->error_type ][] = $error;
+    $this->log( 'error', $this->error_type, $error );
+  }
+
+
+  public function use_pdo() {
+    return $this->get( 'use_pdo' );
+  }
+
+
+  /**
+   * Setup connection, populate tables array
+   *
+   * @return void
+   */
+  public function db_setup() {
+
+    $connection_type = class_exists( 'PDO' ) ? 'pdo' : 'mysql';
+
+    // connect
+    $this->set( 'db', $this->connect( $connection_type ) );
+
+  }
+
+
+  /**
+   * Database connection type router
+   *
+   * @param string $type
+   *
+   * @return callback
+   */
+  public function connect( $type = '' ) {
+    $method = "connect_{$type}";
+    return $this->$method();
+  }
+
+
+  /**
+   * Creates the database connection using old mysql functions
+   *
+   * @return resource|bool
+   */
+  public function connect_mysql() {
+
+    // switch off PDO
+    $this->set( 'use_pdo', false );
+
+    $connection = @mysql_connect( $this->host, $this->user, $this->pass );
+
+    // unset if not available
+    if ( ! $connection ) {
+      $connection = false;
+      $this->add_error( mysql_error(), 'db' );
+    }
+
+    // select the database for non PDO
+    if ( $connection && ! mysql_select_db( $this->name, $connection ) ) {
+      $connection = false;
+      $this->add_error( mysql_error(), 'db' );
+    }
+
+    return $connection;
+  }
+
+
+  /**
+   * Sets up database connection using PDO
+   *
+   * @return PDO|bool
+   */
+  public function connect_pdo() {
+
+    try {
+      $connection = new PDO( "mysql:host={$this->host};dbname={$this->name}", $this->user, $this->pass );
+    } catch( PDOException $e ) {
+      $this->add_error( $e->getMessage(), 'db' );
+      $connection = false;
+    }
+
+    // check if there's a problem with our database at this stage
+    if ( $connection && ! $connection->query( 'SHOW TABLES' ) ) {
+      $error_info = $connection->errorInfo();
+      if ( !empty( $error_info ) && is_array( $error_info ) )
+        $this->add_error( array_pop( $error_info ), 'db' ); // Array pop will only accept a $var..
+      $connection = false;
+    }
+
+    return $connection;
+  }
+
+
+  /**
+   * Retrieve all tables from the database
+   *
+   * @return array
+   */
+  public function get_tables() {
+    // get tables
+
+    // A clone of show table status but with character set for the table.
+    $show_table_status = "SELECT
+      t.`TABLE_NAME` as Name,
+      t.`ENGINE` as `Engine`,
+      t.`version` as `Version`,
+      t.`ROW_FORMAT` AS `Row_format`,
+      t.`TABLE_ROWS` AS `Rows`,
+      t.`AVG_ROW_LENGTH` AS `Avg_row_length`,
+      t.`DATA_LENGTH` AS `Data_length`,
+      t.`MAX_DATA_LENGTH` AS `Max_data_length`,
+      t.`INDEX_LENGTH` AS `Index_length`,
+      t.`DATA_FREE` AS `Data_free`,
+      t.`AUTO_INCREMENT` as `Auto_increment`,
+      t.`CREATE_TIME` AS `Create_time`,
+      t.`UPDATE_TIME` AS `Update_time`,
+      t.`CHECK_TIME` AS `Check_time`,
+      t.`TABLE_COLLATION` as Collation,
+      c.`CHARACTER_SET_NAME` as Character_set,
+      t.`Checksum`,
+      t.`Create_options`,
+      t.`table_Comment` as `Comment`
+    FROM information_schema.`TABLES` t
+      LEFT JOIN information_schema.`COLLATION_CHARACTER_SET_APPLICABILITY` c
+        ON ( t.`TABLE_COLLATION` = c.`COLLATION_NAME` )
+      WHERE t.`TABLE_SCHEMA` = '{$this->name}';
+    ";
+
+    $all_tables_mysql = $this->db_query( $show_table_status );
+    $all_tables = array();
+
+    if ( ! $all_tables_mysql ) {
+
+      $this->add_error( $this->db_error( ), 'db' );
+
+    } else {
+
+      // set the character set
+      //$this->db_set_charset( $this->get( 'charset' ) );
+
+      while ( $table = $this->db_fetch( $all_tables_mysql ) ) {
+        // ignore views
+        if ( $table[ 'Comment' ] == 'VIEW' )
+          continue;
+
+        $all_tables[ $table[0] ] = $table;
+      }
+
+    }
+
+    return $all_tables;
+  }
+
+
+  /**
+   * Get the character set for the current table
+   *
+   * @param string $table_name The name of the table we want to get the char
+   * set for
+   *
+   * @return string    The character encoding;
+   */
+  public function get_table_character_set( $table_name = '' ) {
+    $table_name = $this->db_escape( $table_name );
+    $schema = $this->db_escape( $this->name );
+
+    $charset = $this->db_query(  "SELECT c.`character_set_name`
+      FROM information_schema.`TABLES` t
+        LEFT JOIN information_schema.`COLLATION_CHARACTER_SET_APPLICABILITY` c
+        ON (t.`TABLE_COLLATION` = c.`COLLATION_NAME`)
+      WHERE t.table_schema = {$schema}
+        AND t.table_name = {$table_name}
+      LIMIT 1;" );
+
+    $encoding = false;
+    if ( ! $charset ) {
+      $this->add_error( $this->db_error( ), 'db' );
+    }
+    else {
+      $result = $this->db_fetch( $charset );
+      $encoding = isset( $result[ 'character_set_name' ] ) ? $result[ 'character_set_name' ] : false;
+    }
+
+    return $encoding;
+  }
+
+
+  /**
+   * Retrieve all supported database engines
+   *
+   * @return array
+   */
+  public function get_engines() {
+
+    // get available engines
+    $mysql_engines = $this->db_query( 'SHOW ENGINES;' );
+    $engines = array();
+
+    if ( ! $mysql_engines ) {
+      $this->add_error( $this->db_error( ), 'db' );
+    } else {
+      while ( $engine = $this->db_fetch( $mysql_engines ) ) {
+        if ( in_array( $engine[ 'Support' ], array( 'YES', 'DEFAULT' ) ) )
+          $engines[] = $engine[ 'Engine' ];
+      }
+    }
+
+    return $engines;
+  }
+
+
+  public function db_query( $query ) {
+    if ( $this->use_pdo() )
+      return $this->db->query( $query );
+    else
+      return mysql_query( $query, $this->db );
+  }
+
+  public function db_update( $query ) {
+    if ( $this->use_pdo() )
+      return $this->db->exec( $query );
+    else
+      return mysql_query( $query, $this->db );
+  }
+
+  public function db_error() {
+    if ( $this->use_pdo() ) {
+      $error_info = $this->db->errorInfo();
+      return !empty( $error_info ) && is_array( $error_info ) ? array_pop( $error_info ) : 'Unknown error';
+    }
+    else
+      return mysql_error();
+  }
+
+  public function db_fetch( $data ) {
+    if ( $this->use_pdo() )
+      return $data->fetch();
+    else
+      return mysql_fetch_array( $data );
+  }
+
+  public function db_escape( $string ) {
+    if ( $this->use_pdo() )
+      return $this->db->quote( $string );
+    else
+      return "'" . mysql_real_escape_string( $string ) . "'";
+  }
+
+  public function db_free_result( $data ) {
+    if ( $this->use_pdo() )
+      return $data->closeCursor();
+    else
+      return mysql_free_result( $data );
+  }
+
+  public function db_set_charset( $charset = '' ) {
+    if ( ! empty( $charset ) ) {
+      if ( ! $this->use_pdo() && function_exists( 'mysql_set_charset' ) )
+        mysql_set_charset( $charset, $this->db );
+      else
+        $this->db_query( 'SET NAMES ' . $charset );
+    }
+  }
+
+  public function db_close() {
+    if ( $this->use_pdo() )
+      unset( $this->db );
+    else
+      mysql_close( $this->db );
+  }
+
+  public function db_valid() {
+    return (bool)$this->db;
+  }
+
+
+  /**
+   * Walk an array replacing one element for another. ( NOT USED ANY MORE )
+   *
+   * @param string $find    The string we want to replace.
+   * @param string $replace What we'll be replacing it with.
+   * @param array $data    Used to pass any subordinate arrays back to the
+   * function for searching.
+   *
+   * @return array    The original array with the replacements made.
+   */
+  public function recursive_array_replace( $find, $replace, $data ) {
+    if ( is_array( $data ) ) {
+      foreach ( $data as $key => $value ) {
+        if ( is_array( $value ) ) {
+          $this->recursive_array_replace( $find, $replace, $data[ $key ] );
+        } else {
+          // have to check if it's string to ensure no switching to string for booleans/numbers/nulls - don't need any nasty conversions
+          if ( is_string( $value ) )
+            $data[ $key ] = $this->str_replace( $find, $replace, $value );
+        }
+      }
+    } else {
+      if ( is_string( $data ) )
+        $data = $this->str_replace( $find, $replace, $data );
+    }
+  }
+
+
+  /**
+   * Take a serialised array and unserialise it replacing elements as needed and
+   * unserialising any subordinate arrays and performing the replace on those too.
+   *
+   * @param string $from       String we're looking to replace.
+   * @param string $to         What we want it to be replaced with
+   * @param array  $data       Used to pass any subordinate arrays back to in.
+   * @param bool   $serialised Does the array passed via $data need serialising.
+   *
+   * @return array The original array with all elements replaced as needed.
+   */
+  public function recursive_unserialize_replace( $from = '', $to = '', $data = '', $serialised = false ) {
+
+    // some unserialised data cannot be re-serialised eg. SimpleXMLElements
+    try {
+
+      if ( is_string( $data ) && ( $unserialized = @unserialize( $data ) ) !== false ) {
+        $data = $this->recursive_unserialize_replace( $from, $to, $unserialized, true );
+      }
+
+      elseif ( is_array( $data ) ) {
+        $_tmp = array( );
+        foreach ( $data as $key => $value ) {
+          $_tmp[ $key ] = $this->recursive_unserialize_replace( $from, $to, $value, false );
+        }
+
+        $data = $_tmp;
+        unset( $_tmp );
+      }
+
+      // Submitted by Tina Matter
+      elseif ( is_object( $data ) ) {
+        // $data_class = get_class( $data );
+        $_tmp = $data; // new $data_class( );
+        $props = get_object_vars( $data );
+        foreach ( $props as $key => $value ) {
+          $_tmp->$key = $this->recursive_unserialize_replace( $from, $to, $value, false );
+        }
+
+        $data = $_tmp;
+        unset( $_tmp );
+      }
+
+      else {
+        if ( is_string( $data ) ) {
+          $data = $this->str_replace( $from, $to, $data );
+
+        }
+      }
+
+      if ( $serialised )
+        return serialize( $data );
+
+    } catch( Exception $error ) {
+
+      $this->add_error( $error->getMessage(), 'results' );
+
+    }
+
+    return $data;
+  }
+
+
+  /**
+   * Regular expression callback to fix serialised string lengths
+   *
+   * @param array $matches matches from the regular expression
+   *
+   * @return string
+   */
+  public function preg_fix_serialised_count( $matches ) {
+    $length = mb_strlen( $matches[ 2 ] );
+    if ( $length !== intval( $matches[ 1 ] ) )
+      return "s:{$length}:\"{$matches[2]}\";";
+    return $matches[ 0 ];
+  }
+
+
+  /**
+   * The main loop triggered in step 5. Up here to keep it out of the way of the
+   * HTML. This walks every table in the db that was selected in step 3 and then
+   * walks every row and column replacing all occurences of a string with another.
+   * We split large tables into 50,000 row blocks when dealing with them to save
+   * on memmory consumption.
+   *
+   * @param string $search     What we want to replace
+   * @param string $replace    What we want to replace it with.
+   * @param array  $tables     The tables we want to look at.
+   *
+   * @return array    Collection of information gathered during the run.
+   */
+  public function replacer( $search = '', $replace = '', $tables = array( ) ) {
+
+    // check we have a search string, bail if not
+    if ( empty( $search ) ) {
+      $this->add_error( 'Search string is empty', 'search' );
+      return false;
+    }
+
+    $report = array( 'tables' => 0,
+             'rows' => 0,
+             'change' => 0,
+             'updates' => 0,
+             'start' => microtime( ),
+             'end' => microtime( ),
+             'errors' => array( ),
+             'table_reports' => array( )
+             );
+
+    $table_report = array(
+             'rows' => 0,
+             'change' => 0,
+             'changes' => array( ),
+             'updates' => 0,
+             'start' => microtime( ),
+             'end' => microtime( ),
+             'errors' => array( ),
+             );
+
+    $dry_run = $this->get( 'dry_run' );
+
+    if ( $this->get( 'dry_run' ) )      // Report this as a search-only run.
+      $this->add_error( 'The dry-run option was selected. No replacements will be made.', 'results' );
+
+    // if no tables selected assume all
+    if ( empty( $tables ) ) {
+      $all_tables = $this->get_tables();
+      $tables = array_keys( $all_tables );
+    }
+
+    if ( is_array( $tables ) && ! empty( $tables ) ) {
+
+      foreach( $tables as $table ) {
+
+        $encoding = $this->get_table_character_set( $table );
+        switch( $encoding ) {
+
+          // Tables encoded with this work for me only when I set names to utf8. I don't trust this in the wild so I'm going to avoid.
+          case 'utf16':
+          case 'utf32':
+            //$encoding = 'utf8';
+            $this->add_error( "The table \"{$table}\" is encoded using \"{$encoding}\" which is currently unsupported.", 'results' );
+            continue;
+            break;
+
+          default:
+            $this->db_set_charset( $encoding );
+            break;
+        }
+
+
+        $report[ 'tables' ]++;
+
+        // get primary key and columns
+        list( $primary_key, $columns ) = $this->get_columns( $table );
+
+        if ( empty($primary_key) ) {
+          $this->add_error( "The table \"{$table}\" has no primary key. Changes will have to be made manually.", 'results' );
+          continue;
+        }
+
+        // create new table report instance
+        $new_table_report = $table_report;
+        $new_table_report[ 'start' ] = microtime();
+
+        $this->log( 'search_replace_table_start', $table, $search, $replace );
+
+        // Count the number of rows we have in the table if large we'll split into blocks, This is a mod from Simon Wheatley
+        $row_count = $this->db_query( "SELECT COUNT(*) FROM `{$table}`" );
+        $rows_result = $this->db_fetch( $row_count );
+        $row_count = $rows_result[ 0 ];
+
+        $page_size = $this->get( 'page_size' );
+        $pages = ceil( $row_count / $page_size );
+
+        for( $page = 0; $page < $pages; $page++ ) {
+
+          $start = $page * $page_size;
+
+          // Grab the content of the table
+          $data = $this->db_query( sprintf( 'SELECT * FROM `%s` LIMIT %d, %d', $table, $start, $page_size ) );
+
+          if ( ! $data )
+            $this->add_error( $this->db_error( ), 'results' );
+
+          while ( $row = $this->db_fetch( $data ) ) {
+
+            $report[ 'rows' ]++; // Increment the row counter
+            $new_table_report[ 'rows' ]++;
+
+            $update_sql = array( );
+            $where_sql = array( );
+            $update = false;
+
+            foreach( $columns as $column ) {
+
+              $edited_data = $data_to_fix = $row[ $column ];
+
+              if ( in_array($column, $primary_key, true) ) {
+                $where_sql[] = "`{$column}` = " . $this->db_escape( $data_to_fix );
+                continue;
+              }
+
+              // exclude cols
+              if ( in_array( $column, $this->exclude_cols ) )
+                continue;
+
+              // include cols
+              if ( ! empty( $this->include_cols ) && ! in_array( $column, $this->include_cols ) )
+                continue;
+
+              // Run a search replace on the data that'll respect the serialisation.
+              $edited_data = $this->recursive_unserialize_replace( $search, $replace, $data_to_fix );
+
+              // Something was changed
+              if ( $edited_data != $data_to_fix ) {
+
+                $report[ 'change' ]++;
+                $new_table_report[ 'change' ]++;
+
+                // log first x changes
+                if ( $new_table_report[ 'change' ] <= $this->get( 'report_change_num' ) ) {
+                  $new_table_report[ 'changes' ][] = array(
+                    'row' => $new_table_report[ 'rows' ],
+                    'column' => $column,
+                    'from' => utf8_encode( $data_to_fix ),
+                    'to' => utf8_encode( $edited_data )
+                  );
+                }
+
+                $update_sql[] = "`{$column}` = " . $this->db_escape( $edited_data );
+                $update = true;
+
+              }
+
+            }
+
+            if ( $dry_run ) {
+              // nothing for this state
+            } elseif ( $update && ! empty( $where_sql ) ) {
+
+              $sql = 'UPDATE ' . $table . ' SET ' . implode( ', ', $update_sql ) . ' WHERE ' . implode( ' AND ', array_filter( $where_sql ) );
+              $result = $this->db_update( $sql );
+
+              if ( ! is_int( $result ) && ! $result ) {
+
+                $this->add_error( $this->db_error( ), 'results' );
+
+              } else {
+
+                $report[ 'updates' ]++;
+                $new_table_report[ 'updates' ]++;
+              }
+
+            }
+
+          }
+
+          $this->db_free_result( $data );
+
+        }
+
+        $new_table_report[ 'end' ] = microtime();
+
+        // store table report in main
+        $report[ 'table_reports' ][ $table ] = $new_table_report;
+
+        // log result
+        $this->log( 'search_replace_table_end', $table, $new_table_report );
+      }
+
+    }
+
+    $report[ 'end' ] = microtime( );
+
+    $this->log( 'search_replace_end', $search, $replace, $report );
+
+    return $report;
+  }
+
+
+  public function get_columns( $table ) {
+
+    $primary_key = array( );
+    $columns = array( );
+
+    // Get a list of columns in this table
+    $fields = $this->db_query( sprintf("DESCRIBE `%s`", $table) );
+    if ( ! $fields ) {
+      $this->add_error( $this->db_error( ), 'db' );
+    } else {
+      while( $column = $this->db_fetch( $fields ) ) {
+        $columns[] = $column[ 'Field' ];
+        if ( $column[ 'Key' ] == 'PRI' )
+          $primary_key[] = $column[ 'Field' ];
+      }
+    }
+
+    return array( $primary_key, $columns );
+  }
+
+
+  public function do_column() {
+
+  }
+
+
+  /**
+   * Convert table engines
+   *
+   * @param string $engine Engine type
+   * @param array $tables
+   *
+   * @return array    Modification report
+   */
+  public function update_engine( $engine = 'MyISAM', $tables = array() ) {
+
+    $report = false;
+
+    if ( empty( $this->engines ) )
+      $this->set( 'engines', $this->get_engines() );
+
+    if ( in_array( $engine, $this->get( 'engines' ) ) ) {
+
+      $report = array( 'engine' => $engine, 'converted' => array() );
+
+      if ( empty( $tables ) ) {
+        $all_tables = $this->get_tables();
+        $tables = array_keys( $all_tables );
+      }
+
+      foreach( $tables as $table ) {
+        $table_info = $all_tables[ $table ];
+
+        // are we updating the engine?
+        if ( $table_info[ 'Engine' ] != $engine ) {
+          $engine_converted = $this->db_query( "alter table {$table} engine = {$engine};" );
+          if ( ! $engine_converted )
+            $this->add_error( $this->db_error( ), 'results' );
+          else
+            $report[ 'converted' ][ $table ] = true;
+          continue;
+        } else {
+          $report[ 'converted' ][ $table ] = false;
+        }
+
+        if ( isset( $report[ 'converted' ][ $table ] ) )
+          $this->log( 'update_engine', $table, $report, $engine );
+      }
+
+    } else {
+
+      $this->add_error( 'Cannot convert tables to unsupported table engine &rdquo;' . $engine . '&ldquo;', 'results' );
+
+    }
+
+    return $report;
+  }
+
+
+  /**
+   * Updates the characterset and collation on the specified tables
+   *
+   * @param string $collate table collation
+   * @param array $tables  tables to modify
+   *
+   * @return array    Modification report
+   */
+  public function update_collation( $collation = 'utf8_unicode_ci', $tables = array() ) {
+
+    $report = false;
+
+    if ( is_string( $collation ) ) {
+
+      $report = array( 'collation' => $collation, 'converted' => array() );
+
+      if ( empty( $tables ) ) {
+        $all_tables = $this->get_tables();
+        $tables = array_keys( $all_tables );
+      }
+
+      // charset is same as collation up to first underscore
+      $charset = preg_replace( '/^([^_]+).*$/', '$1', $collation );
+
+      foreach( $tables as $table ) {
+        $table_info = $all_tables[ $table ];
+
+        // are we updating the engine?
+        if ( $table_info[ 'Collation' ] != $collation ) {
+          $engine_converted = $this->db_query( "alter table {$table} convert to character set {$charset} collate {$collation};" );
+          if ( ! $engine_converted )
+            $this->add_error( $this->db_error( ), 'results' );
+          else
+            $report[ 'converted' ][ $table ] = true;
+          continue;
+        } else {
+          $report[ 'converted' ][ $table ] = false;
+        }
+
+        if ( isset( $report[ 'converted' ][ $table ] ) )
+          $this->log( 'update_collation', $table, $report, $collation );
+      }
+
+    } else {
+
+      $this->add_error( 'Collation must be a valid string', 'results' );
+
+    }
+
+    return $report;
+  }
+
+
+  /**
+   * Replace all occurrences of the search string with the replacement string.
+   *
+   * @author Sean Murphy <sean@iamseanmurphy.com>
+   * @copyright Copyright 2012 Sean Murphy. All rights reserved.
+   * @license http://creativecommons.org/publicdomain/zero/1.0/
+   * @link http://php.net/manual/function.str-replace.php
+   *
+   * @param mixed $search
+   * @param mixed $replace
+   * @param mixed $subject
+   * @param int $count
+   * @return mixed
+   */
+  public static function mb_str_replace( $search, $replace, $subject, &$count = 0 ) {
+    if ( ! is_array( $subject ) ) {
+      // Normalize $search and $replace so they are both arrays of the same length
+      $searches = is_array( $search ) ? array_values( $search ) : array( $search );
+      $replacements = is_array( $replace ) ? array_values( $replace ) : array( $replace );
+      $replacements = array_pad( $replacements, count( $searches ), '' );
+
+      foreach ( $searches as $key => $search ) {
+        $parts = mb_split( preg_quote( $search ), $subject );
+        $count += count( $parts ) - 1;
+        $subject = implode( $replacements[ $key ], $parts );
+      }
+    } else {
+      // Call mb_str_replace for each subject in array, recursively
+      foreach ( $subject as $key => $value ) {
+        $subject[ $key ] = self::mb_str_replace( $search, $replace, $value, $count );
+      }
+    }
+
+    return $subject;
+  }
+
+
+  /**
+   * Wrapper for regex/non regex search & replace
+   *
+   * @param string $search
+   * @param string $replace
+   * @param string $string
+   * @param int $count
+   *
+   * @return string
+   */
+  public function str_replace( $search, $replace, $string, &$count = 0 ) {
+    if ( $this->get( 'regex' ) ) {
+      return preg_replace( $search, $replace, $string, -1, $count );
+    } elseif( function_exists( 'mb_split' ) ) {
+      return self::mb_str_replace( $search, $replace, $string, $count );
+    } else {
+      return str_replace( $search, $replace, $string, $count );
+    }
+  }
+
+  /**
+   * Convert a string containing unicode into HTML entities for front end display
+   *
+   * @param string $string
+   *
+   * @return string
+   */
+  public function charset_decode_utf_8( $string ) {
+    /* Only do the slow convert if there are 8-bit characters */
+    /* avoid using 0xA0 (\240) in ereg ranges. RH73 does not like that */
+    if ( ! preg_match( "/[\200-\237]/", $string ) and ! preg_match( "/[\241-\377]/", $string ) )
+      return $string;
+
+    // decode three byte unicode characters
+    $string = preg_replace( "/([\340-\357])([\200-\277])([\200-\277])/e",
+      "'&#'.((ord('\\1')-224)*4096 + (ord('\\2')-128)*64 + (ord('\\3')-128)).';'",
+      $string );
+
+    // decode two byte unicode characters
+    $string = preg_replace( "/([\300-\337])([\200-\277])/e",
+      "'&#'.((ord('\\1')-192)*64+(ord('\\2')-128)).';'",
+      $string );
+
+    return $string;
+  }
+
+}
+
+/**
+ * Getopt class
+ */
+class Getopt {
+  /**
+   * Emulates getopt(1) because PHP's default getopt() sucks. If $name is not set,
+   * $args[0] will be used instead, this is handy for passing the $argv array.
+   *
+   * Short options are provided in one string, each letter representing one option
+   * optionally followed by a colon (:) to signify that an argument is required.
+   *
+   * Long options are provided in an array, one option name per item. If the name
+   * is ended by a colon (:), the option will require an argument.
+   *
+   * Example:
+   * <code>
+   * $ret = sak_getopt(
+   *   $argv,                 // Pass $argv directly by reference
+   *   null,                  // Name here is optional as $argv[0] will be used
+   *   "f:hqv",               // -f requires an argument; -h, -q, and -v do not
+   *   array("file:","help"), // --file requires an argument; --help does not
+   *   SAK_GETOPT_ARGS_NEST   // Bitmask to nest options with arguments
+   * );
+   * </code>
+   *
+   * @param  array   &$args Array referece to be modified upon return
+   * @param  string  $name  Program name
+   * @param  string  $short Short option string
+   * @param  array   $long  Long option array
+   * @param  bitmask $mode  Settings bitmask. Default = SAK_GETOPT_NONE
+   *
+   * @return bool    True on success, false otherwise
+   *
+   * @uses sak_in_array     Checks against option arrays
+   * @uses sak_getopt_error Error output
+   */
+  public function parse(&$args, $name = null, $short = null, $long = null,
+                  $mode = null) {
+
+    if ($short == null && $long == null && $mode == null)
+      $mode = SAK_GETOPT_M_BLIND;
+    elseif ($mode == null)
+      $mode = SAK_GETOPT_NONE;
+
+    $success = true;
+
+    // Convert to: array( "o" => bool );
+    $s = $short;
+    $short = array();
+    $c = strlen($s);
+    for ($i=0; $i < $c; $i++) {
+      $cc = substr($s, $i, 2);
+      if (strlen($cc) == 2 && $cc[1] == ":") {
+        $short[$cc[0]] = true;
+        $i++;
+      } else
+        $short[$cc[0]] = false;
+    }
+
+    // Convert to: array( "option" => bool );
+    $l = (array) $long;
+    $long = array();
+    foreach ($l as $n => $v) {
+      $v = ltrim($v,"-");
+      if (substr($v, -1, 1) == ":")
+        $long[rtrim($v, ":")] = true;
+      else
+        $long[$v] = false;
+    }
+
+    unset($s);  // Destroy temporary arrays
+    unset($l);
+
+    if (!($mode & SAK_GETOPT_NO_NAME) && empty($name))
+      $name = basename(
+        array_shift($args));      // Store name and pop $args[0] off array
+
+    $options = array();           // Successfully parsed options
+    $addon = array();             // Any argument which is not a switch
+    $endargs = false;
+
+    $l = sizeof($args);
+
+    for ($i = 0; $i < $l; $i++) {
+      $arg = $args[$i];
+      $next = $extra = $match = null;
+
+      if (isset($args[($i+1)])) $next = $args[($i+1)];
+
+      $delim = substr($arg, 0, 2);
+
+      // Check for '--' marking the end of args
+      if (!($endargs) && $arg == '--') {
+        $arg = null;                            // Destroy
+        $endargs = true;
+      }
+
+      if (!($endargs) && $delim == "--") {      // == Long options ==
+        $arg = substr($arg, 2);                 // Strip delimiter
+        $eq = strpos($arg, "=");                // Check for --option=argument
+        if ($eq !== false) {                    // Extract value
+          $extra = substr($arg, ($eq + 1));
+          $arg   = substr($arg, 0, $eq);
+        }
+
+        // Search for matching long option
+        $match = $this->in_array($arg, $long, !($mode & SAK_GETOPT_ARGS_NO_CASE));
+
+        if ($match !== false) {
+          if (!($mode & SAK_GETOPT_ARGS_NO_EXPAND))
+            $arg = $match;                      // Expand option
+          if (($long[$match])) {                // Argument is required
+            if (!is_null($extra)) {             // Syntax: --option=argument
+              $next = $extra;                   // Pull from $extra
+            } elseif (!is_null($next)) {        // Syntax: --option argument
+              $i++;                             // Skip next arg
+            } else {                            // Argument not supplied
+              if (!($mode & SAK_GETOPT_QUIET)) {
+                $this->error($name, "option `--%s' requires an argument", $arg);
+                $success = false;
+              }
+              if (!($mode & SAK_GETOPT_ARGS_KEEP))
+                $arg = null;                    // Destroy if no argument
+            }
+            $arg = array("--".$arg => $next);   // Prepend match and add argument
+          } else
+            $arg = "--".$arg;                   // Prepend match
+        } else {                                // Could not find match
+          if (!($mode & SAK_GETOPT_QUIET)) {
+            $this->error($name, "unrecognized option `--%s'", $arg);
+            $success = false;
+          }
+          if (!($mode & SAK_GETOPT_ARGS_KEEP))
+            $arg = null;                        // Destroy non-match
+          else {
+            $arg = "--".$arg;                   // Prepend non-match
+            if (!is_null($extra))               // NOTE: $next cannot be used here
+              $arg = array($arg => $extra);     // Add $extra if exists
+          }
+        }
+
+        if (is_null($arg))
+          continue;                             // Skip destroyed argument
+
+        if (is_array($arg) && !($mode & SAK_GETOPT_ARGS_NEST)) {
+          foreach ($arg as $n => $v) {          // Un-nest
+            $options[] =                        // Store option
+              (($mode & SAK_GETOPT_ARGS_LOWERCASE) ? strtolower($n) : $n);
+            $options[] = $v;                    // Store argument
+          }
+        } else
+          $options[] =                          // Store option and any argument
+            (($mode & SAK_GETOPT_ARGS_LOWERCASE) ? strtolower($arg) : $arg);
+
+      } elseif (!($endargs) && $delim[0] == "-") { // == Short options ==
+        $arg = substr($arg, 1);                 // Strip delimiter
+        $c = strlen($arg);
+
+        for ($x = 0; $x < $c; $x++) {
+          $a = substr($arg, $x, 1);             // Extract short option
+
+          // This skips the rest of the string as an argument of previous option
+          if (!($mode & SAK_GETOPT_ARGS_KEEP) && $a == "=")
+            break;
+
+          $eq = false;
+          if (substr($arg, ($x + 1), 1) == "=") {
+            $next = substr($arg, ($x + 2));
+            $eq = true;
+          }
+
+          // Search for matching short option
+          $match = $this->in_array($a, $short, !($mode & SAK_GETOPT_ARGS_NO_CASE));
+
+          if ($match !== false) {
+            if (!($mode & SAK_GETOPT_ARGS_NO_EXPAND))
+              $a = $match;                      // Expand option (i.e. case)
+
+            if (($short[$match])) {             // Argument is required
+              if ($x >= ($c - 1) && !is_null($next)) {
+                $i++;                           // Syntax: -o argument
+              } elseif ($x < ($c - 1)) {
+                $next = substr($arg, ($x + 1)); // Syntax: -oargument
+                $c = $x;
+              } else {                          // Argument not supplied
+                if (!($mode & SAK_GETOPT_QUIET)){
+                  $this->error($name, "option requires an argument -- %s", $a);
+                  $success = false;
+                }
+                if (!($mode & SAK_GETOPT_ARGS_KEEP))
+                  $a = null;                    // Destroy if no argument
+              }
+              if (!is_null($a))
+                $a = array("-".$a => $next);    // Prepend match and add argument
+            } else
+              $a = "-".$a;                      // Prepend match
+          } else {                              // Could not find match
+            if (!($mode & SAK_GETOPT_QUIET)) {
+              $this->error($name, "invalid option -- %s", $a);
+              $success = false;
+            }
+
+            if (!($mode & SAK_GETOPT_ARGS_KEEP))
+              $a = null;                        // Destroy non-match
+            elseif (($eq) && count($short) == 0 && !is_null($next)) {
+              // Option has an argument
+              $a = array("-".$a => $next);
+              $c = $x;
+            } else
+              $a = "-".$a;                      // Prepend non-match
+          }
+
+          if (is_null($a))
+            continue;                           // Skip destroyed argument
+
+          if (is_array($a) && !($mode & SAK_GETOPT_ARGS_NEST)) {
+            foreach ($a as $n => $v) {          // Un-nest
+              $options[] = $n;                  // Store option
+              $options[] = $v;                  // Store argument
+            }
+          } else
+            $options[] = $a;                    // Store option and any argument
+        }
+      } else {                                  // == Non-option ==
+        if (is_null($arg))
+          continue;                             // Skip destroyed argument
+
+        if (($mode & SAK_GETOPT_ARGS_ORDER))
+          $options[] = $arg;                    // Preserve order
+        else
+          $addon[] = $arg;                      // Appended after --
+
+        continue;
+      }
+    }
+
+    // Bring everything together
+    $args = array_merge($options, array("--"), $addon);
+    return $success;
+  }
+
+  /**
+   * Internal error output for Getopt
+   *
+   * @param  string $name     Program name
+   * @param  string $format   Format string
+   * @param  mixed  $args     Optional arguments
+   * @return void
+   */
+  private function error($name, $format, $args = "") {
+    $args = func_get_args();
+    $name = array_shift($args);
+    $error = call_user_func_array('sprintf', $args);
+
+    $result = sprintf("%s: %s\n", $name, $error);
+    fwrite(STDERR, $result);
+  }
+
+  /**
+   * Internal adaptation of in_array and allows partial beginning matches
+   *
+   * @param  string $needle   Term to search for
+   * @param  array  $haystack Array to search
+   * @param  bool   $case     Case sensitive toggle
+   * @return string|false     If one and only one match, returns that match. False otherwise.
+   */
+  private function in_array($needle, $haystack, $case = true) {
+    $count = 0;
+    $match = null;
+    foreach ($haystack as $stack => $garbage) {
+      if ((($case) && $needle == $stack) ||
+        (!($case) && strtolower($needle) == strtolower($stack))
+      ) return $stack;                  // Exact match
+      if ((($case) && strpos ($stack, $needle) === 0) ||
+        (!($case) && stripos($stack, $needle) === 0)
+      ) { $count++; $match = $stack; }  // Partial match
+    }
+
+    if ($count == 1) return $match;
+    return false;
+  }
+}
+
+/**#@+ @var bitmask */
+/** Default, no options. */
+define('SAK_GETOPT_NONE',           0x000);
+/** Do not shift $args[0] off the array as the program name. */
+define('SAK_GETOPT_NO_NAME',        0x001);
+/** Suppress error output. */
+define('SAK_GETOPT_QUIET',          0x002);
+/** Options with arguments will be nested together in arrays. */
+define('SAK_GETOPT_ARGS_NEST',      0x004);
+/** Keep all options and arguments passed in the result. */
+define('SAK_GETOPT_ARGS_KEEP',      0x008);
+/** Do not move unmatched arguments to the end after "--" */
+define('SAK_GETOPT_ARGS_ORDER',     0x010);
+/** Match options without case sensitivity. */
+define('SAK_GETOPT_ARGS_NO_CASE',   0x020);
+/** Convert all long options to lowercase. */
+define('SAK_GETOPT_ARGS_LOWERCASE', 0x040);
+/** Do not rename partial argument matches (e.g. --h to --help) */
+define('SAK_GETOPT_ARGS_NO_EXPAND', 0x080);
+/**#@-*/
+
+/**
+ * Macro for quiet, keep arguments, and keep order. Handy for passing $argv
+ *
+ * Combination of {@link SAK_GETOPT_QUIET}, {@link SAK_GETOPT_ARGS_KEEP}, and {@link SAK_GETOPT_ARGS_ORDER}.
+ *
+ * @var bitmask
+ */
+define('SAK_GETOPT_M_BLIND', (SAK_GETOPT_QUIET | SAK_GETOPT_ARGS_KEEP | SAK_GETOPT_ARGS_ORDER));
+
+/**
+ * Extended class to modify constructor and log output
+ */
+class icit_srdb_cli extends icit_srdb {
+  public function __construct($args) {
+    $args = array_merge(array(
+      'name'            => '',
+      'user'            => '',
+      'pass'            => '',
+      'host'            => '',
+      'search'          => '',
+      'replace'         => '',
+      'tables'          => array(),
+      'exclude_cols'    => array(),
+      'include_cols'    => array(),
+      'dry_run'         => true,
+      'regex'           => false,
+      'pagesize'        => 50000,
+      'alter_engine'    => false,
+      'alter_collation' => false,
+      'verbose'         => false,
+
+      'workdir'         => '',
+      'nobackup'        => false
+    ), $args);
+
+    // handle exceptions
+    set_exception_handler(array($this, 'exceptions'));
+
+    // handle errors
+    set_error_handler(array($this, 'errors'), E_ERROR | E_WARNING);
+
+    // allow a string for columns
+    foreach (array('exclude_cols', 'include_cols', 'tables') as $maybe_string_arg)
+      if (is_string($args[$maybe_string_arg]))
+        $args[$maybe_string_arg] = array_filter(array_map('trim', explode(',', $args[$maybe_string_arg])));
+
+    // set class vars
+    foreach ($args as $name => $value) {
+      if (is_string($value))  $value = stripcslashes($value);
+      if (is_array($value))   $value = array_map('stripcslashes', $value);
+      $this->set($name, $value);
+    }
+
+    // only for non cli call, cli set no timeout, no memory limit
+    if (!defined('STDIN')) {
+      // increase time out limit
+      @set_time_limit(60 * 10);
+      // try to push the allowed memory up, while we're at it
+      @ini_set('memory_limit', '1024M');
+    }
+
+    // set up db connection
+    $this->db_setup();
+    if ($this->db_valid()) {
+      if (count($this->get_tables()) == 0) {
+        // No need to proceed if database has no tables
+        fatal("Database has no tables, nothing to do.");
+      } elseif ($args['nobackup']) {
+        echo "\n"; warn("No backups will be created."); echo "\n";
+      } else
+        backup_database($this->user, $this->pass, $this->name, $args['workdir']);
+
+      if ($this->alter_engine)        // update engines
+        $report = $this->update_engine($this->alter_engine, $this->tables);
+      elseif ($this->alter_collation) // update collation
+        $report = $this->update_collation($this->alter_collation, $this->tables);
+      else                            // default search/replace action
+        $report = $this->replacer($this->search, $this->replace, $this->tables);
+    } else
+      $report = $this->report;
+
+    // store report in the report store
+    $this->set('report', $report);
+    return $report;
+  }
+
+  public function replacer($search = '', $replace = '', $tables = array()) {
+    // check we have a search string, bail if not
+    if (empty($search)) {
+      $this->add_error('Search string is empty', 'search');
+      return false;
+    }
+
+    $report = array(
+      'tables'        => 0,
+      'rows'          => 0,
+      'change'        => 0,
+      'updates'       => 0,
+      'start'         => microtime(),
+      'end'           => microtime(),
+      'errors'        => array(),
+      'table_reports' => array());
+
+    $table_report = array(
+      'rows'    => 0,
+      'change'  => 0,
+      'changes' => array(),
+      'updates' => 0,
+      'start'   => microtime(),
+      'end'     => microtime(),
+      'errors'  => array());
+
+    $have_key = true;
+    $dry_run = $this->get('dry_run');
+
+    if ($this->get('dry_run'))      // Report this as a search-only run.
+      $this->add_error('The dry-run option was selected. No replacements will be made.', 'results');
+
+    // if no tables selected assume all
+    if (empty($tables)) {
+      $all_tables = $this->get_tables();
+      $tables = array_keys($all_tables);
+    }
+
+    if (is_array($tables) && !empty($tables)) {
+      foreach($tables as $table) {
+        $encoding = $this->get_table_character_set($table);
+        switch($encoding) {
+          // Tables encoded with this work for me only when I set names to utf8. I don't trust this in the wild so I'm going to avoid.
+          case 'utf16':
+          case 'utf32':
+            //$encoding = 'utf8';
+            $this->add_error( "The table \"{$table}\" is encoded using \"{$encoding}\" which is currently unsupported.", 'results' );
+            continue;
+          default:
+            $this->db_set_charset( $encoding );
+            break;
+        }
+
+        $report['tables']++;
+
+        // get primary key and columns
+        list($primary_key, $columns) = $this->get_columns($table);
+
+        if (!$this->get('experimental') && !($have_key = (empty($primary_key)) ? false : true)) {
+          $this->log('error_no_key', $table, $new_table_report);
+          continue;
+        }
+
+        // create new table report instance
+        $new_table_report = $table_report;
+        $new_table_report['start'] = microtime();
+
+        $this->log('search_replace_table_start', $table, $search, $replace);
+
+        // Count the number of rows we have in the table if large we'll split into blocks, This is a mod from Simon Wheatley
+        $row_count = $this->db_query("SELECT COUNT(*) FROM `{$table}`");
+        $rows_result = $this->db_fetch($row_count);
+        $row_count = $rows_result[0];
+
+        $this->log('search_replace_table_rows', $table, $row_count);
+
+        $page_size = $this->get('page_size');
+        $pages = ceil($row_count / $page_size);
+
+        for( $page = 0; $page < $pages; $page++ ) {
+          $start = $page * $page_size;
+          // Grab the content of the table
+          $data = $this->db_query(sprintf('SELECT * FROM `%s` LIMIT %d, %d', $table, $start, $page_size));
+
+          if (!$data)
+            $this->add_error($this->db_error(), 'results');
+
+          while ($row = $this->db_fetch($data)) {
+            $report['rows']++; // Increment the row counter
+            $new_table_report['rows']++;
+
+            $update_sql = array();
+            $where_sql = array();
+            $update = false;
+
+            foreach ($columns as $column) {
+              //echo "processing $column\n";
+              $edited_data = $data_to_fix = $row[ $column ];
+              if (in_array($column, $primary_key, true)) {
+                $where_sql[] = "`{$column}` = ".$this->db_escape($data_to_fix);
+                continue;
+              }
+
+              // exclude cols
+              if (in_array( $column, $this->exclude_cols))
+                continue;
+              // include cols
+              if (!empty($this->include_cols) && !in_array($column, $this->include_cols))
+                continue;
+              // Run a search replace on the data that'll respect the serialisation.
+              $edited_data = $this->recursive_unserialize_replace($search, $replace, $data_to_fix);
+              // Something was changed
+              if ($edited_data != $data_to_fix) {
+                $report['change']++;
+                $new_table_report['change']++;
+
+                // log first x changes
+                if ( $new_table_report['change'] <= $this->get('report_change_num')) {
+                  $new_table_report['changes'][] = array(
+                    'row' => $new_table_report['rows'],
+                    'column' => $column,
+                    'from' => utf8_encode($data_to_fix),
+                    'to' => utf8_encode($edited_data)
+                  );
+                }
+
+                if (!$have_key)
+                  $where_sql[] = "`{$column}` = ".$this->db_escape($data_to_fix);
+                $update_sql[] = "`{$column}` = ".$this->db_escape($edited_data);
+                $update = true;
+              }
+            }
+
+            if ($dry_run) {
+              // nothing for this state
+            } elseif ($update && !empty($where_sql)) {
+              $sql = sprintf('UPDATE `%s` SET %s WHERE %s', $table,
+                implode(', ', $update_sql), implode(' AND ', array_filter($where_sql)));
+              $result = $this->db_update($sql);
+
+              if (!is_int($result) && !$result) {
+                $this->add_error($this->db_error(), 'results');
+              } else {
+                $report['updates']++;
+                $new_table_report['updates']++;
+              }
+            }
+          }
+          $this->db_free_result($data);
+        }
+
+        $new_table_report['end'] = microtime();
+        // store table report in main
+        $report['table_reports'][$table] = $new_table_report;
+        // log result
+        $this->log('search_replace_table_end', $table, $new_table_report);
+      }
+    }
+
+    $report['end'] = microtime();
+    $this->log('search_replace_end', $search, $replace, $report);
+    return $report;
+  }
+
+  public function log($type = '') {
+    $args = array_slice(func_get_args(), 1);
+    $output = "";
+    switch($type) {
+      case 'error':
+        list($error_type, $error) = $args;
+        echo "\r\e[K".$this->color("\e[31;1m");
+        warn($error);
+        echo $this->color("\e[0m");
+        break;
+
+      case 'error_no_key':
+        list($table, $report) = $args;
+        printf("\r\e[K%s%-36s  SKIPPED: No primary key.%s\n",
+          $this->color("\e[33;1m"), $table,
+          $this->color("\e[0m"));
+        break;
+
+      case 'search_replace_table_start':
+        list($table, $report) = $args;
+        printf("\r\e[K%-36s  counting rows...", $table);
+        return;
+
+      case 'search_replace_table_rows':
+        list($table, $rows) = $args;
+        printf("\r\e[K%-30s  %5d rows to process...", $table, $rows);
+        return;
+
+      case 'search_replace_table_end':
+        list($table, $report) = $args;
+        if ($report['change'] || $this->get('verbose'))
+          printf("\r\e[K%s%-30s  %5d changes%s\n",
+            (($report['change'] > 0 || $report['updates'] > 0) ?
+              $this->color("\e[32;1m") : ''), $table, $report['change'],
+            $this->color("\e[0m"));
+        break;
+
+      case 'search_replace_end':
+        list( $search, $replace, $report ) = $args;
+        printf("\r\e[K\nReplaced `%s' with `%s' on %d tables %d times with %d update queries.\n",
+          $search, $replace, $report['tables'], $report['change'], $report['updates']);
+        break;
+
+      case 'update_engine':
+        list($table, $report, $engine) = $args;
+        printf("%s%s has %sbeen converted to %s%s\n",
+          $this->color("\e[33;1m"), $table,
+          ($report['converted'][$table] ? '' : 'not '), $engine,
+          $this->color("\e[0m"));
+        break;
+
+      case 'update_collation':
+        list($table, $report, $collation) = $args;
+        printf("%s%s has %sbeen converted to %s%s\n",
+          $this->color("\e[33;1m"), $table,
+          ($report['converted'][$table] ? '' : 'not '), $collation,
+          $this->color("\e[0m"));
+        break;
+
+      default:
+        // Future-proofing, in case the class changes, call the parent
+        call_user_func_array(array($this, 'parent::log'), func_get_args());
+        break;
+    }
+  }
+
+  public function color($string) {
+    if ($this->get('color'))
+      return $string;
+    return '';
+  }
+}
+
+################################################################################
+################################################################################
+
+/**
+ * Call dbconnect to read a configuration file for database info
+ *
+ * @param string $configfile  Path to the configuration file to read.
+ *
+ * @return object Result data.
+ */
+function read_config($configfile) {
+  if (!file_exists($configfile) || !is_readable($configfile))
+    fatal("Error: File does not exist or not readable: %s", $configfile);
+
+  // Resolve file path
+  $configfile = realpath($configfile);
+
+  // Call a command line api exposed by dbconnect to take advantage of
+  // the perl module that can read a wide variety of web app config files.
+  $json = exec(sprintf('/root/bin/dbconnect --api=is_supported_filename,%s', escapeshellarg($configfile)));
+  $data = json_decode($json);
+  if (isset($data->result)) {
+    if ($data->result == 0)
+      fatal("Error: Not a supported config file: %s", $configfile);
+  } else
+    fatal("Error: Failed to verify if specified file is supported.\n", $configfile);
+
+  $json = exec(sprintf('/root/bin/dbconnect --api=extract_db,%s', escapeshellarg($configfile)));
+  $data = json_decode($json);
+  if (!$data) {
+    error("Error while parsing json while reading: %s", $configfile);
+    printf("Raw data from dbconnect call:\n%s\n", $json);
+    exit(1);
+  }
+
+  if ($data->error)
+    fatal("Error while reading %s: %s", $configfile, $data->error);
+
+  if (!$data->result->hostname || !$data->result->database || !$data->result->dbuser ||
+      !$data->result->password || !$data->result->app)
+    fatal("Error: Database information missing or incomplete from the specified file.");
+
+  return $data;
+}
+
+/**
+ * Perform a database backup.
+ *
+ * @param string $user_name       Database username.
+ * @param string $password        Database password.
+ * @param string $database_name   Database name.
+ * @param string $work_directory  Backup directory.
+ *
+ * @return void
+ */
+function backup_database($user_name, $password, $database_name, $work_directory) {
+  $database_filename = sprintf('%s.%s.%d.sql',
+    $database_name, date("Y-m-d-H-i-s"), getmypid());
+
+  // Sanitize $user_name
+  if (preg_match("#^[_a-zA-Z0-9]{1,16}$#", $user_name) != 1)
+    fatal("Error: Not a valid username: %s", $user_name);
+
+  // Sanitize $password (make sure it's not more than 128 characters long)
+  if (strlen($password) > 128)
+    fatal("Error: Database password is more than 128 characters long.");
+
+  // Sanitize $database_name
+  if (preg_match("#^[a-zA-Z0-9_]{1,64}$#", $database_name) != 1)
+    fatal("Error: %s is not a valid database name.", $database_name);
+
+  // Figure out a work_directory to use.
+  if ($work_directory) {
+    if (preg_match("#^[-/a-zA-Z0-9\.]{1,256}$#", $work_directory) != 1)
+      fatal("Error: %s is not a valid path/file.", $work_directory);
+  } else
+    $work_directory = sprintf("/home/hgtransfer/myimport-backups-%s", date("Ymd"));
+
+  // Check if we're root and if we are, see if the file exists or mkdir fails
+  if (UID != 0 || (!file_exists($work_directory) && !@mkdir($work_directory, 0777, true))) {
+    // We aren't root, or things failed, so try something else
+    $work_directory = null;
+    // Read passwd to find our home directory
+    if (($passwd = file('/etc/passwd')) !== false) {
+      foreach ($passwd as $line) {
+        list($user, $g, $id, $g, $g, $home, $g) = explode(":", $line);
+        if (UID == $id) {
+          if (file_exists($home))
+            $work_directory = realpath($home).DS.'.srdbs';
+          else // Home directory doesn't exist, or is broken...
+            $work_directory = sys_get_temp_dir().DS.'srdbs'.DS.$user;
+          break;
+        }
+      }
+    } // else fall through with null
+
+    if (is_null($work_directory))
+      fatal("Error: Could not find suitable directory for backup. Specify manually with --workdir=PATH");
+    elseif (!file_exists($work_directory) && !@mkdir($work_directory, 0700, true))
+      fatal("Error: Failed to create backup directory: %s", $work_directory);
+  }
+
+  printf("Backup will be saved in: %s\n", $work_directory);
+  $creds = (defined('ROOT_CREDS')) ? '' :
+    sprintf('-u%s -p%s ', escapeshellarg($user_name), escapeshellarg($password));
+  exec(sprintf('mysqldump --skip-extended-insert %s%s > %s', $creds,
+    escapeshellarg($database_name), escapeshellarg($work_directory.DS.$database_filename)),
+    $output, $result);
+
+  if ($result != 0)
+    fatal("Error: Database backup failed.");
+
+  exec(sprintf('/bin/ls -l %s 2>/dev/null', escapeshellarg($work_directory.DS.$database_filename)), $output);
+  echo implode($output)."\n\n";
+}
+
+/**
+ * Verify dbconnect is installed and the proper version.
+ *
+ * @return bool True on success. Exits with error on failure.
+ */
+function dependency_check() {
+  if (UID != 0)
+    fatal("Error: Must run script as root when using --config. Otherwise, specify DB connection manually.");
+
+  if (!file_exists('/root/bin/dbconnect'))
+    fatal("Error: Required script `dbconnect' not found.  Please install dbconnect 5.0 or specify DB connection manually.");
+
+  exec('/root/bin/dbconnect --help 2>&1', $output, $result);
+
+  if ($result != 0) {
+    if (is_array($output))
+      fatal("Error: \n".implode("\n", $output));
+    else
+      fatal("Unknown error while executing /root/bin/dbconnect.");
+  }
+
+  if (preg_match("/dbconnect (?P<version>[\d.]+)/", $output[0], $matches))
+    if (version_compare($matches['version'], '5.0', '<'))
+      fatal("Error: Required script `dbconnect' is out of date (%s < 5.0).  Please update dbconnect.\n", $matches['version']);
+
+  return true;
+}
+
+/**
+ * Read a my.cnf or similar INI formatted file for MySQL credentials.
+ *
+ * @param string $ini File path to config.
+ *
+ * @return mixed  On success, return array of user and pass. False on failure.
+ */
+function read_mycnf($ini = "/root/.my.cnf") {
+  if (UID != 0 || ($ini = @parse_ini_file($ini, true)) === false)
+    return false;
+
+  $username = "";
+  $password = "";
+  if (array_key_exists('client', $ini)) {
+    $client = $ini['client'];
+    if (array_key_exists('password', $client))
+      $password = $client['password'];
+
+    if ($password == '' && array_key_exists('pass', $client))
+      $password = $client['pass'];
+
+    if (array_key_exists('user', $client))
+      $username = $client['user'];
+  }
+  if ($username == "" || $password == "")
+    return false;
+
+  return array($username, $password);
+}
+
+################################################################################
+################################################################################
+
+/**
+ * Main Street
+ *
+ * @param int   $argc Argument count.
+ * @param array $argv Command line arguments.
+ *
+ * @return void
+ */
+function main($argc, $argv) {
+  // php 5.3 date timezone requirement, shouldn't affect anything
+  date_default_timezone_set('America/Chicago');
+
+  $appname = array_shift($argv);
+  if ($appname == '-' || $appname == 'stdin' || strstr($appname, '/dev/fd') !== false)
+    $appname = 'srdbs';
+
+  define('APPNAME', basename($appname));
+  define('DS', DIRECTORY_SEPARATOR);
+  define('UID', (function_exists('posix_getuid')) ? posix_getuid() : @exec('/bin/id -u 2>/dev/null'));
+
+  $args = $argv;
+  $getopt = new Getopt();
+  $info = array(
+    'dry_run' => false,
+    'color' => ((function_exists('posix_isatty') && !posix_isatty(STDOUT)) ? false : true));
+
+  if ($getopt->parse($args, APPNAME, 'a:cCd:e:f:gh:i:l:n:p:qr:s:t:u:vVw:x:z',
+    array('alter-collation:','alter-engine:','backup:','color','config:',
+          'dbinfo:','dry-run','exclude-cols:','help','host:','include-cols:',
+          'name:','nobackup','nocolor','pagesize:','pass:','regex','replace:',
+          'search:','tables:','user:','verbose','version','workdir:',
+          'experimental'),
+    (SAK_GETOPT_M_BLIND | SAK_GETOPT_ARGS_LOWERCASE)
+  ) === false)
+    exit(1);
+
+  while (true) {
+    switch ($arg = $args[0]) {
+      // Convert short to long option
+      case '-a': $args[0] = '--alter-collation'; continue 2;
+      case '-c': $args[0] = '--color';        continue 2;
+      case '-C': $args[0] = '--nocolor';      continue 2;
+      case '-d': $args[0] = '--dbinfo';       continue 2;
+      case '-e': $args[0] = '--alter-engine'; continue 2;
+      case '-f': $args[0] = '--config';       continue 2;
+      case '-g': $args[0] = '--regex';        continue 2;
+      case '-h': $args[0] = '--host';         continue 2;
+      case '-i': $args[0] = '--include-cols'; continue 2;
+      case '-l': $args[0] = '--pagesize';     continue 2;
+      case '-n': $args[0] = '--name';         continue 2;
+      case '-p': $args[0] = '--pass';         continue 2;
+      case '-q': $args[0] = '--quiet';        continue 2;
+      case '-r': $args[0] = '--replace';      continue 2;
+      case '-s': $args[0] = '--search';       continue 2;
+      case '-t': $args[0] = '--tables';       continue 2;
+      case '-u': $args[0] = '--user';         continue 2;
+      case '-v': $args[0] = '--verbose';      continue 2;
+      case '-V': $args[0] = '--version';      continue 2;
+      case '--backup':      // Alias
+      case '-w': $args[0] = '--workdir';      continue 2;
+      case '-x': $args[0] = '--exclude-cols'; continue 2;
+      case '-z': $args[0] = '--dry-run';      continue 2;
+      // Argumentative options
+      case '--alter-collation':   case '--alter-engine':
+      case '--config':            case '--exclude-cols':
+      case '--host':              case '--include-cols':
+      case '--name':              case '--pagesize':
+      case '--pass':              case '--replace':
+      case '--search':            case '--tables':
+      case '--user':              case '--workdir':
+        $name = str_replace('-', '_', substr($arg, 2));
+        array_shift($args);
+        $info[$name] = $args[0];
+        break;
+      // Triple argumentative option
+      case '--dbinfo':
+        if ($args[1][0] == '-' || $args[2][0] == '-' || $args[3][0] == '-')
+          usage("option `--dbinfo' requires three (3) arguments.");
+
+        foreach(array('name','user','pass') as $item) {
+          array_shift($args);
+          $info[$item] = $args[0];
+        }
+        break;
+      // Boolean options
+      case '--color': case '--dry-run': case '--nobackup':
+      case '--regex': case '--verbose':
+      case '--experimental':
+        $name = str_replace('-', '_', substr($arg, 2));
+        $info[$name] = true;
+        break;
+      case '--nocolor': $info['color'] = false; break;
+      // Stuff and things
+      case '--help':    help(); break;
+      case '-V':
+      case '--version': version(); exit(); break;
+      // End of arguing
+      case '--':        array_shift($args); break 2;
+      // Invalid arguing
+      default:
+        if ($arg[0] == '-') {
+          if ($arg[1] == '-')
+            usage("unrecognized option `%s'", $arg);
+          else
+            usage("invalid option -- %s", $arg);
+        } else
+          usage("unexpected argument `%s'", $arg);
+      break 2;
+    }
+    array_shift($args);
+  }
+
+  // Read config for connection details
+  if (isset($info['config']) && dependency_check()) {
+    // Read the database info. from the config file.
+    if ($data = read_config($info['config'])) {
+      $info['name'] = $data->result->database;
+      $info['user'] = $data->result->dbuser;
+      $info['pass'] = $data->result->password;
+    }
+  }
+
+  // If we are root and no details passed, use /root/my.cnf for user & pass
+  if (UID == 0 && isset($info['name']) && (!isset($info['user']) || !isset($info['pass']))) {
+    list($temp_user, $temp_pass) = (array)read_mycnf();
+    if ($temp_user !== false) {
+      define('ROOT_CREDS', true);
+      $info['user'] = $temp_user;
+      $info['pass'] = $temp_pass;
+    }
+  }
+
+  // If we still don't have connectino info, die with an error
+  if (!isset($info['name']) || !isset($info['user']) || !isset($info['pass'])) {
+    usage("Error: Missing required database connection information.");
+  }
+
+  // Begin script output
+  version();
+  echo "\n";
+  // Class displays log output and returns final results
+  $report = new icit_srdb_cli($info);
+
+  // Display notice if any warnings or errors were output
+  if ($report && ((isset($args['dry_run']) && $args['dry_run']) || empty($report->errors['results'])))
+    echo "\nNOTICE: Check the output for warnings and errors.\n\n";
+
+  echo "\nCompleted.\n";
+}
+
+// Old option array
+//$opts = array(
+//  'h:'  => 'host:',
+//  'n:'  => 'name:',
+//  'u:'  => 'user:',
+//  'p:'  => 'pass:',
+//  'c:'  => 'char:',   // Not documented anywhere
+//  's:'  => 'search:',
+//  'r:'  => 'replace:',
+//  't:'  => 'tables:',
+//  'i:'  => 'include-cols:',
+//  'x:'  => 'exclude-cols:',
+//  'g'   => 'regex',
+//  'l:'  => 'pagesize:',
+//  'z'   => 'dry-run',
+//  'e:'  => 'alter-engine:',
+//  'a:'  => 'alter-collation:',
+//  'v::' => 'verbose::',
+//  'd:'  => 'dbinfo:',
+//  'f:'  => 'config:',
+//  'b'   => 'nobackup',
+//  'w:'  => 'workdir:',
+//  'help'
+//);
+
+################################################################################
+################################################################################
+
+/**
+ * Generate a fatal message with printf() and exit
+ *
+ * Use similar to printf. If first argument is boolean true, script usage will
+ * be displayed before the error.
+ *
+ * @param bool    $usage  Optional. True to display script usage.
+ * @param string  $format Format string passed to printf().
+ * @param mixed   $arg1   ...
+ */
+function fatal() {
+  $args = func_get_args();
+  if ($args[0] === true) {
+    usage();
+    array_shift($args);
+  }
+  call_user_func_array('error', $args);
+  exit(1);
+}
+
+/**
+ * Generate an error message with printf()
+ *
+ * @param string  $format Format string passed to printf().
+ * @param mixed   $arg1   ...
+ *
+ * @return void
+ */
+function error() {
+  $args = func_get_args();
+  $args[0] = sprintf("%s: %s\n", APPNAME, $args[0]);
+  if (defined('STDERR')) {
+    array_unshift($args, STDERR);
+    call_user_func_array('fprintf', $args);
+  } else
+    call_user_func_array('printf', $args);
+}
+
+/**
+ * Generate a warning message with printf()
+ *
+ * @param string  $format Format string passed to printf().
+ * @param mixed   $arg1   ...
+ *
+ * @return void
+ */
+function warn() {
+  $args = func_get_args();
+  $args[0] = sprintf("Warning: %s\n", $args[0]);
+  if (defined('STDERR')) {
+    array_unshift($args, STDERR);
+    call_user_func_array('fprintf', $args);
+  } else
+    call_user_func_array('printf', $args);
+}
+
+/**
+ * Display program version
+ */
+function version() {
+  echo "SRDBS v3.0 (PHP)\n";
+}
+
+/**
+ * Display program usage and optionally prepend an error
+ *
+ * @param string  $format Format string passed to error().
+ * @param mixed   $arg1   ...
+ *
+ * @return void
+ */
+function usage() {
+  if ($args = func_get_args()) {
+    call_user_func_array('error', $args);
+    echo "\n";
+  }
+  echo "Usage: ".APPNAME." [OPTION]... DBINFO... --search=STRING --replace=STRING\n".
+       "       ".APPNAME." [OPTION]... DBINFO... --alter-engine=ENGINE\n".
+       "       ".APPNAME." [OPTION]... DBINFO... alter-collation=TYPE\n";
+  if ($args) exit(1);
+}
+
+/**
+ * Display program help and exit
+ */
+function help() {
+  version();
+  usage();
+  echo <<< EOF
+
+Allows you to search and replace strings in your database safely without
+breaking serialised PHP.
+
+Mandatory arguments to long options are mandatory for short options too.
+  -h, --host=HOST       Hostname of the database server.
+  -n, --name=NAME       Database name.
+  -u, --user=USER       Database user.
+  -p, --pass=PASS       Database user's password.
+
+  -f, --config=FILENAME Parse FILENAME for database connection information.
+                          NOTE: Requires root privileges (may change in the
+                          future).
+  --dbinfo DBNAME DBUSER DBPASS
+                        Alternate method to provide database information.
+
+  --backup, --workdir   Specify backup directory.
+  --nobackup            Disable backups.
+                          USE AT YOUR OWN RISK.
+
+  -s, --search=STRING   String to search for or `preg_replace()` style regular
+                          expression.
+  -r, --replace=STRING  None empty string to replace search with or
+                          `preg_replace()` style replacement.
+  -g, --regex           Treats value for -s or --search as a regular expression
+                          and -r or --replace as a regular expression
+                          replacement.
+
+  -t, --tables=TABLE[,TABLE2...]
+                        Perform replacement on specified tables only.
+  -i, --include-cols=COL[,COL2...]
+                        Perform replacement on specified columns only.
+  -x, --exclude-cols=COL[,COL2...]
+                        Exclude specified columns from replacements.
+
+  -e, --alter-engine=ENGINE
+                        Changes the database table to the specified database
+                          engine (e.g. InnoDB or MyISAM). If specified
+                          search/replace arguments are ignored. They will not be
+                          run simultaneously.
+  -a, --alter-collation=TYPE
+                        Changes the database table to the specified collation
+                          eg. utf8_unicode_ci. If specified search/replace
+                          arguments are ignored. They will not be run
+                          simultaneously.
+
+  -l, --pagesize=SIZE   How rows to fetch at a time from a table.
+
+  -z, --dry-run         Preview replacements without making any changes.
+  -c, --color           Enable color highlighting.
+  -C, --nocolor         Disable color highlighting.
+  -v, --verbose         Increase script output.
+  -q, --quiet           Reduce script output.
+
+  --help                Displays this help message.
+  -V, --version         Display the program version.
+
+Based on <https://github.com/interconnectit/search-replace-db> version 3.0
+
+
+EOF;
+
+  if (UID == 0 && dependency_check()) {
+    exec('/root/bin/dbconnect --api=show_supported_configs 2>/dev/null', $output);
+    echo implode("\n", $output)."\n\n";
+  }
+
+  exit;
+}
+
+main($argc, $argv);

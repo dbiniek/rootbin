@@ -1,0 +1,868 @@
+#!/usr/bin/env python
+
+###########
+#
+# autoclean
+# Automatically remove known malware injections from files.
+# https://gatorwiki.hostgator.com/Security/AutoClean
+# http://git.toolbox.hostgator.com/autoclean
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+import sys, os, subprocess, platform
+
+if __file__ == '<stdin>' or __file__.startswith('/dev/fd/'):
+    raise Exception('autoclean cannot be run through a pipe.  The file must exist.')
+
+FNULL = open('/dev/null','w')
+
+def restart(after_install=False):
+    try:
+        name = '/opt/python27/bin/python2.7'
+        os.execvp(name, [name]+sys.argv)
+    except OSError:
+        if after_install:
+            raise Exception('Failure to install python2.7!')
+        print('Installing Python 2.7')
+
+        python_url, python_file = {
+	    '32bit': ('http://repo.websitewelcome.com/dedi/centos/5/i386/Python27-2.7.3-9.i386.rpm', 'Python27-2.7.3-9.i386.rpm'),
+	    '64bit': ('http://repo.websitewelcome.com/dedi/centos/5/x86_64/Python27-2.7.3-9.x86_64.rpm', 'Python27-2.7.3-9.x86_64.rpm')
+        }[platform.architecture()[0]]
+
+        if subprocess.call('wget %s' % python_url, stdout=FNULL, stderr=FNULL, shell=True):
+            raise Exception('Error fetching python installer!')
+        if subprocess.call('rpm -ivh --nodeps %s' % python_file, stdout=FNULL, stderr=FNULL, shell=True):
+            raise Exception('Error installing python!')
+        if subprocess.call('rm -f %s' % python_file, stdout=FNULL, stderr=FNULL, shell=True):
+            raise Exception('Error removing python RPM.')
+        restart(True)
+
+if sys.version_info[:2] < (2,6):
+    restart()
+
+if sys.version_info[:2] < (2,7) and "Apr  3 2012" not in sys.version:
+    restart()
+
+try:
+    import setuptools
+except ImportError:
+    print('Installing setuptools.')
+    if subprocess.call('wget hgfix.net/pharrison/ez_setup.py', stdout=FNULL, stderr=FNULL, shell=True):
+        raise Exception('Error fetching ez_setup.py!')
+    if subprocess.call('/opt/python27/bin/python2.7 ez_setup.py', stdout=FNULL, stderr=FNULL, shell=True):
+        raise Exception('Error running ez_setup.py!')
+    if subprocess.call('rm -f ez_setup.py', stdout=FNULL, stderr=FNULL, shell=True):
+        raise Exception('Error removing setuptools installer.')
+    restart()
+
+#class RegexVersionException(Exception):
+#    pass
+
+try:
+    import regex as re
+#    if re.__version__ < "2.4.0":
+#        raise RegexVersionException()
+except ImportError:
+    print('Installing regex library.')
+    if subprocess.call('/opt/python27/bin/easy_install-2.7 regex', stdout=FNULL, stderr=FNULL, shell=True):
+        raise Exception('Error installing regex library.')
+    restart()
+#except RegexVersionException:
+#    print('Updating regex library.')
+#    if subprocess.call('/opt/python27/bin/easy_install-2.7 --upgrade regex', stdout=FNULL, stderr=FNULL, shell=True):
+#        raise Exception('Error upgrading regex library.')
+#    restart()
+
+FNULL.close()
+
+from sys import exit
+from os import getpid, getcwd, unlink, listdir, lstat, chmod
+from os.path import join as joinpath
+from gzip import open as gzipopen
+from time import sleep, time, strftime, localtime
+from tarfile import open as taropen
+from threading import Lock, Thread
+from xmlrpclib import ServerProxy
+from string import Template
+from Queue import Queue, Empty
+import stat as stat_check
+import hashlib
+from pwd import getpwnam
+from socket import gethostname as get_hostname
+from smtplib import SMTP
+
+#### JSONRPC_Client.py ####
+
+import urllib2, uuid, json, base64
+
+class _Method(object):
+    def __init__(self, send, name):
+        self.__send = send
+        self.__name = name
+    
+    def __getattr__(self, name):
+        return _Method(self.__send, "%s.%s" % (self.__name, name))
+    
+    def __call__(self, *args):
+        return self.__send(self.__name, args)
+
+class Proxy(object):
+    def __init__(self, service_url, auth_user = None, auth_password = None):
+        self.service_url = service_url
+        if auth_user and auth_password:
+            self.auth_data = base64.encodestring('%s:%s' % (auth_user, auth_password))[:-1]
+        else:
+            self.auth_data = None
+
+    def call(self, method, params=None):
+        result = self.__call(method, params)
+        if result['error']:
+            raise Exception(result['error'])
+        else:
+            return result['result']
+
+    def __call(self, method, params=None):
+        try:
+            id = str(uuid.uuid1())
+            req = urllib2.Request(self.service_url)
+            if self.auth_data:
+                req.add_header("Authorization", "Basic %s" % self.auth_data)
+            req.add_header("Content-type", "application/json")
+            return json.loads(urllib2.urlopen(req, json.dumps({'method':method, 'params':params, 'id':id})).read())
+        except IOError, (strerror):
+            return dict(result=None, error=dict(message='Network error. ' + str(strerror), code=None, data=None), id=id)
+        except ValueError, (strerror):
+            return dict(result=None, error=dict(message='JSON format error. ' + str(strerror), code=None, data=None), id=id)
+
+    def __getattr__(self, name):
+        return _Method(self.call, name)
+
+###########################
+
+class File(object):
+    '''Lazy-loaded interface to a file object.'''
+
+    def __init__(self, path, reporter, stats):
+        self.__path = path
+        self.__data = None
+        self.__modified = False
+        self.reporter = reporter
+        self.stats = stats
+
+    def __get_path(self):
+        return self.__path
+
+    def __get_data(self):
+        if not self.__data:
+            try:
+                f = open(self.__path,'r')
+                self.__data = f.read()
+                f.close()
+            except IOError, e:
+                if e.errno == 2:
+                    self.reporter.error("Vanishing file! %s" % self.__path)
+                    return None
+
+        return self.__data
+
+    def __set_data(self, value):
+        self.__data = value
+        self.__modified = True
+
+    def __get_modified(self):
+        return self.__modified
+
+    def close(self):
+        '''"Closes" the file.  No file handles are actually retained during
+        the lifespan of the File object.  The close operation simply checks to
+        see if the File object's data has been modified, and if so, write the
+        contents to disk.'''
+
+        if self.__modified:
+            try:
+                f = open(self.__path, 'w')
+                f.write(self.__data)
+                f.close()
+            except IOError, e:
+                self.reporter.error("Unable to write to file %s, aborting!" % self.__path)
+        self.__modified = False
+
+    path = property(__get_path)
+    '''The path of the file represented by this File instance.'''
+
+    data = property(__get_data, __set_data)
+    '''The data contained in the file pointed to by this File object.  This data
+    is only read at the last possible moment.'''
+
+    modified = property(__get_modified)
+    '''If true, then this File object has been modified, and the file it points
+    to will be written to when the File object is closed with a call to
+    close()'''
+
+def get_user_from_path(path):
+    toks = path.split('/')
+    if len(toks) < 3 or toks[1] != 'home':
+        user = None
+    else:
+        user = toks[2]
+    if user:
+        try:
+            getpwnam(user)
+        except KeyError:
+            return None
+    return user
+
+def get_reseller_from_user(user):
+    tuo = open('/etc/trueuserowners', 'r')
+    tuo.readline()
+    reseller = None
+    for luser, lreseller in (line.rstrip().split(': ') for line in tuo.readlines()):
+        if luser == user:
+            reseller = lreseller
+            break
+    tuo.close()
+    return reseller
+
+class Backup(object):
+    '''Manages a backup tarfile in a thread-safe manner.'''
+
+    def __init__( self, directory, tarname='/tmp/autoclean-%d.tar' % getpid()):
+        self.directory = directory
+        self.tarname = tarname
+        self.write_backup = False
+
+        # Creating tar file to facilitate reliable appending.
+        taropen(tarname, 'w').close()
+        chmod(tarname, int("600", 8))
+
+        self.lock = Lock()
+
+    def commit_file(self, file):
+        '''Adds a file to the backup tarfile.  Do this *before* writing any
+        changes to the files you want backed up...'''
+
+        if not file.modified:
+            return
+        self.write_backup = True
+        file_path = file.path
+        if not os.path.exists(file_path):
+            return
+        self.lock.acquire()
+        tarfile = taropen(self.tarname, 'a:')
+        fileobj = open(file_path, 'r')
+        tarinfo = tarfile.gettarinfo( 
+            arcname=file_path[len(self.directory):], # dirty hack
+            fileobj = fileobj
+        )
+        tarfile.addfile(tarinfo, fileobj)
+        tarfile.close()
+        fileobj.close()
+        self.lock.release()
+
+    def finalize(self):
+        '''Gzip the tar file and place it in the user's .security directory.'''
+
+        if not self.write_backup:
+            return
+
+        user = get_user_from_path(self.directory)
+
+        if user:
+            secdir = joinpath('/home', user, '.security')
+        else:
+            secdir = os.getcwd()
+
+        if not os.path.exists(secdir):
+            os.mkdir(secdir)
+        output_path = joinpath(secdir, 'autoclean-%s.tar.gz' % strftime('%m-%d-%y_%H%M%S', localtime()))
+        output = gzipopen(output_path,'wb')
+        input = open(self.tarname,'r')
+        output.write(input.read())
+        output.close()
+        input.close()
+        unlink(self.tarname)
+        chmod(output_path, int("600", 8))
+        
+
+class FilenameGenerator(object):
+    '''Like os.walk, but with name, size, and depth filters, and faster.'''
+
+    def __init__(self, top, maxdepth, filename_filter, omit_dirs, reporter, max_filesize, debug):
+        self.queue = Queue()
+        self.queue.put(top)
+        if maxdepth:
+            self.maxdepth = top.count('/') + maxdepth
+        else:
+            self.maxdepth = 0
+        self.filename_filter = filename_filter
+        self.max_filesize = max_filesize * 1024
+        self.omit_dirs = omit_dirs
+        self.reporter = reporter
+        self.debug = debug
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        while True:
+            try:
+                root = self.queue.get_nowait()
+            except Empty:
+                raise StopIteration
+            if os.path.exists(root):
+                break
+        names = listdir(root)
+        dirs, nondirs = [], []
+        for name in names:
+            path = root + '/' + name
+            try:
+                stat = lstat(path)
+            except OSError:
+                continue
+            if stat_check.S_ISBLK(stat.st_mode):
+               if self.debug:
+                   self.reporter.debug("%s skipped: blockfile" % path)
+               continue
+            if stat_check.S_ISLNK(stat.st_mode):
+                if self.debug:
+                    self.reporter.debug("%s skipped: symlink" % path)
+                continue
+            mode = stat[0]
+            under_maxdepth = \
+                not self.maxdepth or self.maxdepth >= path.count('/')
+            if mode & 32768:
+                if not self.filename_filter.match(path):
+                    if self.debug:
+                        self.reporter.debug("%s skipped: filename_filter" % path)
+                    continue
+                if self.max_filesize:
+                    size = stat[6]
+                    if self.max_filesize < size:
+                        if self.debug:
+                            self.reporter.debug("%s skipped: size" % path)
+                        continue
+                nondirs.append((name, {'atime': stat.st_atime, 'mtime': stat.st_mtime, 'ctime': stat.st_ctime, 'size': stat.st_size}))
+            elif mode & 16384 and under_maxdepth:
+                if any((p.match(path) for p in self.omit_dirs)):
+                    if self.debug:
+                        self.reporter.debug("%s skipped: omit_dirs" % path)
+                    continue
+                dirs.append(name)
+                self.queue.put_nowait(path)
+        return root, dirs, nondirs
+
+class FileGenerator(object):
+    '''Generates File objects found using a FilenameGenerator instance.
+    Instances of this class are threadsafe.'''
+
+    def __init__(self, top, maxdepth, filename_filter, omit_dirs, reporter, max_filesize, debug):
+        self.filename_generator = iter(FilenameGenerator(
+            top, maxdepth, filename_filter, omit_dirs, reporter, max_filesize, debug
+        ))
+        self.root = None
+        self.iterator = iter([])
+        self.lock = Lock()
+        self.reporter = reporter
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        self.lock.acquire()
+        filename = None
+        filestat = None
+        while not filename:
+            try:
+                filename, filestat = self.iterator.next()
+            except StopIteration, e:
+                try:
+                    self.root, dirs, files = self.filename_generator.next()
+                except StopIteration, e:
+                    self.lock.release()
+                    raise StopIteration
+                self.iterator = iter(files)
+        root = self.root # Avoid root swapping.
+        self.lock.release()
+        return File(root + '/' + filename, self.reporter, filestat)
+
+class Statistics(object):
+    def __init__(self):
+        self.matched_patterns = []
+        self.lock = Lock()
+
+    def add(self, pattern):
+        self.lock.acquire()
+        if pattern not in self.matched_patterns:
+            self.matched_patterns.append(pattern)
+        self.lock.release()
+
+    def submit_report(self, path):
+        self.lock.acquire()
+        user = get_user_from_path(path)
+        reseller = get_reseller_from_user(user)
+        hostname = get_hostname();
+        proxy = Proxy("http://192.185.0.113/injection/")
+        try:
+            proxy.insert(hostname, reseller, user, path, [pattern['name'] for pattern in self.matched_patterns])
+        except:
+            print("Failed to report statistics!")
+        self.lock.release()
+
+    def report(self, directory):
+        if len(self.matched_patterns):
+            self.submit_report(directory)
+
+class Reporter(object):
+    '''Thread-safe console output handling for matches and possibly other
+    data.'''
+
+    def __init__(self, verbosity, stat_dump):
+        self.verbosity = verbosity
+        self.lock = Lock()
+        self.errors = []
+        self.stat_dump = stat_dump
+        if stat_dump:
+            self.stats = {}
+
+    def debug(self, message):
+        self.lock.acquire()
+        print(message)
+        self.lock.release()
+
+    def summarize(self):
+        for error in self.errors:
+            print(error)
+        if self.stat_dump:
+            print(json.dumps(self.stats))
+
+    def report(self, file, matches):
+        '''Print out report of matches for a file.'''
+
+        self.lock.acquire()
+        if self.stat_dump:
+            self.stats[file.path] = file.stats
+        if self.verbosity:
+            if self.verbosity >= 1:
+                print(file.path)
+            if self.verbosity == 2:
+                for match in matches:
+                    print('\t%s, (%d, %d)' % (
+                        file.data[match.start():match.end()], 
+                        match.start(), match.end()
+                    ))
+        self.lock.release()
+
+    def error(self, error):
+        self.lock.acquire()
+        self.errors.append(error)
+        self.lock.release()
+
+class Profiler(object):
+    '''Profiles scanners, providing profile output to the list developer.'''
+
+    def __init__(self):
+        self.scanners = {}
+
+    def start(self, scanner):
+        self.scanners.setdefault(scanner, [0.0, 0.0])[1] = time()
+
+    def stop(self, scanner):
+        self.scanners[scanner][0] += time() - self.scanners[scanner][1]
+
+class Scanner(object):
+    '''Scan's File objects using the details defined in the pattern object.'''
+
+    def __init__( self, filename_pattern, ignore_case, ignore_newline, malware_pattern, profiler, reporter, debug):
+
+        #self.__filename_pattern = re.compile( filename_pattern, re.IGNORECASE|re.VERSION0|re.BESTMATCH )
+        self.__filename_pattern = re.compile( filename_pattern, re.IGNORECASE )
+        ignore_case_flag = 0
+        if ignore_case:
+            ignore_case_flag = re.IGNORECASE
+        ignore_newline_flag = 0
+        if ignore_newline:
+            ignore_newline_flag = re.DOTALL
+        try:
+            #self.__malware_pattern = re.compile(malware_pattern, ignore_case_flag | ignore_newline_flag | re.VERSION0 | re.BESTMATCH )
+            self.__malware_pattern = re.compile(malware_pattern, ignore_case_flag | ignore_newline_flag )
+        except re.error, e:
+            print("Error compiling pattern!!!:")
+            print("    %s" % malware_pattern)
+            print(e.args[0])
+        self.profiler = profiler
+        self.reporter = reporter
+        self.debug = debug
+
+    def __get_malware_pattern(self):
+        return self.__malware_pattern
+
+    malware_pattern = property(__get_malware_pattern)
+    
+    def scan(self, file):
+        '''Scan the file object.  Returns a list of matches.'''
+
+        if self.debug:
+            self.reporter.debug("Scanning %s" % file.path)
+            self.reporter.debug("Pattern: %s" % self.__malware_pattern.pattern)
+        if self.profiler:
+            self.profiler.start(self)
+        malware_list = None
+        data = None
+        if not self.__filename_pattern.match(file.path):
+            if self.debug:
+                self.reporter.debug("%s scan abort: filename_pattern" % file.path)
+            malware_list = []
+        else:
+            data = file.data
+        if data is None:
+            malware_list = None
+        else:
+            malware_list = list(self.__malware_pattern.finditer(data))
+            if self.debug:
+                if len(malware_list):
+                    self.reporter.debug("%s found something" % file.path)
+                else:
+                    self.reporter.debug("%s found nothing" % file.path)
+        if self.profiler:
+            self.profiler.stop(self)
+        return malware_list
+
+def sort_matches(matches_ref):
+    matches_vals = matches_ref.keys()
+    matches_dict = {}
+    for match in matches_vals:
+        matches_dict[(match.start(), match.end())] = match
+    matches = sorted(matches_dict.values(), key=lambda m: m.start())
+    for a, b in ((matches[i], matches[i+1]) for i in xrange(len(matches)-1)):
+        if a.end() > b.start():
+            return None, (
+                (matches_ref[a]['scanner'].malware_pattern, a),
+                (matches_ref[b]['scanner'].malware_pattern, b)
+            )
+    return matches, None
+
+class OverlapException(Exception):
+    def __str__(self):
+        file = self[1]
+        a = self[0][0]
+        b = self[0][1]
+        msg = "Overlap exception: %s\n" % file.path
+        msg += "    %s (%d, %d)\n" % (a[0].pattern, a[1].start(), a[1].end())
+        msg += "    %s (%d, %d)\n" % (b[0].pattern, b[1].start(), b[1].end())
+        return msg
+
+def clean_file(file, matches_ref, statistics):
+    matches, overlap = sort_matches(matches_ref)
+    if not matches:
+        raise OverlapException(overlap, file)
+    data = list(file.data)
+    for match in reversed(matches):
+        pattern = matches_ref[match]
+        statistics.add(pattern)
+        l_replacement = []
+        if type(pattern['replacement']) is str:
+            l_replacement = pattern['replacement']
+        if type(pattern['replacement']) is Template:
+            if pattern['targeted']:
+                raise Exception("Cannot target and template!")
+            l_replacement = pattern['replacement'].substitute(match.groupdict())
+        l_replacement = list(l_replacement)
+        if pattern['targeted']:
+            span = match.span('target')
+        else:
+            span = match.span()
+        data[span[0]:span[1]] = l_replacement
+    file.data = ''.join(data)
+
+class Worker(object):
+    def __init__(self):
+        self.running = True
+
+    def __call__(self, file_generator, patterns, reporter, backup, clean_files, statistics):
+        for file in file_generator: 
+            sleep(0)
+            if not self.running:
+                break
+            matches_ref = {}
+            for pattern in patterns:
+                matches = pattern['scanner'].scan(file)
+                if matches is None:
+                    # This happens when the file disappears after the scanner found it.
+                    # We can safely bail out.
+                    continue
+                for match in matches:
+                    matches_ref[match] = pattern
+            if len(matches_ref):
+                reporter.report(file, matches_ref.keys())
+                if clean_files:
+                    try:
+                        clean_file(file, matches_ref, statistics)
+                    except OverlapException, e:
+                        reporter.error(e)
+            if backup:
+                backup.commit_file(file)
+            file.close()
+
+def get_resold_accounts(username):
+    ownerfile = open('/etc/trueuserowners', 'r')
+    lines = ownerfile.readlines()
+    ownerfile.close()
+    users = []
+    for line in lines:
+        if line[0] == '#':
+            continue
+        user, owner = line.rstrip('\n').split(': ')
+        if owner == username:
+            try:
+                getpwnam(user)
+            except KeyError:
+                raise Exception("Invalid user %s found in /etc/trueuserowners" % user)
+            users.append(user)
+    return users
+
+def run(options):
+
+    LIST_PROVIDER_URL="http://scripts.hostgator.com/~sec/nscan/list_provider.cgi"
+
+    omit_dirs = (
+        re.compile('^/home\d*/\w+/mail(?:$|/.*)'),
+        re.compile('^/home\d*/\w+/.cpanel(?:$|/.*)'),
+        re.compile('^/home\d*/\w+/.security(?:$|/.*)'),
+        re.compile('^/home\d*/virtfs(?:$|/.*)'),
+    )
+
+    debug = options.debug
+
+    #Pull the list from the server.
+    list_data = ServerProxy(LIST_PROVIDER_URL).request_list(options.list)
+    if 'error' in list_data:
+        if list_data['error'] == 'SYNTAX_ERROR':
+            print('Syntax error in malware list:\n%s' % list_data['error_info'])
+        elif list_data['error'] == 'INVALID_LIST':
+            print('List %s could not be imported:\n%s' % (options.list, list_data['error_info']))
+        elif list_data['error'] == 'UNKNOWN_ERROR':
+            print('Unknown error fetching list:\n%s' % list_data['error_info'])
+        else:
+            print('Malformed error response.')
+        exit(1)
+
+    if options.dump:
+        print(list_data)
+        sys.exit(0)
+
+    if options.reseller is not None:
+        dir_tpl = Template(options.dir_tpl)
+        users = get_resold_accounts(options.reseller)
+        directories = [dir_tpl.substitute({'USER':user}) for user in users]
+    else:
+        directories = [options.directory]
+
+    if options.report_dirs:
+        print("Scanning the following directories:")
+        for directory in directories:
+            print("    " + directory)
+
+    if options.profile:
+        profiler = Profiler()
+    else:
+        profiler = None
+
+    # Calculate verbosity and setup reporter.
+    verbosity = 2
+    if options.suppress:
+        verbosity = 1
+    if options.quiet:
+        verbosity = 0
+    reporter = Reporter(verbosity, options.stat_dump)
+
+    # Load patterns from list_data.
+    patterns = []
+    for raw_pattern in list_data.get('pattern_list', []):
+        pattern = dict()
+        pattern['name'] = raw_pattern.get('name', False)
+        if not pattern['name']:
+            pattern['name'] = hashlib.md5(raw_pattern['malware_pattern']).hexdigest()
+        pattern['scanner'] = Scanner(
+            raw_pattern.get('filename_pattern', ''),
+            raw_pattern.get('ignore_case', False),
+            raw_pattern.get('ignore_newline', False),
+            raw_pattern.get('malware_pattern', 'a^'),
+            profiler, reporter, debug
+            )
+        replacement = raw_pattern.get('replacement', '')
+        if raw_pattern.get('template_replace', False):
+            replacement = Template(replacement)
+        pattern['replacement'] = replacement
+        pattern['targeted'] = raw_pattern.get('targeted', False)
+        patterns.append(pattern)
+
+
+    for directory in directories:
+        if not options.quiet:
+            print("Scanning %s" % directory)
+
+        # Setup the file generator.
+        file_generator = FileGenerator(
+            directory,
+            options.max_depth,
+            re.compile( 
+                list_data.get('filename_filter',
+                r'.*\.(php|php3|php4|php5|phtml|html|htm|js|css)$')
+            ),
+            omit_dirs,
+            reporter,
+            options.max_size,
+            debug
+        )
+
+        # Setup backup.
+        backup = None
+        if not options.skip_backup and options.clean_files:
+            backup = Backup(directory)
+
+        statistics = Statistics()
+
+        num_workers = options.workers
+        if options.profile:
+            num_workers = 1
+
+        #Spawn the workers, start them, then join them.
+        worker = Worker()
+        threads = [
+            Thread(
+                target=worker,
+                args=(
+                    file_generator,
+                    patterns,
+                    reporter,
+                    backup,
+                    options.clean_files,
+                    statistics
+                )
+            ) for i in xrange(num_workers)
+        ]
+        for thread in threads:
+            thread.start()
+
+        # This is to make sure ctrl+c works and doesn't bork anything.
+        broken = False
+        while True:
+            try:
+                threads_alive = False
+                for thread in threads:
+                    thread.join(1)
+                    if thread.isAlive():
+                        threads_alive = True
+                        break
+                if not threads_alive:
+                    break
+            except KeyboardInterrupt:
+                worker.running = False
+                broken = True
+        if not options.skip_backup and options.clean_files:
+            backup.finalize()
+            if len(statistics.matched_patterns):
+                statistics.report(directory)
+        if broken:
+            break
+
+    reporter.summarize()
+
+    # Produce profiler output.
+    if profiler:
+        for scanner in sorted(profiler.scanners.items(), key=lambda a: a[1][0]):
+            print(scanner[0].malware_pattern.pattern)
+            print("    Elapsed Time: %f" % scanner[1][0])
+            print()
+
+if __name__ == '__main__':
+    from optparse import OptionParser
+
+    # Start parsing command line arguments.
+    parser = OptionParser(
+        usage = 'autoclean [options]',
+        version = 'autoclean 1.2 by Patrick Harrison'
+    )
+    parser.add_option( '-B', '--skip-backup', dest='skip_backup',
+        help='Skip backups.  Only if you kow what you\'re doing.',
+        action='store_true', default=False
+    )
+    parser.add_option( '-c', '--clean-files', dest='clean_files', 
+        help='Clear matched data from files.', action='store_true',
+        default=False
+    )
+    parser.add_option( '-d', '--directory', dest='directory',
+        help='Base directory that search will be performed from. \
+        Default is the current working directory.  If the -r flag is passed,\
+        then this option is ignored.', action='store', type='string', 
+        default=getcwd()
+    )
+    parser.add_option( '-D', '--report-directories', dest='report_dirs',
+        help='Show directories that autoclean will check.', action='store_true',
+        default=False
+    )
+    parser.add_option( '-e', '--debug', dest='debug',
+        help='Debug mode.  You probably don\'t want this...', action='store_true',
+        default=False
+    )
+    parser.add_option( '-l', '--list', dest='list',
+        help='Name of the pattern list to use.', type='string',
+        default='production'
+    )
+    parser.add_option( '-m', '--max-depth', dest='max_depth',
+        help='Maximum directory depth to search.', action='store',
+        type='int', default=0
+    )
+    parser.add_option( '-M', '--directory-template', dest='dir_tpl',
+        help='Directory template for use with the -r option.  Basically $USER \
+        or ${USER} is replaced with the username.', action='store',
+        type='string',default='/home/$USER/public_html'
+    )
+    parser.add_option( '-P', '--profile', dest='profile',
+        help='Profiling mode.  Lots of extra data.  Slow.  You probably don\'t\
+        need or want this.', action='store_true', default=False
+    )
+    parser.add_option( '-q', '--quiet', dest='quiet', help='No output.',
+        action='store_true', default=False
+    )
+    parser.add_option( '-r', '--reseller', dest='reseller',
+        help='Scan all of a reseller\'s accounts.', action='store',
+        type='string', default=None
+    )
+    parser.add_option( '-s', '--suppress-output', dest='suppress',
+        help='Display files containing matches, not the matches themselves.',
+        action='store_true', default=False
+    )
+    parser.add_option( '-S', '--stat-dump', dest='stat_dump',
+        help='Produce dump of relevant stat data at the end, in JSON format.',
+        action='store_true', default=False
+    )
+    parser.add_option( '-u', '--dump', dest='dump', help='Dump the pattern.',
+        action='store_true', default=False
+    )
+    parser.add_option( '-w', '--workers', dest='workers',
+        help='Number of worker threads.  Don\'t touch this.', action='store',
+        type='int', default = 2
+    )
+    parser.add_option( '-z', '--max-size', dest='max_size',
+        help='Maximum filesize to scan, in KB.', action='store', type='int',
+        default=1048576
+    )
+    options, args = parser.parse_args()
+    # End parsing command line arguments.
+
+    if options.profile:
+        print("ENTERING PROFILING MODE IN 5 SECONDS")
+        sleep(5)
+        import profile, pstats
+        profile.run('run(options)', 'autoclean_profile.txt')
+        stats = pstats.Stats('autoclean_profile.txt')
+        stats.sort_stats('time')
+        stats.print_stats()
+        sys.exit(0)
+    else:
+        run(options)
+

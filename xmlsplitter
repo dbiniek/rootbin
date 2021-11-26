@@ -1,0 +1,103 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Scalar::Util qw(looks_like_number);
+
+my $help;
+GetOptions ( "help|h" => \$help );
+
+if($help || ! defined $ARGV[0]){
+    help();
+    exit;
+}
+
+sub help{
+    print <<'EOF';
+Usage:
+xmlsplitter <file> <max-size>
+
+Reads a WordPress xml file and splits it up into seperate files, based on a max-size.
+This value is optional.  By default, the max-size is 100KB.
+
+This script provides output to easily begin the import as long as ${user} and ${wp_path} are specified by the user.
+
+EOF
+    return " ";
+}
+
+my $infile = $ARGV[0];
+my $maxsize = $ARGV[1];
+
+if( ! defined $maxsize ){
+    $maxsize = 100000;
+}
+elsif( ! looks_like_number($maxsize) ){
+    die "Please pass only a number(in KB) for max-size";
+}
+else {
+    $maxsize .= "000";
+}
+
+unless( -f $infile ){
+    die "$infile not found\n";
+}
+
+open(my $xmlfile, '<', $infile)
+    or die "Could not open file $infile $!";
+
+#Gets and assigns the initial portion of the xml file up to the first item
+my $import_head;
+while(my $line = <$xmlfile>){
+    chomp $line;
+    if( $line =~ /^\s*?<item>\s*?$/ ){
+        last;
+    }
+    $import_head .= "$line\n";
+}
+
+my $size = length $import_head;
+if( $size >= $maxsize){
+    die "Required import head(tags,authors,etc.) is ${size}, greater than ${maxsize}, failing out to avoid infinite loop\nIncrease max-size or import manually";
+}
+
+my $base_filename = $infile;
+$base_filename =~ s/\.xml$//;
+my $dir_name = "${base_filename}_split";
+if( -d $dir_name ){
+    close $xmlfile;
+    die "Split directory, ${dir_name}, exists, please ensure this hasn't already been run"; 
+}
+mkdir $dir_name;
+my $file_increment = 1;
+
+my $outfile = "${dir_name}/${base_filename}_${file_increment}.xml";
+open(my $outfile_handle, '>', $outfile);
+print $outfile_handle $import_head;
+
+while(my $line = <$xmlfile>){
+
+    if($line =~ /^\s*?<item>\s*?$/ && $size >= $maxsize){
+            #Close the tags opened for each file
+            print $outfile_handle "</channel>\n</rss>\n";
+            close $outfile_handle;
+
+            $file_increment++;
+            $outfile = "${dir_name}/${base_filename}_${file_increment}.xml";
+
+            open($outfile_handle, '>', $outfile);
+            print $outfile_handle $import_head;
+            $size = length $import_head;
+    }
+    print $outfile_handle $line;
+    $size += length $line;
+
+}
+
+close $outfile_handle;
+
+print "Split complete. You can start the import like so:\n";
+print "chown -R \${user}. ${dir_name}\nmv ${dir_name} ~\${user}/\nsu \${user}\n";
+print "for file in \$(\\ls ${dir_name}/*xml);do wp import \$file --authors=create --path=\${wp_path};done | tee -a xmlimport.log\n";

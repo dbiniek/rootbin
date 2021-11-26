@@ -1,0 +1,92 @@
+#!/usr/bin/env perl
+###########
+# splitsql
+# Splits a large database dump file, into individual tables' sql files.
+# https://confluence.endurance.com/display/HGS2/MyImport
+# https://stash.endurance.com/projects/HGADMIN/repos/myimport/browse
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+#
+
+use 5.8.8;
+use strict;
+use Tie::File;
+use Fcntl 'O_RDONLY';
+use Getopt::Long qw (:config pass_through);
+
+my $header;
+my $outf;
+my $table;
+my $reading_header = 1;
+my $unextend;
+my $help;
+
+GetOptions('unextend|u' => \$unextend, 'help|h' => \$help);
+
+if (!-f $ARGV[0] or $help) {
+	print "Usage: splitsql <sql filename>\n";
+	print "Additional functionality currently available:\n";
+	print "\t--unextend, -u    - Breaks the 'insert' statements into individual record inserts.\n";
+	print "\t                    Useful for breaking 'vBulletin'-style database dumps that have large insert statments that cause imports to fail due to timeout limits.\n";
+	print "\t--help, -h        - Prints this help message.\n";
+	exit (1);
+}
+
+tie my @lines, 'Tie::File', "$ARGV[0]", autochomp => 0, mode => O_RDONLY;
+
+my $hasdk = 0;
+my $putdk = 0;
+my $nexttable = 1; #Flag that says whether or not to be on the lookout for the next table.
+foreach my $line (@lines) {
+	if ($nexttable) {
+		if ($line =~ /(Table structure for table|DROP TABLE IF EXISTS|CREATE TABLE) [`]?(\w+)[`]?/i) {
+			$reading_header = 0;
+			$table = $2;
+
+			open($outf, '>', "${table}.sql") or die "Unable to open output file for table ${table}\n";
+			print "Processing table: ${table} -> ${table}.sql\n";
+			print $outf $header;
+			print $outf "\n";
+			$nexttable = 0; # Stop looking for new lines that indicate a new table until the next INSERT.
+		}
+	}
+	if ($reading_header) {
+		$header .= $line;
+	} else {
+		if ($line =~ /ALTER TABLE \`$table\`/){
+			$hasdk = 1;
+			$putdk = 0;
+		}
+
+		if (not $hasdk and $line =~ m/INSERT INTO \`$table\`/) {
+			print $outf "/*!40000 ALTER TABLE `$table` DISABLE KEYS */;\n";
+			$putdk = 1;
+			$hasdk = 1;
+		}
+		if ($putdk) {
+			if ($line =~ /^\s*$/ or $line =~ /^UNLOCK TABLES/) {
+				print $outf "/*!40000 ALTER TABLE `$table` ENABLE KEYS */;\n";
+				$putdk = 0;
+				$hasdk = 0;
+			}
+		}
+		if ($line =~ /CREATE TABLE/i) {
+			$nexttable = 1; # Now that we're at an INSERT statement, reset flag to continue looking
+					# for the next table.
+		}
+		if ($unextend and $line =~ m/^INSERT INTO [`]?$table[`]?.*VALUES/) {
+			my ($start, $values) = split (/VALUES\s/, $line, 2);
+			my @values = split (/\)(?:(?=,\(|;$))/, $values);
+			foreach (@values) {
+				$_ =~ s/^,|;//;
+				if ($_ !~ /^\s*$/) {
+					print $outf "${start}VALUES $_);\n";
+				}
+			}
+		} else {
+			print $outf $line;
+		}
+	}
+}

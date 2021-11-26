@@ -1,0 +1,23 @@
+--- phpize.orig 2014-06-05 08:13:08.000000000 -0500
++++ phpize  2014-06-06 06:59:53.000000000 -0500
+@@ -162,6 +162,11 @@
+   $PHP_AUTOHEADER || exit 1
+ }
+ 
++phpize_fix_configure()
++{
++ $SED -i "s#PHP_PHP_CONFIG=php-config#PHP_PHP_CONFIG=$prefix/bin/php-config#" configure
++}
++
+ # Main script
+ 
+ case "$1" in 
+@@ -203,6 +208,8 @@
+      phpize_check_autotools
+ 
+      phpize_autotools
++
++     phpize_fix_configure
+      ;;
+ esac
+

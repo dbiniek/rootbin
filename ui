@@ -1,0 +1,1638 @@
+#!/usr/bin/perl -w
+#################################################################
+# ui.pl - Michael Karr
+# This script provides a quick display of relevant account information.
+#
+# Git: http://git.toolbox.hostgator.com/ui
+# Wiki: https://gatorwiki.hostgator.com/Admin/UI
+# 
+# Please submit all bug reports at http://bugs.hostgator.com
+#
+# (c) 2012 - HostGator.com, LLC.
+#################################################################
+
+{ # start main package
+package UI;
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Date::Format;
+use Cwd;
+
+# package globals
+
+my %args;
+
+# warning thresholds
+
+my %warn = (
+    domains => 100,
+    inodes => 100000,
+    disk => 20480, # 20 GiB, in MiB
+    catchall => 1,
+    cpu_perc => 25,
+    mem_perc => 5,
+    no_procs => 25,
+);
+
+# start main routine
+
+sub main {   
+    Getopt::Long::Configure ("bundling");
+    
+    GetOptions (
+        'billing|b' => \$args{show_billing},
+        'usage|u|help|h|z|?' => \$args{usage},
+        'json|j' => \$args{json},
+        'env|e' => \$args{env},
+        'debug|d' => \$args{debug},
+        'list|l' => \$args{list},
+        'temp|tempurl|t' => \$args{show_tempurl},
+        'nameserver|ns|n' => \$args{show_ns},
+        'ssl|s' => \$args{show_ssl},
+    );
+    
+    my $ui = undef;
+    my $arg = undef;
+
+    if ($args{usage}) {
+        usage();
+        exit 0;
+    } elsif ($ARGV[0]) {
+        if ($ARGV[0] eq '.') {
+            $arg = get_user_from_cwd();
+        } else {
+            $arg = UI::Utility::normalize($ARGV[0]);
+        }
+    } else {
+        print STDERR "Warning: No argument given, attempting to detect from CWD.\n";
+        $arg = get_user_from_cwd();
+    }
+
+    if($arg) {
+        if (-e '/etc/psa/.psa.shadow') { # plesk
+            $ui = UI::Plesk::UserInfo->new($arg)
+        } else { # cpanel
+            $ui = UI::cPanel::UserInfo->new($arg)
+        }
+
+        if ($ui) {
+            if ($args{json}) {
+                json_output($ui);
+            } elsif ($args{env}) {
+                env_output($ui);
+            } else {
+                console_display($ui);
+            }
+        } else {
+            print STDERR "Error: Unknown argument or user/domain does not exist.\n";
+            exit 1;
+        }
+    } else {
+        print STDERR "Error: Could not detect valid argument or none provided.\n";
+        exit 1;
+    }
+    
+    exit 0;
+}
+
+# end main routine
+
+sub usage {
+    print "Usage:\n\n";
+    print "$0 (username|domain) [options]\n\n";
+    print "Options:\n\n";
+    print "--usage, -u : Display this help message.\n";
+    print "--debug, -d : Debug mode. All gathered info and warnings will display.\n";    
+    print "--billing, -b : Show billing link.\n";
+    print "--temp, -t : Show temp URL.\n";
+    print "--nameserver, -n : Show nameservers.\n";
+    print "--ssl, -s : Show SSL cert data.\n";
+    print "--list, -l : Display list of addon/subdomains for user.\n";
+    print "--json, -j : Output in JSON.\n";
+    print "--env, -e : Output 'export' lines that can eval'd with BASH.\n";
+    print "\n";
+}
+
+sub console_display {
+    my ($ui) = @_;
+    
+    print "\n";
+    
+    display('Reference', 'ui');
+    display('Server', $ui->host);
+    display('Brand', $ui->_determine_brand($ui->{'host'}));
+    display('Srv. Type', $ui->server_type);
+    display('Created', ($ui->time_created ? time2str("%a %b %e %T %Y", $ui->time_created) : 'n/a'));
+    display('Acct Type', $ui->acct_type);
+    display('Plan', $ui->plan);
+    
+    if ($ui->domain) {
+        display('Domain', $ui->domain);
+    }
+    
+    display('User', $ui->user);
+    
+    if ($ui->sys_user) {
+         display('Sys User', $ui->sys_user);
+    }
+    
+    display('U. Domain', $ui->primary_domain);
+    
+    if ($ui->owner_ui) {
+        display('Owner', $ui->owner);
+        display('O. Domain', $ui->owner_ui->primary_domain);
+    }
+    
+    if ($ui->owner_ui) {
+        display('Email', (length($ui->owner_ui->contact_email) > 0 ? $ui->owner_ui->contact_email : 'n/a').'  (reseller)');
+    } else {
+        display('Email', (length($ui->contact_email) > 0 ? $ui->contact_email : 'n/a'));
+    }
+    
+    display('IP', $ui->ip." (".$ui->ip_type.")");
+    
+    print "\n";
+    
+    display('Doc Root', $ui->documentroot);
+    
+    if (!($ui->shell =~ /noshell|false|n\/a/) || $args{debug}) {
+        display('Shell', $ui->shell);
+    }
+    
+    if ($args{show_billing} || $args{debug}) {
+        my $billing_url = (-d '/etc/hgseo') ? 'admin.seohosting.com' : 'gbadmin.hostgator.com'; # are we SEO?
+        
+        if (!($ui->acct_type =~ /Shared|Reseller|Admin/) && ($ui->owner_ui)) {
+            display('Billing', 'https://'.$billing_url.'/search_final/domain/_'.$ui->owner_ui->primary_domain);
+        } else {
+            display('Billing', 'https://'.$billing_url.'/search_final/domain/_'.$ui->primary_domain);
+        }        
+    }
+    
+    if ($args{show_tempurl} || $args{debug}) {
+        display('Temp URL', $ui->tempurl);
+    }
+    
+    if (($args{show_ssl} || $args{debug}) && $ui->ssl) {
+        print "\n";
+        
+        display('SSL Expires', time2str("%a %b %e %T %Y", $ui->ssl->{notafterepoch}));
+    }
+        
+    if ($args{show_ns} || $args{debug}) {
+        print "\n";
+        
+        display('NS1', $ui->ns1);
+        display('NS2', $ui->ns2);
+    }
+    
+    if ($args{list} || $args{debug}) {
+        print "\n" if scalar(@{$ui->parked_domains});
+        
+        for my $sub (sort {$a cmp $b} @{$ui->parked_domains}) {
+            display('Parked', $sub);
+        }
+
+        print "\n" if scalar(@{$ui->addon_domains});
+        
+        for my $addon (sort {$a cmp $b} @{$ui->addon_domains}) {
+            display('Addon', $addon);
+        }
+        
+        print "\n" if scalar(@{$ui->sub_domains});
+        
+        for my $sub (sort {$a cmp $b} @{$ui->sub_domains}) {
+            display('Sub', $sub);
+        }
+    }
+    
+    print "\n";
+    
+    if ($ui->suspended) {
+        if ($ui->owner_ui) {
+            display('Suspended', $ui->user.': '.$ui->suspended.' ('.time2str("%Y-%m-%d %T", $ui->suspended_time).')');
+            
+            if ($ui->owner_ui && $ui->owner_ui->suspended) {
+                display('Suspended', $ui->owner_ui->user.': '.$ui->owner_ui->suspended.' ('.time2str("%Y-%m-%d %T", $ui->owner_ui->suspended_time).')');
+            }
+        } else {
+            display('Suspended', $ui->suspended.' ('.time2str("%Y-%m-%d %T", $ui->suspended_time).')');
+        }
+    }
+
+    if ($ui->apache_disable) {
+        chomp(my $ticket = UI::cPanel::UserInfo->_get_disable_ticket($ui->user, 'apache'));
+        display('Disable', "All sites for this user have been disabled in apache. See $ticket");
+    }
+
+    if ($ui->exim_disable) {
+        chomp(my $ticket = UI::cPanel::UserInfo->_get_disable_ticket($ui->user, 'exim'));
+        display('Disabled', "All e-mail accounts for this user have been disabled in exim. See $ticket");
+    }
+	
+	if ($ui->script_disable) {
+		chomp(my $ticket = UI::cPanel::UserInfo->_get_disable_ticket($ui->user, 'script'));
+		display('Disabled', "All script generated email from this user has been disabled in exim. See $ticket");
+	}
+
+    if ($ui->server_disable) {
+        chomp(my $ticket = UI::cPanel::UserInfo->_get_disable_ticket($ui->user, 'server'));
+        display('Disabled', "This server has been disabled. See $ticket");
+    }
+    if ($ui->pwrestrict_disable) {
+	chomp(my $ticket = UI::cPanel::UserInfo->_get_disable_ticket($ui->user, 'pwrestrict'));
+	display('Disable', "This user has had some sites disabled with http authentication. See $ticket");
+    }
+    if($ui->quarantined($ui->user)){
+        display('Malware', "Most recent quarantined content: ".$ui->quarantined);
+    }
+
+    # various warnings that may or not may display
+
+    warning('Res Privs', 'Account appears to have reseller privledges on a shared server.',
+            (($ui->reseller_privs) && ($ui->host =~ /\.(hostgator\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear)\.com)$/)));
+    
+    warning('No Owner', 'Account appears to be resold, but the reseller ('.$ui->owner.') is not present.',
+            (($ui->acct_type eq "Resold") && (!$ui->owner_ui)));
+    
+    warning('Bad Owner', 'Account is shared, but owner ('.$ui->owner.') is not root.',
+            (($ui->acct_type eq "Shared") && (($ui->owner ne 'root') && ($ui->owner ne 'admin'))));
+    
+    warning('Bad Pack', 'Account is on shared server, but package is set to "'.$ui->plan.'".',
+            (($ui->host =~ /hostgator\.(com)$/) && !($ui->plan =~ /Baby\sCroc|Business|Hatchling/)) || # USA Shared Packages
+            (($ui->host =~ /hostgator\.(com\.br)/) && !($ui->plan =~ /[GMP]\d{0,2}/))); # Brazil Shared Packages
+    
+    warning('Domains', $ui->no_domains, ($ui->no_domains > $warn{domains}), 1);
+    warning('CPU Usage', $ui->cpu_usage.'%', ($ui->cpu_usage > $warn{cpu_perc}), 1);
+    warning('MEM Usage', $ui->mem_usage.'%', ($ui->mem_usage > $warn{mem_perc}), 1);
+    warning('Processes', $ui->no_procs, ($ui->no_procs >= $warn{no_procs}), 1);
+    
+    my $diskspace = UI::Utility::key_total($ui->quotas, 'curspace');
+    warning('Diskspace', int ($diskspace/1024).' MiB', (int ($diskspace/1024) > $warn{disk}), 1);
+    my $inodes = UI::Utility::key_total($ui->quotas, 'curinodes');
+    warning('Inodes', $inodes, ($inodes > $warn{inodes}), 1);
+    
+    for my $quota (@{$ui->quotas}) {        
+        warning('Quota', 'User exceeds space quota on \''.$quota->{mount}.'\'', ($quota->{bhardlimit} > 0) && ($quota->{curspace} >= $quota->{bhardlimit}));
+        warning('Quota', 'User exceeds inode quota on \''.$quota->{mount}.'\'', ($quota->{ihardlimit} > 0) && ($quota->{curinodes} >= $quota->{ihardlimit}));
+    }
+    
+    warning('Catchalls', $ui->catchalls, ($ui->catchalls >= $warn{catchall}), 1);
+    
+    warning('LimitPHP', 'Limit file exists.', ($ui->shm_limit));
+    warning('Includes', 'Additional Apache includes exist.', ($ui->apache_includes));
+    warning('MySQL', 'MySQL user present in ban file.', ($ui->mysql_banned));
+    warning('MySQL', 'MySQL user is restricted.', ($ui->mysql_restricted));
+    
+    warning('Bulk', 'User is present in the bulk mail whitelist.', (scalar(@{$ui->bulkwhitelist})));
+    warning('Spam', 'User is present in the spam mail whitelist.', (scalar(@{$ui->spamwhitelist})));
+    warning('SMTP', 'User is present in the SMTP whitelist.', (scalar(@{$ui->smtpwhitelist})));
+
+    if ($ui->ssl) {
+        if ($ui->ssl->{error}) {
+            warning('SSL', 'SSL error: '.$ui->ssl->{error}, 1)
+        } elsif (time > ($ui->ssl->{notafterepoch}) || (time < ($ui->ssl->{notbeforeepoch}))) {
+            warning('SSL', 'SSL error: certificate for domain "'.($ui->domain ? $ui->domain : $ui->primary_domain).'" is expired.', 1);
+        }
+    }
+    
+    my @a_dom = (
+        $ui->primary_domain,
+        @{$ui->sub_domains},
+        @{$ui->addon_domains},
+        @{$ui->parked_domains}
+    );
+
+    foreach my $c_dom ( @a_dom ) {
+        warning('Varnish', "$c_dom is cached.", (_domain_is_cached($c_dom)));
+    }
+
+    foreach my $phish ( @{$ui->phished} ) {
+        warning('Phish', $phish->{domain}." marked as phishing and blocked at ".localtime($phish->{added}), 1);
+    }
+
+    print "\n";
+}
+
+sub display {
+    my ($title, $value) = @_;
+    
+    printf "%9s: %s\n", $title, $value;
+
+}
+
+sub warning {
+    my ($title, $value, $test, $debuggable) = @_;
+    
+    if ($test || ($args{debug} && $debuggable)) {
+        display($title, $value.' (warning)');
+    }
+}
+
+sub json_output {
+    my ($ui) = @_;
+    
+    if (eval { require JSON }) {
+        JSON->import(-convert_blessed_universally);
+        print(JSON->new->allow_blessed->convert_blessed->encode($ui)."\n");
+    } else {
+        print "Error: Perl module 'JSON' not found. Please install to get JSON output.\n";
+    }
+}
+
+sub env_output {
+    my ($ui) = @_;
+    
+    print "UI_MY_DOMAIN=\"".$ui->primary_domain."\"\n";
+    print "UI_MY_USERNAME=\"".$ui->user."\"\n";
+    
+    if ($ui->owner) {
+        print "UI_MY_OWNER=\"".$ui->owner."\"\n";
+    }
+    
+    print "UI_MY_EMAIL=\"".$ui->contact_email."\"\n";
+    print "UI_MY_DOCROOT=\"".$ui->documentroot."\"\n";
+}
+
+sub get_user_from_cwd {
+    if (cwd() =~ /\/var\/www\/vhosts\/([^\/]*)\/?/) { # plesk
+        return $1;
+    } elsif (cwd() =~ /\/home[0-9]?\/([^\/]*)\/?/) { # cpanel
+        return $1;
+    } else {
+        return undef;
+    }
+}
+
+sub _domain_is_cached {
+    my $domain = shift;
+    return if ( ! defined $domain );
+    return -f "/etc/proxy_conf/$domain";
+}
+
+__PACKAGE__->main unless caller; # call main function unless we were included as module
+
+1;    
+} # end main package
+
+
+BEGIN { # start class UI::cPanel::UserInfo
+package UI::cPanel::UserInfo;
+
+use strict;
+use warnings;
+
+# libraries;
+
+use Carp;
+
+use File::stat;
+use DBI;
+use Date::Parse;
+use Sys::Hostname;
+use LWP::UserAgent;
+
+# package specific modules
+
+my %package_modules = (
+    'YAML::Syck' => qw(LoadFile),
+    'LWP::Simple' => qw(get),
+    'Net::Domain' => qw(hostdomain),
+);
+
+# global package variables
+
+my ($u2d_ref, $d2u_ref);
+my $resellers_ref;;
+
+# constructor
+
+sub new {
+    _initialize(); # make required imports, load support data
+    
+    my($class, $arg, $no_recur) = @_;
+    my %self;
+    
+    $self{server_type} = 'cpanel';
+    $self{host} = $self{shorthost} = hostname;
+    $self{shorthost} =~ s/^([^\.]*)\..*$/$1/;
+
+    if ($d2u_ref->{$arg}) {
+        $self{domain} = $arg;
+        $self{user} = $d2u_ref->{$self{domain}};
+    } elsif ($u2d_ref->{$arg}) {
+        $self{user} = $arg;
+    } else {
+        return undef; # not a valid user
+    }
+
+    # cpuser file handling stuff
+    
+    my $cpuser_ref = _loadcpuser($self{user});
+    
+    $self{primary_domain} = $cpuser_ref->{domain};
+    $self{owner} = $cpuser_ref->{owner};
+    
+    $self{phished} = [];
+    eval { # suppress errors
+        local $SIG{'__WARN__'} = sub { }; # suppress warnings too
+        my $p_dbh = DBI->connect("dbi:SQLite:dbname=/opt/eig_linux/etc/marked_phishing_domains.sqlite", undef, undef, { RaiseError => 1, ReadOnly => 1 });
+        $self{phished} = $p_dbh->selectall_arrayref("SELECT * FROM domains WHERE user=?", { Slice => {} }, $self{user});
+        $p_dbh->disconnect();
+    };
+    
+    if (($self{owner} ne $self{user}) && ($self{owner} ne 'root') && (!$no_recur)) {
+        $self{owner_ui} = (UI::cPanel::UserInfo->new($self{owner}, 1));
+
+    } else {
+        $self{owner_ui} = (undef);
+    }
+    
+    $self{plan} = $cpuser_ref->{plan};
+    $self{ip} = $cpuser_ref->{ip};
+    
+    my $domain_ips = _get_domain_ips();
+    # my $reserved_ips = _get_reserved_ips();
+    # my $ip_pool = _get_ip_pool();
+
+    if (exists($domain_ips->{$self{ip}})) {
+        $self{ip_type} = 'dedicated';
+    } else {
+        $self{ip_type} = 'shared';
+    }
+
+    $self{time_created} = _creationdate($self{user});
+    $self{contact_email} = $cpuser_ref->{contactemail};
+    $self{no_domains} = (scalar(@{$cpuser_ref->{domains}}) + 1);
+    
+    # data gathered from the userdata
+    
+    my ($userdata_ref, $maindata_ref, $userdata_ssl_ref) = $self{domain} ? _loaduserdata($self{user}, $self{domain}) : _loaduserdata($self{user}, $self{primary_domain});
+    
+    if ($userdata_ref) {
+        $self{documentroot} = $userdata_ref->{documentroot};
+    }
+    
+    if ($maindata_ref) {
+        @{$self{addon_domains}} = ref($maindata_ref->{addon_domains}) eq 'HASH' ? keys %{$maindata_ref->{addon_domains}} : ();
+        $self{sub_domains} = ref($maindata_ref->{sub_domains}) eq 'ARRAY' ? $maindata_ref->{sub_domains} : [];
+        $self{parked_domains} = ref($maindata_ref->{parked_domains}) eq 'ARRAY' ? $maindata_ref->{parked_domains} : [];
+    }
+    
+    # ssl
+    
+    if ($userdata_ssl_ref) {
+        if (-f $userdata_ssl_ref->{sslcertificatefile}) {
+            my $ssl_data = _get_ssl_data($userdata_ssl_ref->{sslcertificatefile});
+            if (keys %{$ssl_data}) {
+                $self{ssl} = $ssl_data;
+            } else {
+                $self{ssl} = { error => 'bad configuration' };
+            }
+        } else {
+            $self{ssl} =  { error => 'missing certificate' };
+        }
+    } else {
+        $self{ssl} = undef;
+    }
+    
+    # data gathered from other sources
+    
+    my $ptable_ref = _proc_table($self{user});
+    $self{mem_usage} = UI::Utility::key_total($ptable_ref, 'percent_mem');
+    $self{cpu_usage} = UI::Utility::key_total($ptable_ref, 'percent_cpu');    
+    $self{no_procs} = scalar(@{$ptable_ref});
+    
+    $self{quotas} = UI::Utility::quota($self{user});
+    
+    ($self{suspended}, $self{suspended_time}) = _suspended($self{user});
+    $self{apache_disable} = _apache_disable($self{user});
+    $self{exim_disable} = _exim_disable($self{user});
+	$self{script_disable} = _script_disable($self{user});
+    $self{server_disable} = _server_disable();
+    $self{pwrestrict_disable} = _pwrestrict_disable($self{user});
+    $self{catchalls} = _catchalls($self{user});
+    $self{shm_limit} = _shm_limit($self{user});
+    
+    if ($self{owner} eq $self{user}) {
+        if (exists($resellers_ref->{$self{user}})) {
+            $self{acct_type} = 'Reseller';
+        } else {
+            $self{acct_type} = 'Shared';
+        }
+    } else {
+        if ($self{owner} eq 'root') {
+            $self{acct_type} = 'Shared';
+        } else {
+            $self{acct_type} = 'Resold';
+        }
+    }
+    
+    if (exists($resellers_ref->{$self{user}})) {
+         $self{reseller_privs} = 1;
+    }
+    
+    $self{shell} = _getshell($self{user});
+    $self{apache_includes} = _apache_includes($self{user});
+    $self{mysql_banned} = _mysql_banned($self{user});
+    $self{mysql_restricted} = _mysql_restricted($self{user});
+    $self{tempurl} = 'http://'.$self{host}.'/~'.$self{user}.'/';
+    
+    my $wwwacct = _get_wwwacct_conf();
+    $self{ns1} = exists $wwwacct->{ns} ? $wwwacct->{ns} : 'n/a';
+    $self{ns2} = exists $wwwacct->{ns2} ? $wwwacct->{ns2} : 'n/a';
+    
+    $self{bulkwhitelist} = _whitelisted(\%self, '/etc/bulkwhitelist');
+    $self{spamwhitelist} = _whitelisted(\%self, '/etc/spamwhitelist');
+
+    $self{smtpwhitelist} = _smtp_whitelist($self{user});
+
+    $self{quarantined} = _quarantined($self{user});
+
+    bless(\%self, $class);
+    return \%self;
+}
+
+# generate accessors
+
+no strict;
+
+for my $i (qw(user domain primary_domain owner owner_ui plan ip time_created
+              contact_email suspended no_domains acct_type mem_usage cpu_usage
+              quotas catchalls shm_limit documentroot suspended_time
+              shell apache_includes mysql_banned mysql_restricted addon_domains
+              sub_domains reseller_privs ssl server_type host shorthost tempurl
+              ns1 ns2 sys_user no_procs ip_type bulkwhitelist spamwhitelist
+              parked_domains smtpwhitelist apache_disable exim_disable server_disable pwrestrict_disable 
+			  script_disable determin_brand quarantined phished )) {
+    
+    *{"$i"} = sub {
+        my $self = shift;
+        return $self->{$i};
+    };
+}
+
+
+use strict;
+
+# initialization
+
+sub _initialize {
+    # import package-specific modules
+    
+    for my $module (keys %package_modules) {
+        my $ex_module = $module; $ex_module =~ s#::#/#g;
+        eval { require $ex_module.'.pm' } or croak "$@";
+        eval $module.'->import($package_modules{$module})';
+    }
+    
+    # initialize global variables
+    
+    ($u2d_ref, $d2u_ref) = _loaduserdomains();
+    $resellers_ref = _loadresellers();
+}
+
+# private methods
+
+sub _suspended {
+    my $user      = shift;
+    my $susp_file = '/var/cpanel/suspended/' . $user;
+    my $user_file = '/var/cpanel/users/' . $user;
+
+    if ( -e $susp_file ) {
+        my $susp_time;
+        open( my $fh, '<', $susp_file ) or croak;
+        my $reason = <$fh>;
+        close $fh;
+
+        if ( !defined($reason) ) {
+            $reason = "No Reason Given";
+        }
+
+        if ( -e $user_file ) {
+            open( my $fh, '<', $user_file ) or croak;
+            while ( my $user_line = <$fh> ) {
+                if ( $user_line =~ /SUSPENDTIME=(\d+)/ ) {
+                    $susp_time = $1;
+                    last;
+                }
+            }
+            close $fh;
+        }
+
+        return ( $reason, $susp_time );
+    }
+    else {
+        return ( undef, undef );
+    }
+}
+
+sub _apache_disable {
+    my $user = shift;
+    my $file = '/opt/eig_linux/var/suspended/' . $user;
+    if ( -e $file ) {
+        return(1);
+    } else {
+        return(0);
+    }
+}
+
+sub _exim_disable {
+    my $user = shift;
+    my $file = '/etc/eximdisabledusers';
+    open(my $fh, '<', $file) or return(0);
+    my @current = <$fh>;
+    close($fh);
+    if ( grep(/^$user$/, @current) ) {
+        return(1);
+    } else {
+        return(0);
+    }
+}
+
+sub _server_disable { 
+    if ( -f '/root/.lockdown' ) {
+        return(1);
+    } else {
+        return(0);
+    }
+}
+
+sub _script_disable {
+	my $user = shift;
+	if ( -f '/opt/eig_linux/var/script_mail_suspended/' . $user ) {
+		return(1);
+	} else {
+		return(0);
+	}
+}
+
+sub _pwrestrict_disable {
+	my $user = shift;
+	if ( -f "/root/.lockdown-$user" ) {
+		return(1);
+	} elsif ( -f "/opt/eig_linux/var/pwrestrict/$user" ) {
+		return(1);
+	} else {
+		return(0);
+	}
+}
+
+sub _determine_brand {
+	my $self = shift;
+	my $hostname = shift;
+	my $brand;
+	my %hostnames = (
+		'hostgator.com' => 'hostgator',
+		'websitewelcome.com' => 'hostgator',
+		'unifiedlayer.com' => 'bluehost',
+		'hostgator.com.br' => 'hostgator_br',
+		'prodns.com.br' => 'hostgator_br',
+		'hostgator.in' => 'hostgator_in',
+		'websitedns.in' => 'hostgator_in',
+		'arvixeshared.com' => 'arvixe',
+		'arvixe.com' => 'arvixe',
+		'accountservergroup.com' => 'site5',
+		'webserversystems.com' => 'site5',
+		'asoshared.com' => 'asmallorange',
+		'asmallorange.com' => 'asmallorange',
+		'seoboxes.com' => 'seohosting',
+		'mysitehosted.com' => 'arvixe',
+		'myserverhosts.com' => 'host9',
+	);
+	if ( $hostnames{hostdomain($hostname)} ) {
+		return($hostnames{hostdomain($hostname)});
+	}
+    
+	$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+	my $ua = LWP::UserAgent->new();
+	$ua->timeout(2);
+	my $req = HTTP::Request->new( GET => 'https://eigid.endurance.com/lookup.php' );
+	$req->header('Content-Type' => 'text/plain');
+	$req->header('X-Auth-Token' => 'DLA5R5dg4GkSn9DuLhGikfdgazN3nnTAD3tcUFVpwATVlHFvNjpHoO0Pa90it7K5cxsgvcPsVDwQDPjuM8NlEslD7hi22V5FDd43hlfwrea13pobVwLqGF1215bBcCU3');
+	$req->header('Hostname' => $hostname);
+	my $response = $ua->request($req);
+	if ( $response->is_success ) {
+		chomp($brand = $response->content);
+		$brand =~ s/\s+//g;
+		if ( $brand ne 'Unknown' ) {
+			return($brand);
+		}
+	}
+	
+	if ( $brand = get('http://custapi.unifiedlayer.com/servbrand') ) {
+		if (( $brand =~ /Failed/ ) || ( $brand =~ /No server found/ )) {
+			$brand = 'Could not reliably determine brand';
+		}
+		return($brand);
+	}
+
+	return('Could not determine brand');
+}
+	
+sub _quarantined {
+    my $user = shift;
+    my $dir = '/home/'.$user.'/.security';
+    my @files;
+    if(-d "$dir"){
+        opendir(my $dh, "$dir");
+        while(defined(my $file = readdir($dh))){
+            next if(!($file =~ /^amc_archive\.\d+$/));
+            my $path = Cwd::abs_path($dir).'/'.$file;
+            next unless(-d $path);
+            push(@files, [stat($path)->[9], $path]);
+        }
+        closedir($dh);
+        if(scalar(@files)>0){
+            my @files = sort { $b->[0] <=> $a->[0] } @files ;
+            return localtime($files[0][0]);
+        }
+    }
+}
+
+sub _get_disable_ticket {
+    shift;
+    my $user = shift;
+    my $type = shift;
+    my $file;
+    if ( $type eq 'apache' ) {
+        $file = "/opt/eig_linux/var/suspended/$user";
+    } elsif ( $type eq 'exim' ) {
+        $file = "/opt/eig_linux/var/exim_suspended/$user";
+    } elsif ( $type eq 'server' ) {
+        $file = '/root/.lockdown';
+    } elsif ( $type eq 'pwrestrict' ) {
+	if ( -f "/opt/eig_linux/var/pwrestrict/$user" ) {
+	    $file = "/opt/eig_linux/var/pwrestrict/$user";
+	} else {
+	    $file = "/root/.lockdown-$user";
+	}
+    } elsif ( $type eq 'script' ) {
+		$file = "/opt/eig_linux/var/script_mail_suspended/$user";
+	}
+    if ( ! -f $file ) {
+        return('abusetool or lockdown');
+    }
+    open(my $DAT, '<', $file) or return('abusetool');
+        my $ticket = <$DAT> || 'abusetool or lockdown';
+    close($DAT);
+    return($ticket);
+}
+
+sub _proc_table {
+    my $user = shift;
+    my $pattern = '^\s*(\d+)\s+('.$user.')\s+([^\s]*)\s+([^\s]*)\s+(.*?)$';
+    
+    my @ptable;
+    
+    for my $psline (`ps ax -o pid,user,%cpu,%mem,command --no-header`) {
+        if ($psline =~ /$pattern/) {
+            push (@ptable, {
+                pid => $1,
+                percent_cpu => $3,
+                percent_mem => $4,
+                command => $5,
+            });
+        }
+    }
+        
+    return \@ptable;
+}
+
+sub _catchalls {
+    my ($user) = @_;    
+    my $sum = 0;
+    
+    for my $domain (@{$u2d_ref->{$user}}) {
+        if (open(my $fh, '/etc/valiases/'.$domain)) {
+            while (my $line = <$fh>) {
+                if ($line =~ /^\*:\s[a-zA-Z0-9]/){
+                    $sum++;
+                }
+            }
+            close($fh);
+        }
+    }
+    
+    return $sum;
+}
+
+sub _apache_includes {
+    my ($user) = @_;
+
+    if (-e '/usr/local/apache/conf/userdata/std/2/'.$user) {
+        return 1;
+    } else {
+        return undef;
+    }
+}
+
+sub _shm_limit {
+    my ($user) = @_;
+
+    if ((-e '/dev/shm/limit/'.$user) || (-e '/dev/shm/limit/'.getpwnam($user))) {
+        return 1;
+    } else {
+        return undef;
+    }
+}
+
+sub _loaduserdomains {
+    my $userpath = '/etc/userdomains';
+    
+    my %user2domain = (); # hash of arrays for user -> domains map
+    my %domain2user = (); # hash for domain -> user map
+
+    open (USERDOMAINS, $userpath) or croak;
+
+    while (my $line = <USERDOMAINS>) {
+        chomp($line); # Kill trailing whitespace/newline
+        my ($domain, $user) = split(": ", $line); # userdomains format is "domain.com: user"
+
+        $domain2user{ $domain} = $user;
+        push @{ $user2domain{$user} }, $domain;
+    }
+
+    close (USERDOMAINS);
+    
+    return (\%user2domain, \%domain2user);
+}
+
+sub _loadcpuser {
+    my $user = shift;
+    my $path = '/var/cpanel/users/'.$user;
+    
+    my (%cpuser, %domains);
+
+    open (my $cpuser_fh, $path) or croak;
+
+    while (my $line = <$cpuser_fh>) {
+        chomp($line); # Kill trailing whitespace/newline
+        if ($line =~ /.*?\s*=.*?/) { # match only key=value pairs
+            my ( $key, $value ) = split( /\s*=/, $line, 2 );
+            
+            if ($key =~ /^DNS$/) {
+                $cpuser{domain} = lc $value;
+            } elsif ($key =~ /^DNS\d+$/) {
+                my $domain = lc $value;
+                
+                if ((!exists($cpuser{domain})) || ($domain ne $cpuser{domain})) {
+                    $domains{$domain} = undef;
+                }
+            } elsif ($key =~ /^XDNS\d+$/) {
+                next; # ignore dead domains (for now)
+            } else {
+                $cpuser{lc $key} = $value;
+            }
+        } else {
+            next; 
+        }
+    }
+
+    close ($cpuser_fh);
+    
+    @{$cpuser{'domains'}} = sort keys %domains; # generate list of domains
+    
+    return (\%cpuser);
+}
+
+sub _loaduserdata {
+    my ($user, $domain) = @_;    
+    my $real_domain;
+    
+    my $mainpath = '/var/cpanel/userdata/'.$user.'/main';
+    my $main_ref =  LoadFile($mainpath);
+    
+    # if we are a sub/addon domain, load the associated subdomain file
+    
+    if ((ref($main_ref->{addon_domains}) eq 'HASH') && $main_ref->{addon_domains}->{$domain}) {
+        $real_domain = $main_ref->{addon_domains}->{$domain};
+    } elsif ((ref($main_ref->{sub_domains}) eq 'ARRAY') && (grep {$_ eq $domain} @{$main_ref->{sub_domains}})) {
+        $real_domain = $domain;
+    } else {
+        $real_domain = $main_ref->{main_domain};
+    }
+    
+    my $userpath = '/var/cpanel/userdata/'.$user.'/'.$real_domain;
+    my $userdata_ref = LoadFile($userpath);
+    
+    my $userpath_ssl = '/var/cpanel/userdata/'.$user.'/'.$real_domain.'_SSL';
+    my $userdata_ssl_ref = (-e $userpath_ssl) ? LoadFile($userpath_ssl) : undef;
+    
+    return $userdata_ref, $main_ref, $userdata_ssl_ref;
+}
+
+sub _loadresellers {
+    my $resellerspath = '/var/cpanel/resellers';
+    my %resellers;
+    
+    if (-e $resellerspath) {
+        open (my $resellers_fh, $resellerspath) or croak;
+        
+        while (my $line = <$resellers_fh>) {
+            chomp($line);
+            
+            if ($line =~ /^([^:]*):/) {
+                $resellers{$1} = undef;
+            }
+        }
+        
+        close ($resellers_fh);
+    }
+    
+    return \%resellers;
+}
+
+sub _getshell {
+    my ($user) = @_;
+    my ($name, $passwd, $uid, $gid, $quota, $comment, $gcos, $dir, $shell, $expire) = getpwnam($user);
+    return $shell;
+}
+
+sub _creationdate {
+    my ($user) = @_;
+
+    my $pattern = '^(\w{3}\s\w{3}\s{1,2}\d{1,2}\s\d\d:\d\d:\d\d\s\d{4}):CREATE:[^:]*:[^:]*:[^:]*:[^:]*:'.$user.'$';
+    my $date = 0;
+
+    if (open (my $fh, '/var/cpanel/accounting.log')) {
+        while (defined(my $line = <$fh>)) {
+            if ($line =~ /$pattern/){
+                $date = str2time($1);
+            }
+        }
+        close($fh);
+    }
+
+    return $date;
+}
+
+sub _mysql_banned {
+    my ($user) = @_;
+    
+    if (-e "/opt/hgmods/automated_monitoring/etc/banned_sqlusers") {
+        open (my $bu_fh, "/opt/hgmods/automated_monitoring/etc/banned_sqlusers");
+        
+        if ($bu_fh) {
+            while (my $line = <$bu_fh>) {
+                chomp($line);
+                
+                if ($line =~ /^$user$/) {
+                    return $line;
+                }
+            }
+        }
+    }
+    
+    return undef;
+}
+
+sub _mysql_restricted {
+    my ($user) = @_;
+    
+    my $sqluser;
+    my $sqlpass;
+       
+    if (-e "/root/.my.cnf") {
+        open (my $mycnf_fh, "/root/.my.cnf");
+        
+        if ($mycnf_fh) {
+            while (my $line = <$mycnf_fh>) {
+                chomp($line);
+                
+                if ($line =~ /^user\s*?=\s*?[\'"]?([^\"\']*)[\'"]?$/) {
+                    $sqluser = $1;
+                } elsif ($line =~ /^pass\s*?=\s*?[\'"]?([^\"\']*)[\'"]?$/) {
+                    $sqlpass = $1;
+                }
+            }
+        }
+        
+        close($mycnf_fh);
+    }
+    
+    if ($sqluser && $sqlpass) {
+        if (my $dbh = DBI->connect("dbi:mysql:database=mysql;host=localhost", $sqluser, $sqlpass)) {
+            my $sth = $dbh->prepare(
+                "SELECT COUNT(*) AS row_count ".
+                "FROM user ".
+                "WHERE (max_questions != 0 OR max_updates != 0 OR max_connections != 0 OR max_user_connections != 0) ".
+                "AND (User = '".$user."' OR User LIKE '".$user."\\_%')"
+            );
+            
+            if ($sth->execute()) {
+                my $res = $sth->fetchrow_hashref;
+                if ($res->{row_count} > 0) {
+                    return $res->{row_count};
+                }
+            }
+        }
+    }
+    
+    return undef;
+}
+
+sub _get_wwwacct_conf {
+    my %wwwacct;
+    
+    if (-e '/etc/wwwacct.conf') {
+        open(my $fh, '<', '/etc/wwwacct.conf') or die;
+        
+        while (my $line = <$fh>) {
+            if ($line =~ /^([^\s]*)(\s(.*?))?$/) {
+                $wwwacct{lc $1} = $3;
+            }
+        }
+        
+        close($fh);
+    }
+    
+    return \%wwwacct;
+}
+
+sub _get_ssl_data {
+    my ($cert_file) = @_;
+    
+    my @sslraw = `openssl x509 -in $cert_file -noout -subject -dates -nameopt RFC2253`;
+    my %ssldata;
+    
+    for my $field (@sslraw) {
+        if ($field =~ /([^=]*)=(.*?)$/) {
+            if ($1 eq "subject") {
+                my $subjectraw = $2;
+                $subjectraw =~ s/^\s+|\s+$//g;
+                
+                for my $sfield (split(',', $subjectraw)) {
+                    if ($sfield =~ /([^=]*)=(.*?)$/) {
+                        push (@{$ssldata{subject}}, [$1, $2]);
+                    }
+                }
+            } elsif ($1 eq "notBefore") {
+                $ssldata{notbefore} = $2;
+                $ssldata{notbeforeepoch} = str2time($2);
+            } elsif ($1 eq "notAfter") {
+                $ssldata{notafter} = $2;
+                $ssldata{notafterepoch} = str2time($2);
+            }
+        }
+    }
+    
+    return \%ssldata;
+}
+
+sub _get_domain_ips {
+    my %domain_ips;
+
+    if (-e '/etc/domainips') {
+        open(my $fh, '<', '/etc/domainips') or die;
+        
+        while (my $line = <$fh>) {
+            if ($line =~ /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\s(.*?)$/) {
+                $domain_ips{$1} = undef;
+            }
+        }
+        
+        close($fh);
+    }
+
+    return \%domain_ips;
+}
+
+sub _get_reserved_ips {
+    my %reserved_ips;
+
+    if (-e '/etc/reservedips') {
+        open(my $fh, '<', '/etc/reservedips') or die;
+        
+        %reserved_ips = map {chomp; $_ => undef} <$fh>;
+        
+        close($fh);
+    }
+
+    return \%reserved_ips;
+}
+
+sub _get_ip_pool {
+    my %ip_pool;
+
+    if (-e '/etc/ipaddrpool') {
+        open(my $fh, '<', '/etc/ipaddrpool') or die;
+        
+        %ip_pool = map {chomp; $_ => undef} <$fh>;
+        
+        close($fh);
+    }
+
+    return \%ip_pool;
+}
+
+sub _whitelisted {
+    my ($ui, $file) = @_;
+    my @entries;
+    my $search_rex = join('|', map {quotemeta($_)} $ui->{primary_domain}, @{$ui->{addon_domains}}, @{$ui->{sub_domains}}, '/'.$ui->{user}.'/');
+    
+    if (-e $file) {
+        open(my $fh, '<', $file) or die;
+        
+        @entries = grep {/$search_rex/} <$fh>;
+        
+        close($fh);
+    }
+    
+    return \@entries;
+}
+
+sub _smtp_whitelist {
+    my ($user) = @_;
+    my @entries;
+
+    if (-e '/etc/firewall/SMTP_WHITELIST') {
+        open(my $fh, '<', '/etc/firewall/SMTP_WHITELIST') or die;
+        @entries = grep {/^($user)$/} <$fh>;
+        close($fh);
+    }
+
+    return \@entries;
+}
+
+
+1;
+} # end class UI::cPanel::UserInfo
+
+
+BEGIN { # start class UI::Plesk::UserInfo
+package UI::Plesk::UserInfo;
+
+use strict;
+use warnings;
+
+# libraries;
+
+use Carp;
+use DBI;
+use Date::Parse;
+use Sys::Hostname;
+
+# global package variables
+
+my $dbh;
+
+# constructor
+
+sub new {
+    my($class, $arg, $no_recur) = @_;
+    my %self;
+    
+    $self{server_type} = 'plesk';
+    $self{host} = $self{shorthost} = hostname;
+    $self{shorthost} =~ s/^([^\.]*)\..*$/$1/;
+    
+    _sqlinit();
+    
+    my ($cl_id, $sys_id, $sys_user, $domain_id, $ip_id, $limit_id, $sub_id);
+   
+    if ($cl_id = _domaintoclid($arg)) { # were we given a domain name?
+        $self{domain} = $arg;
+        $self{user} = _clidtouser($cl_id);
+    } elsif ($cl_id = _usertoclid($arg)) { # a user name?
+        $self{user} = $arg;
+    } elsif ($sys_id = _sysidfromsysuser($arg)) { # a sys_user name?
+        $self{sys_user} = $arg;
+        $domain_id = _didfromsysid($sys_id);
+        $self{domain} = _domainfromdid($domain_id);
+        $cl_id = _clidfromdid($domain_id);
+        $self{user} = _clidtouser($cl_id);
+    } else {
+        return undef; # not a valid user
+    }
+    
+    $self{primary_domain} = _clidtodomain($cl_id);
+    
+    # there may or may not be any domains associated with an account
+    
+    if ($self{primary_domain} || $self{domain}) {
+        if ($self{domain}) {
+            $domain_id = _domaintodid($self{domain});
+        } else {
+            $domain_id = _domaintodid($self{primary_domain});
+        }
+        
+        $sys_id = _sysidfromdid($domain_id);
+        $self{sys_user} = _sysuserfromsysid($sys_id);
+        $self{shell} = _shellfromsysid($sys_id);
+        
+        $self{documentroot} = _didtodocroot($domain_id);
+        $self{ip} = _ipidtoip(_didtoipid($domain_id));
+        $self{ip_type} = 'shared';
+        
+        my $dnsid = _dnsidfromdid($domain_id);        
+        $self{ns1} = _ns1fromdnsid($dnsid);
+        $self{ns2} = _ns2fromdnsid($dnsid);
+        
+        $sys_user = _sysuserfromsysid($sys_id);        
+        $self{quotas} = UI::Utility::quota($sys_user);
+        
+        $self{mem_usage} = 0; # not implemented
+        $self{cpu_usage} = 0; # not implemented
+        $self{no_procs} = 0; # not implemented
+        $self{catchalls} = 0; # not implemented
+        $self{ssl} = undef; # not implemented
+        $self{tempurl} = 'n/a'; # not implemented
+        $self{bulkwhitelist} = []; # not implemented
+        $self{spamwhitelist} = []; # not implemented
+        $self{smtpwhitelist} = []; # not implemented
+        
+    } else {
+        # if we dont have a domain, a lot of the fields don't make sense to have
+        
+        $self{shell} = 'n/a';
+        $self{primary_domain} = 'n/a';
+        $self{documentroot} = 'n/a';
+        $self{ip} = 'n/a';
+        $self{ip_type} = 'n/a';
+        $self{tempurl} = 'n/a';
+        $self{ns1} = 'n/a';
+        $self{ns2} = 'n/a';
+        $self{quotas} = [];
+        $self{mem_usage} = 0;
+        $self{cpu_usage} = 0;
+        $self{no_procs} = 0;
+        $self{ssl} = undef;
+        $self{catchalls} = 0;
+        $self{bulkwhitelist} = []; # not implemented
+        $self{spamwhitelist} = []; # not implemented
+        $self{smtpwhitelist} = []; # not implemented
+    }
+    
+    # if we were given a domain name, grab the plan for that, otherwise grab the plan for the client
+    
+    if($self{domain}){
+        my $parentd = undef;
+        
+        if (_sqlcolumnexists('domains', 'parentDomainId')) {
+            $parentd = _parentidfromdid($domain_id)
+        } else {
+            $parentd = _webspaceidfromdid($domain_id)
+        }
+        
+        if ($parentd) {
+            $sub_id = _subidfromdid($parentd);
+        } else {
+            $sub_id = _subidfromdid($domain_id);
+        }
+    } else {
+        $sub_id = _subidfromclid($cl_id);
+    }
+    
+    if ($sub_id) {
+        $self{plan} = _templatefromplanid(_planidfromsubid($sub_id));
+    } else {
+        $self{plan} = 'n/a';
+    }
+
+    # if we have an owner, grab the ui info for it too
+    
+    $self{owner_ui} = (undef);
+    
+    my $parent = _parentfromclid($cl_id);
+
+    if ($parent) {    
+        $self{owner} = _clidtouser($parent);
+        if (($self{owner} ne 'admin') && (!$no_recur)) {
+            $self{owner_ui} = (UI::Plesk::UserInfo->new($self{owner}, 1))
+        }
+    } else {
+        $self{owner} = "n/a"
+    }
+    
+    # determine account type
+    
+    my $acct_type = _accttypefromclid($cl_id);
+    
+    if ($acct_type eq 'admin') {
+        $self{acct_type} = 'Admin';
+        $self{reseller_privs} = 1;
+    } elsif ($acct_type eq 'reseller') {
+        $self{acct_type} = 'Reseller';
+        $self{reseller_privs} = 1;
+    } elsif ($acct_type eq 'client') {
+        if ($self{owner_ui} && ($self{owner_ui}->acct_type ne 'Admin')) {
+            $self{acct_type} = 'Resold';
+        } else {
+            $self{acct_type} = 'Shared';
+        }
+        
+        $self{reseller_privs} = 0;
+    }
+    
+    # grab various other pieces of info
+    
+    $self{contact_email} = _emailfromclid($cl_id);
+    
+    if (my $createstatus = _creventfromuser($self{user})) {
+        $self{time_created} = str2time($createstatus);
+    } else {
+        $self{time_created} = str2time(_crdatefromclid($cl_id));
+    }
+        
+    if (_statusfromclid($cl_id) == 16) {
+        $self{suspended} = "No Reason Given";
+        $self{suspended_time} = str2time(_laststatuschgfromuser($self{user}));
+    }
+    
+    if(_sqlcolumnexists('domains', 'parentDomainId')) {
+        $self{addon_domains} = _addonlistfromclidpd($cl_id);
+        $self{sub_domains} = _sublistfromclid($cl_id);
+        $self{parked_domains} = []; # not implemented
+    } else {
+        $self{addon_domains} = _addonlistfromclidnopd($cl_id);
+        $self{sub_domains} = [];
+        $self{parked_domains} = []; # not implemented
+    }
+    
+    $self{no_domains} = scalar(@{$self{addon_domains}}) + scalar(@{$self{sub_domains}});
+    $self{shm_limit} = undef; # not implemented, does not apply to plesk servers yet
+    $self{apache_includes} = undef; # not implemented, does not apply to plesk servers yet
+    $self{mysql_banned} = undef; # not implemented, does not apply to plesk servers yet
+    $self{mysql_restricted} = undef; # not implemented, does not apply to plesk servers yet
+    
+    bless(\%self, $class);
+    return \%self;
+}
+
+# generate accessors (evil perl)
+
+no strict;
+
+for my $i (qw(user domain primary_domain owner owner_ui plan ip time_created
+              contact_email suspended no_domains acct_type mem_usage cpu_usage
+              quotas catchalls shm_limit documentroot suspended_time
+              shell apache_includes mysql_banned mysql_restricted addon_domains
+              sub_domains reseller_privs ssl server_type host shorthost tempurl
+              ns1 ns2 sys_user no_procs ip_type bulkwhitelist spamwhitelist
+              parked_domains smtpwhitelist)) {
+    
+    *{"$i"} = sub {
+        my $self = shift;
+        return $self->{$i};
+    };
+}
+
+# generate query methods (evil perl)
+
+my %single_queries = (
+    domaintoclid => ['cl_id', 'SELECT cl_id FROM domains WHERE name=?'],
+    clidtouser => ['login', 'SELECT login FROM clients WHERE id=?'],
+    usertoclid => ['id', 'SELECT id FROM clients WHERE login=?'],
+    clidtodomain => ['name', 'SELECT name FROM domains WHERE cl_id=? ORDER BY id LIMIT 1'],
+    domaintodid => ['id', 'SELECT id FROM domains WHERE name=?'],
+    didtodocroot => ['www_root', 'SELECT www_root FROM hosting WHERE dom_id=?'],
+    didtoipid => ['val', 'SELECT val FROM dom_param WHERE param=\'ip_addr_id\' AND dom_id=?'],
+    ipidtoip => ['ip_address', 'SELECT ip_address FROM IP_Addresses WHERE id=?'],
+    emailfromclid => ['email', 'SELECT email FROM clients WHERE id=?'],
+    parentfromclid => ['parent_id', 'SELECT parent_id FROM clients WHERE id=?'],
+    typefromclid => ['type', 'SELECT type FROM clients WHERE id=?'],
+    parentidfromdid => ['parentDomainId', 'SELECT parentDomainId FROM domains WHERE id=?'],
+    webspaceidfromdid => ['parentDomainId', 'SELECT webspace_id FROM domains WHERE id=?'],
+    subidfromdid => ['id', 'SELECT id FROM Subscriptions WHERE object_type=\'domain\' AND object_id=?'],
+    subidfromclid => ['id', 'SELECT id FROM Subscriptions WHERE object_type=\'client\' AND object_id=?'],
+    planidfromsubid => ['plan_id', 'SELECT plan_id FROM PlansSubscriptions WHERE subscription_id=?'],
+    templatefromplanid => ['name', 'SELECT name FROM Templates WHERE id=?'],
+    crdatefromclid => ['cr_date', 'SELECT cr_date FROM clients WHERE id=?'],
+    creventfromuser => ['event_time', 'SELECT event_time FROM exp_event where obj_class=\'client\' AND obj_id=? AND event_type=\'created\' ORDER BY event_time LIMIT 1'],
+    accttypefromclid => ['type', 'SELECT type FROM clients WHERE id=?'],
+    sysidfromdid => ['sys_user_id', 'SELECT sys_user_id FROM hosting WHERE dom_id=?'],
+    shellfromsysid => ['shell', 'SELECT shell FROM sys_users WHERE id=?'],
+    statusfromclid => ['status', 'SELECT status FROM clients WHERE id=?'],
+    laststatuschgfromuser => ['event_time', 'SELECT event_time FROM exp_event where obj_class=\'client\' AND obj_id=? AND event_type=\'status_changed\' ORDER BY event_time DESC LIMIT 1'],
+    dnsidfromdid => ['dns_zone_id', 'SELECT dns_zone_id FROM domains WHERE id =?'],
+    ns1fromdnsid => ['val', 'SELECT val FROM dns_recs WHERE dns_zone_id=? AND type=\'NS\' ORDER BY val LIMIT 1'],
+    ns2fromdnsid => ['val', 'SELECT val FROM dns_recs WHERE dns_zone_id=? AND type=\'NS\' ORDER BY val DESC LIMIT 1'],
+    sysuserfromsysid => ['login', 'SELECT login FROM sys_users WHERE id=?'],
+    sysidfromsysuser => ['id', 'SELECT id FROM sys_users WHERE login=?'],
+    didfromsysid => ['dom_id', 'SELECT dom_id FROM hosting WHERE sys_user_id=?'],
+    clidfromdid => ['cl_id', 'SELECT cl_id FROM domains WHERE id=?'],
+    domainfromdid => ['name', 'SELECT name FROM domains where id=?'],
+);
+
+my %list_queries = (
+    addonlistfromclidpd => 'SELECT name FROM domains WHERE parentDomainId=0 AND webspace_id!=0 AND cl_id=?',
+    addonlistfromclidnopd => 'SELECT name FROM domains WHERE webspace_id!=0 AND cl_id=?',
+    sublistfromclid => 'SELECT name FROM domains WHERE parentDomainId!=0 AND webspace_id!=0 AND cl_id=?',
+);
+
+for my $query (keys %single_queries) {
+    *{"_$query"} = sub {
+        return _sqlsingleselect(${$single_queries{$query}}[1], $_[0], ${$single_queries{$query}}[0]);
+    };
+}
+
+for my $query (keys %list_queries) {
+    *{"_$query"} = sub {
+        return _sqllistselect($list_queries{$query}, $_[0]);
+    };
+}
+
+use strict;
+
+# private methods
+
+sub _getsqlpass() {
+    if (-e "/etc/psa/.psa.shadow") {
+        open (my $mycnf_fh, "/etc/psa/.psa.shadow") or croak "Can not open '/etc/psa/.psa.shadow': $@";
+        my $pass = <$mycnf_fh>;
+        chomp $pass;
+        close($mycnf_fh);
+        return $pass;
+    }
+    return undef;
+}
+
+sub _sqlinit {
+    unless ($dbh) {
+        my ($sqluser, $sqlpass) = ('admin', _getsqlpass());
+        
+        $dbh = DBI->connect(
+            "dbi:mysql:database=psa;host=localhost",
+            $sqluser,
+            $sqlpass,
+            {PrintError => 1},
+        ) or croak "Failed to connect to database: ".$DBI::errstr;
+    }
+}
+
+sub _sqlsingleselect {
+    my ($sql, $var, $column) = @_;
+    
+    if ($dbh) {
+        if (my $results = $dbh->selectrow_hashref($sql, undef, $var)) {
+            return $results->{$column};
+        } else {
+            return undef;
+        }
+    } else {
+        croak "Database handler not valid.";
+    }
+}
+
+sub _sqllistselect {
+    my ($sql, $var) = @_;
+    
+    if ($dbh) {
+        return $dbh->selectcol_arrayref($sql, undef, $var);
+    } else {
+        croak "Database handler not valid.";
+    }
+}
+
+sub _sqlcolumnexists {
+    my ($sql, $table, $column) = @_;
+    
+    if ($dbh) {
+        if (my $results = $dbh->selectrow_hashref("SELECT COUNT(*) AS tblcnt FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='psa' AND TABLE_NAME=? AND COLUMN_NAME=?", undef, $table, $column)) {
+            return $results->{'tblcnt'};
+        }
+        croak "Database handler not valid.";
+    }
+}
+
+1;
+} # end class UI::Plesk::UserInfo
+
+
+# UI::Utility
+# Provides various utilities routines used by UI modules
+
+BEGIN { # start module UI::Utility
+package UI::Utility;
+
+use strict;
+use warnings;
+use Carp;
+
+# routines
+
+sub key_total {
+    my ($hash_r, $field) = @_;
+    my $sum = 0;
+        
+    for my $i (@{$hash_r}) {        
+        $sum += $i->{$field} if $i->{$field};
+    }
+    
+    return $sum; 
+}
+
+sub quota {
+    my $user = shift;
+    my @quotas;
+    
+    for my $mount (@{MK::Utility::Quota::get_mounts()}) {
+        if (my $quota = MK::Utility::Quota::get_quota($user, $mount)) {
+            push(@quotas, $quota);
+        }
+    }
+    
+    return \@quotas;
+}
+
+sub normalize {
+    my ($arg) = @_;
+    
+    $arg = lc $arg;
+    $arg =~ s/(?:^\s+)|(?:\s+$)//g; # trim whitespace
+    $arg =~ s/(?:^(ht|f)tps?:\/\/)//; # remove preceeding protocol tag (for lazy admins)
+    $arg =~ s/(?:^www\.)//; # remove preceeding 'www.'
+    
+    return $arg;
+}
+
+1;
+} # end UI::Utility
+
+
+# MK::Utility::Quota
+# Provides syscall based quota-checking functionality
+
+BEGIN { # start class MK::Utility::Quota
+package MK::Utility::Quota;
+
+use strict;
+use warnings;
+use Carp;
+
+use Config;
+use Math::BigInt;
+
+# define syscall number
+
+my $sys_quotactl = $Config{ptrsize} == 8 ? 179 : 131; 
+
+# define constants for quotactl
+
+my $USRQUOTA = 0;
+my $Q_GETQUOTA = 0x800007;
+my $DQBLK_SIZE_BITS = 10;
+
+# combine two long ints into a quad (we have to do this since non 64 bit perls lack quadint support)
+
+sub ltoq {
+    return Math::BigInt->new($_[1])->blsft(32)->bior($_[0]);
+}
+
+# generate the qcmd value for quotactl
+
+sub qcmd {
+    return (($_[0] << 8) | ($_[1] & 0x00ff));
+}
+
+# get quota entries, if they exist
+
+sub get_quota {
+    my ($user, $mount) = @_;
+    
+    my $dqblk = pack("L16L", (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)); # generate appropriate size string for dqblk struct
+    my $cmd = qcmd($Q_GETQUOTA, $USRQUOTA);
+        
+    if (syscall($sys_quotactl, int($cmd), $mount, int(getpwnam($user)), $dqblk) == -1) {
+        return undef; # no quota, or error
+    } else {
+        # unpack the data and return
+        
+        my @quota = unpack("L16L", $dqblk); 
+        
+        return {
+            mount => $mount,
+            bhardlimit => ltoq($quota[0],$quota[1])->numify(),
+            bsoftlimit => ltoq($quota[2],$quota[3])->numify(),
+            curspace => ltoq($quota[4],$quota[5])->brsft($DQBLK_SIZE_BITS)->numify(), # needs to be shifted to compensate for quota block size
+            ihardlimit => ltoq($quota[6],$quota[7])->numify(),
+            isoftlimit => ltoq($quota[8],$quota[9])->numify(),
+            curinodes =>  ltoq($quota[10],$quota[11])->numify(),
+        };
+    }
+}
+
+# get mounted devices
+
+sub get_mounts {
+    my @mounts;
+    
+    open(my $fh, '<', '/etc/mtab') or croak "Failed to open '/etc/mtab': $!";
+    
+    while (my $mount = <$fh>) {
+        if ($mount =~ /^(\/dev[^\s]*)/) {
+            push(@mounts, $1);
+        }
+    }
+    
+    close ($fh);
+    
+    return \@mounts;
+}
+
+1;
+} # end MK::Utility::Quota

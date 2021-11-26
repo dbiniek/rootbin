@@ -1,0 +1,573 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+########### 
+# dbconnect imports database dumps for common PHP scripts and updates their configuratin files.
+#  It optionally searches directories for the configuration files and matches the configuration
+#  files with the database dumps.
+#   
+# https://confluence.endurance.com/display/HGS/Migrations%3A+dbconnect 
+# https://stash.endurance.com/projects/HGADMIN/repos/dbconnect/browse 
+# Please submit all bug reports at jira.endurance.com   
+#   
+# (C) 2012 - HostGator.com, LLC 
+###########
+
+=pod
+
+=head1 NAME
+
+dbconnect
+
+=head1 DESCRIPTION
+
+A script that imports database dumps for common PHP scripts and updates their configuratin files.
+
+=head1 SYNOPSIS
+
+dbconnect olddbname.sql /home/mydomai/public_html/wordpress/wp-config.php
+
+dbconnect --list=/home/user/public_html
+
+=cut
+
+use strict;
+use Cwd;
+use File::Find ();
+use Tie::File;
+use Getopt::Long;
+use Sys::Hostname;
+use Term::ANSIColor qw(:constants);
+use JSON;
+use Cpanel::Version;
+use Data::Dumper;
+
+#---------------------------------------------------------------------------------------------
+#----------------------------------- Initialization ------------------------------------------
+#---------------------------------------------------------------------------------------------
+
+# Find out if we're on a cPanel server or a Plesk server.
+my $plesk;
+my $currversion;
+if (-e "/etc/psa/.psa.shadow") {
+     $plesk = 1;
+}else { #If the password file doesn't exist, this must be a cPanel server.  Run the cPanel methods.
+     $plesk = 0;
+     $currversion = Cpanel::Version::getversionnumber();
+}
+
+if (!dependency_check()) { # If a dependency is out of date or missing, then exit.
+     exit 1;
+}
+# Token Support
+my $tokensupport;
+my $token_name;
+my $json;
+my $token;
+if ( $currversion >= 11.64 && $plesk == 0 )
+{
+        #Clean up the API Token before exit
+        END{
+                if($token_name){
+                        `whmapi1 api_token_revoke token_name=$token_name`
+                }
+        }
+        $token_name = "hgtool_".time();
+        $json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+        $token = from_json($json)->{'data'}{'token'};
+        {
+                my $revoked;
+                $SIG{INT} = sub {
+                        unless ($revoked) {
+                                $revoked = 1;
+                                `whmapi1 api_token_revoke token_name=$token_name`;
+                        }
+                        die "Interrupted";
+                }
+                        
+        }
+        #Remove stale tokens
+        stale_tokens();
+}
+
+my $dbc = dbconnect->new(undef, $token);
+if (!$dbc) {            #If the dbconnect module instantiation fails, exit now.
+     exit 1;
+}
+my $listopt;  #Optional list file or /full/path/to/directory
+my $help;
+my $api;
+GetOptions ('list=s' => \$listopt,
+            'help'   => \$help,
+            'api=s'  => \$api);
+
+my $dbdumpfile   = $ARGV[0];
+my $dbconfigfile = $ARGV[1];
+
+if ($help) {
+     show_help();
+     exit 0;
+}
+
+my $mysqlpass;
+plesk_read_mysql_password();
+
+#---------------------------------------------------------------------------------------------
+#---------------------- Decide what type of transfer this is ---------------------------------
+#---------------------------------------------------------------------------------------------
+if ($api) {
+     api($api);
+}elsif ($#ARGV >-1 && $listopt) {                 #If arguments are given and --list is given, then show an error.
+     print "No additional arguments are needed if --list=listfile is specified.\n";
+     show_help();
+     exit 0;
+}elsif ($#ARGV == -1 && $listopt) {           #If no arguments are given and --list is given, then treat it as a --list type.
+     dbclist($listopt);
+}elsif ($#ARGV == 1 && !$listopt) {           #If 2 arguments are given and no --list option, then treat it as a single dbconnect.
+     dbconnect($dbdumpfile, $dbconfigfile);
+}else {
+     show_help();
+     exit 0;
+}
+
+#---------------------------------------------------------------------------------------------
+#----------------------------------- API subroutines -----------------------------------------
+#---------------------------------------------------------------------------------------------
+
+=pod
+
+=head1 COMMAND LINE API CALLS
+
+The command line API calls are available to pass data to other scripts.
+
+=head2 show_supported_configs
+
+dbconnect --api=show_supported_configs
+
+=head3 DESCRIPTION
+
+Print out a two-column list of configuration filenames that are supported by dbconnect.
+
+=head3 EXAMPLE
+
+Supports: bbPress             osCommerce
+          CakePHP             phpBB
+          ...
+          OpenCart
+
+=cut
+
+sub api {
+     my $api = shift;
+     my $result;
+     my $json = JSON->new();
+     if ($api eq "show_supported_configs") {
+          $dbc->show_supported_configs();
+          return;
+     }elsif($api =~ /^is_supported_filename/) { #$api will look something like is_supported_filename,wp-config.php
+          $result = api_is_supported_filename($api);
+     }elsif($api =~ /^extract_db/) { #$api will look something like extract_db,/home/user/public_html/wp-config.php
+          $result = api_extract_db($api);
+     }else {
+          $result = {"error" => "Unknown API function call $api"};
+     }
+     my $output = $json->encode($result);
+     print "$output\n";
+}
+
+=pod
+
+=head2 is_supported_filename
+
+dbconnect --api=is_supported_filename,filename
+
+=head3 DESCRIPTION
+
+Determine whether or not the given filename is a valid filename used by one of the supported web applications. 
+
+=head3 RETURN VALUE
+
+JSON encoded result.  If filename is supported:     {"result":"1"}
+                      If filename is not supported: {"result":"0"}
+
+=cut
+
+sub api_is_supported_filename {
+     my $api = shift;
+     my $result;
+     my @api_array = split(',', $api);
+     if (scalar(@api_array) == 2) {
+          my $filename = @api_array[1];
+          $filename = dbconnect::removedirpath($filename);
+          if ($dbc->is_supported_filename($filename)) {
+               $result = {"result" => "1"};
+          }else{
+               $result = {"result" => "0"};
+          }
+     }else{
+          $result = {"error" => "is_supported_filename takes 1 argument."};
+     }
+     return $result;
+}
+
+=pod
+
+=head2 extract_db
+
+dbconnect --api=extract_db,/path/to/filename
+
+=head3 DESCRIPTION
+
+Extract the database details from the file in /path/to/filename and print them in JSON encoded format. 
+
+=head3 RETURN VALUE EXAMPLE
+
+JSON encoded result.  Success: {"result":{"database":"wptest_wp381","app":"Wordpress","password":"mysecret","dbuser":"wptest_wp381","hostname":"localhost"}}
+                      Failure: {"error":"Some error message."}
+
+=cut
+
+sub api_extract_db {
+     my $api = shift;
+     my $result;
+     my @api_array = split(',', $api);
+     if (scalar(@api_array) == 2) {
+          my $file = @api_array[1];                       #i.e. /home/user/public_html/wp-config.php
+          my $filename = dbconnect::removedirpath($file); #i.e. wp-config.php
+          if ($dbc->is_supported_filename($filename)) {
+               my @config = $dbc->extract_db($file);
+               if (dbconnect::fields_populated(@config)) {
+                    $result = {"result" => {
+                                             "hostname" => $config[0],
+                                             "database" => $config[1],
+                                             "dbuser"   => $config[2],
+                                             "password" => $config[3],
+                                             "app"      => $config[4]
+                                           }
+                              };
+               }else{
+                    $result = {"error" => "Failed to read database credentials from the config file."};
+               }
+          }else{
+               $result = {"error" => "$filename is not a supported config file."};
+          }
+     }else{
+          $result = {"error" => "extract_db takes 1 argument."};
+     }
+     return $result;
+}
+
+#---------------------------------------------------------------------------------------------
+#-------------------------------- cPanel subroutines -----------------------------------------
+#---------------------------------------------------------------------------------------------
+
+#Removes stale tokens
+sub stale_tokens {
+        my $token_list = `whmapi1 api_token_list --output=json`;
+        my $listjson = from_json($token_list);
+        my $current_time = time();
+        if ($currversion >= 11.68){
+                foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+                        if( $token_name =~ /hgtool_/ ){
+                                my $token_time = $token_name;
+                                $token_time =~ s/\D//g;
+                                if ( ($token_time + 432000) < $current_time ){
+                                        print "Revoking token";
+                                        #Token is 5 days older than now, removing.
+                                        `whmapi1 api_token_revoke token_name=$token_name`;
+                                }
+                        }
+                }
+        } else {
+                foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+                        if( $token_data->{'name'} =~ /hgtool_/ ){
+                                my $token_time = $token_data->{'name'};
+                                $token_time =~ s/\D//g;
+                                if ( ($token_time + 432000) < $current_time ){
+                                        #Token is 5 days older than now, removing.
+                                        `whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+                                }
+                        }
+                }
+        }
+}
+
+# Convert a user list into a directory list.
+# Input:  An array of cPanel users
+# Output: An array of directories.
+sub cpanel_userlist_2_dirlist {
+     my @userlist = @_;
+     my @dirlist;
+     print "Building a list of directories...\n";
+     foreach my $user (@userlist) {
+          print "User: $user...\n";
+          my $ud = Userdata->new("localhost", $user, undef, $token);
+          my $primarydir = "/" . $ud->{partition} . "/" . $ud->{username} . "/public_html";
+          push (@dirlist, $primarydir);
+          foreach my $addondir (@{$ud->{addondirs}}) {
+               push (@dirlist, $addondir);
+          }
+          foreach my $subdomaindir (@{$ud->{subdomaindirs}}) {
+               push (@dirlist, $subdomaindir);
+          }
+     }
+     return @dirlist; 
+}
+
+# Find out the cPanel username
+# Input:  Configuration file path.
+# Output: username if one can be extracted.
+#         If not, "" is returned.
+sub cpanel_findusername {
+     my $config_path = shift;
+     my $cwd_path    = getcwd();
+     # First, try to parse the current working directory for a username.
+     if ($cwd_path =~ /\/home/) {
+          $cwd_path =~ s/\/home[1-9]?\///;   #Remove the part of the dir before and after the username.
+          $cwd_path =~ s/\/.*//;
+          if (-s "/var/cpanel/users/$cwd_path") { #If the username exists, then use this one.
+               return $cwd_path
+          }
+     }
+     # Try to parse the config path.  If it's a full path, then it might have the username.
+     if ($config_path =~ /\/home/) {
+          $config_path =~ s/\/home[1-9]?\///;   #Remove the part of the dir before and after the username.
+          $config_path =~ s/\/.*//;
+          if (-s "/var/cpanel/users/$config_path") { #If the username exists, then use this one.
+               return $config_path
+          }
+     }
+     return ""; # Return empty string because we couldn't find a valid username.
+}
+
+#---------------------------------------------------------------------------------------------
+#--------------------------------- Plesk subroutines -----------------------------------------
+#---------------------------------------------------------------------------------------------
+
+#Find the domain name
+#Input: No arguments needed (obtains current directory from getcwd)
+#Output: The domain name of the account whose directory you are in.
+sub plesk_finddomain {
+     my $domain = "";
+     #Read the list of document roots into @docroots array.
+     my @docroots = `mysql -uadmin -p'$mysqlpass' -ss -e"select www_root from hosting;" psa`;
+     my $dir = getcwd();                    #Look up the current directory.
+     my $webspaceid = 0;
+     #Go through the account directories (document roots with httpdocs chopped off) looking for one that matches the
+     # directory we are in.  If we find it, we can then look up the domain associated with that directory.
+     foreach my $line (@docroots) {   
+          chomp($line);
+          my $choppedline = chopbottomdir($line);
+          if ($dir =~ /$choppedline/) {
+               $webspaceid = `mysql -uadmin -p'$mysqlpass' -ss -e"select domains.webspace_id from domains inner join hosting on domains.id=hosting.dom_id where hosting.www_root = '$line' limit 1;" psa`;
+               if ($webspaceid == 0) { #If the webspaceid is 0, then we're in the directory for the primary domain.  Look up the primary domain based on the directory.
+                    $domain = `mysql -uadmin -p'$mysqlpass' -ss -e"select domains.name from domains inner join hosting on domains.id=hosting.dom_id where hosting.www_root = '$line' limit 1;" psa`;
+               }else {                 #If the webspaceid is not 0, then we're in an addon directory, and the webspaceid is domain ID of the primary domain.  Look up the primary domain based on the webspaceid.
+                    $domain = `mysql -uadmin -p'$mysqlpass' -ss -e"select domains.name from domains where domains.id=$webspaceid limit 1;" psa`;
+               }
+          }
+     }
+     chomp($domain);
+     return $domain
+}
+
+sub plesk_domlist_2_dirlist {
+     my @domlist = @_;
+     my @dirlist;
+     my $dir;
+     my @subdomdirs; #Subdomain document roots.
+     foreach my $dom (@domlist) {  #Then convert each element of @dirlist to its corresponding directory.
+         chomp($dom); #First let's find the document root for the domain name.
+         $dir = `mysql -uadmin -p'$mysqlpass' -ss -e"select hosting.www_root from hosting inner join domains on domains.id=hosting.dom_id where domains.name = '$dom' limit 1;" psa`;
+         chomp($dir);
+         push (@dirlist, $dir);
+         $dir = "";   #Next, let's add any subdomain directories.
+         @subdomdirs = `mysql -uadmin -p'$mysqlpass' -ss -e"select subdomains.www_root from hosting inner join domains on domains.id=hosting.dom_id inner join subdomains on domains.id=subdomains.dom_id where domains.name = '$dom';" psa`;
+         foreach my $subdomdir (@subdomdirs) {
+              chomp($subdomdir);
+              if (length($subdomdir) > 0) {
+                   push (@dirlist, $subdomdir);
+              }
+         }
+     }
+     return @dirlist;
+}
+
+# Read the MySQL password if this is plesk and put it into the global variable $mysqlpass
+sub plesk_read_mysql_password {
+     if ($plesk) { #If we're on plesk, some of the subs will need the MySQL password.  Read it now.
+          eval {                                           #Read the mysql password.
+               open (my $INFILE, "/etc/psa/.psa.shadow");
+               $mysqlpass = <$INFILE>;                     #Sluuuuurp
+               close $INFILE;
+          } or do {
+               print "Error reading the MySQL password from /etc/psa/.psa.shadow\n";
+               exit 1;
+          };
+          chomp($mysqlpass);
+     }
+}
+
+#---------------------------------------------------------------------------------------------
+#--------------------------------- General subroutines ---------------------------------------
+#---------------------------------------------------------------------------------------------
+
+# Connect one database.
+# Input:  Database dump filename, including path as needed.
+#         Configuration filename, including path as needed for the php script.
+#         global $dbc object.
+# Output: 1=OK
+#         0=Error
+sub dbconnect {
+     my $dbdumpfile   =  $_[0];  #Name of the dump file that ends in .sql
+     my $dbconfigfile =  $_[1];  #Name of the php script's config file, including path.
+     my $account;                #Account identifier.  On cPanel, this will be a username.  On Plesk, it will be a domain.
+     my $newdbnam;
+     $dbdumpfile      =~ s/\.sql$//;
+     my @dbinfo = $dbc->extract_db($dbconfigfile); #@dbinfo shows all db info from a config file, but we're only interested
+                                             # in the old database name to print on the summary: $dbinfo[1]
+     my $appname = $dbinfo[4];
+     print $appname . "\n";
+     if ($plesk) {
+          $account = plesk_finddomain();
+          if ($account eq "") {
+               print "Please run from within a domain's document root.\n";
+               return 0;
+          }
+          $newdbnam = $dbc->plesk_dbconnect ($dbdumpfile, $dbconfigfile, 1, $account);
+     }else{
+          $account = cpanel_findusername($dbconfigfile);
+          if ($account eq "") {
+               print "Please run from the user's home directory.  If the config file is already within the user's home directory, the full path to the config file can be used instead.\n";
+               return 0;
+          }
+          $newdbnam = $dbc->cpanel_dbconnect ($dbdumpfile, $dbconfigfile, 1, $account);
+     }
+     if (length($newdbnam) > 0) {
+          print "olddbname --> newdb_name\n";                # Show the old and new db names in case the
+          print $dbinfo[1] . " --> " . $newdbnam . "\n";  # user wants to document it.
+     }
+     return 1;
+}
+
+# Read a list file and try to match up the config files that are found with the database dumps in the current directory,
+#  and connect all of the databases that match up.
+# Input:  list filename or directory name.  Directory name must be a full path (i.e. /home/user/public_html)
+#         global $dbc object.
+# Output: 1=OK
+#         0=Fail
+sub dbclist {
+     my $listfile    = $_[0];
+     my $dbdir       = getcwd();
+     my @list;       #Content of a list file.  On cpanel, this will be usernames.  On Plesk, it will be domains.
+     my @finaldirlist;
+     my $filesize = -s $listfile;    #  check to see if there's a file with that name. 
+     if ($filesize > 0 && ! -d $listfile) { #If our file has size and it is not a directory, then treat it like a user list. 
+          eval { 
+               open (my $INFILE, $listfile); 
+               @list = <$INFILE>; 
+               close $INFILE; 
+          } or do { 
+               print "Error reading file $listfile\n"; 
+               return 0; 
+          }; 
+          foreach my $tmpline (@list) { #Remove extra newlines. 
+               chomp($tmpline);       #Remove newlines. 
+               $tmpline =~ s/\s+//;   #Remove leading spaces. 
+               $tmpline =~ s/\s+$//;  #Remove trailing spaces. 
+          }
+          if ($plesk) { # Now that @list is populated, convert it into a directory list.
+               @finaldirlist = plesk_domlist_2_dirlist(@list);   # If we're on plesk, the list is expected to have domains.
+          }else{ 
+               @finaldirlist = cpanel_userlist_2_dirlist(@list); # If we're on cPanel, the list is expected to have usernames.
+          }
+     }else { 
+          push (@finaldirlist, $listfile);   #If there's no file with the name of the argument, then assume that the argument is a directory. 
+     } 
+     $dbc->dbclist($dbdir, \@finaldirlist);
+     return 1;
+}
+
+# Find the directory where the configuration file is.
+# Input: Full directory path (i.e. /var/www/vhosts/mydomain.tld/httpdocs)
+# Output: Rightmost directory chopped (i.e. /var/www/vhosts/mydomain.tld)
+sub chopbottomdir {
+     my $fullpath = $_[0];
+     #Find last "/" in the fullpath and put its index into $lastloc.
+     my $loc = 0;
+     my $lastloc = 0; #Init the variable.
+     while ($loc >= 0) {
+          $lastloc = $loc;
+          $loc = index($fullpath, "/", $loc+1);
+     }
+     my $dirpath = substr $fullpath,0,$lastloc;
+     return $dirpath;
+}
+
+sub show_help {
+     print "dbconnect 5.0\n";
+     print "Usage: dbconnect <databasefile> <configfile>\n";
+     print "            Run this from the user's home directory if --list is not specified.\n";
+     print "            <databasefile> is a MySQL dump file with the filename ending in .sql.\n";
+     print "            <configfile>  the filename to the php script's configuration file, including path.\n\n";
+     print "       dbconnect --list=listfile\n";
+     print "            listfile should contain usernames if this is cPanel or domains if this is Plesk.\n";
+     print "            listfile can also be the full path to a directory to search for config files.\n";
+     print "            Run from directory that contains the database dump files.\n\n";
+     $dbc->show_supported_configs();
+}
+
+# Check for dependencies and load the dependencies.
+# Input:  $plesk global variable
+# Output: 1=Success, 0=Fail
+sub dependency_check {
+     #************** Check for xfermodules ****************
+     if (eval {require "/root/bin/xfermodules.pm";}) {  #Is xfermodules available?
+          require "/root/bin/xfermodules.pm";           #Yes, load it.
+          if ($xfermodules::VERSION lt "1.00") {
+               print "This server appears to have an outdated version of the transfers modules.\n";
+               print "Please update them or have a level 2 admin install them if this is a shared/reseller server.\n";
+               print "Install with: ".YELLOW."yum install ESO-utils\n".RESET;
+               print "If the repository is not installed, you can create it with:\n\n";
+               print "cat <<'EOF'> /etc/yum.repos.d/dedi.repo\n";
+               print "[hgdedi]\n";
+               print "name=HG Monitoring Repo\n";
+               print "baseurl=http://repo.websitewelcome.com/dedi/centos/\$releasever/\$basearch\n";
+               print "enabled=1\n";
+               print "gpgcheck=0\n";
+               print "timeout=5\n";
+               print "EOF\n";
+               return 0;
+          }
+     }else{
+          if (! -s "/root/bin/xfermodules.pm") {
+               print "The transfers modules do not appear to be on this server.\n";
+               print "Please install them or have a level 2 admin install them if this is a shared/reseller server.\n";
+               print "Install with: ".YELLOW."yum install ESO-utils\n".RESET;
+               print "If the repository is not installed, you can create it with:\n\n";
+               print "cat <<'EOF'> /etc/yum.repos.d/dedi.repo\n";
+               print "[hgdedi]\n";
+               print "name=HG Monitoring Repo\n";
+               print "baseurl=http://repo.websitewelcome.com/dedi/centos/\$releasever/\$basearch\n";
+               print "enabled=1\n";
+               print "gpgcheck=0\n";
+               print "timeout=5\n";
+               print "EOF\n";
+               return 0;
+          }else{
+               $|++;
+               print RED . "Error while trying to load xfermodules.pm\n".RESET;
+               delete $INC{'/root/bin/xfermodules.pm'};
+               require "/root/bin/xfermodules.pm";
+               return 0;
+          }
+     }
+     #************** Check for JSON ****************
+     if (!eval {require JSON;} && $plesk == 0) { #JSON is needed by the Userdata module within xfermodules.pm.
+          print "the JSON perl module does not appear to be on this server.\n";
+          print "Please install it or have a level 2 admin install it if this is a shared/reseller server.\n";
+          print "Install with: ".YELLOW."/scripts/perlinstaller JSON\n".RESET;
+          return 0;
+     }
+     return 1;
+}
+

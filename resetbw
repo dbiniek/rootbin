@@ -1,0 +1,210 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# resetbw
+# Reset the 'Bandwidth used' statistic for cPanel accounts.
+# https://confluence.endurance.com/display/HGS/MigrationsResetbw 
+# Please submit all bug reports at jira.endurance.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+use strict;
+use Getopt::Long qw (:config pass_through);
+use Term::ANSIColor;
+use File::Copy;
+use File::Path;
+use Tie::File;
+use Cpanel::Version;
+use JSON;
+
+my $help;
+my $currversion = Cpanel::Version::getversionnumber();
+GetOptions ('help' => \$help);
+
+if ($help) {
+	help();
+}
+
+if (!-s "/usr/local/cpanel/cpanel") {
+	print "[!] No cPanel detected on the server. None of the functions will work.\n";
+	exit 1;
+}
+
+if (eval {require cPanel::PublicAPI;}) {
+	require cPanel::PublicAPI;
+} else {
+	print "[!] Failed to load the necessary modules for this script to function properly. Please install cPanel::PublicAPI via '/scripts/perlinstaller cPanel::PublicAPI'\n";
+	exit 1;
+}
+
+if ($#ARGV != 0) {
+	help();
+}
+
+sub help {
+	print "[#] Resetbw - Reset Bandwidth usage - v0.1\n\n";
+	print "Usage: $0 <username> or <filename of file that contains usernames>\n";
+	exit 1;
+}
+
+main();
+
+sub main {
+	my @users = parse_args($ARGV[0]);
+
+	foreach my $user (@users) {
+		my @files = getbwfiles($user);
+		backupfiles(\@files, $user);
+
+		foreach my $bwfile (@files) {
+
+			tie my @lines, 'Tie::File', "/var/cpanel/bandwidth/$bwfile";
+			foreach my $line (@lines) {
+				$line =~ s/=[\d]*/=0/;
+			}
+			untie @lines;
+		}
+
+		print "[+] Updated bandwidth files successfully. Running cPanel's weblogs for the '$user' now... ";
+		my $output = `/scripts/runweblogs $user`;
+		print "Done!\n";
+	}
+}
+
+sub colorify {
+        my $string = $_[0];
+	my $color = $_[1];
+	return color("$color").$string.color("reset");
+}
+
+sub getbwfiles {
+	my $user = $_[0];
+	my @domains;
+	my @files;
+	my $token;
+	my $token_name;
+	my $json;
+	my $apic;
+
+	if ( $currversion >= 11.70 ){
+		$token_name = "resetbw_".time();
+		$json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+		$token = JSON::from_json($json)->{'data'}{'token'};
+		$apic = cPanel::PublicAPI->new( ssl_verify_mode => "0", api_token => $token );
+		END{
+			if($token_name){
+				`whmapi1 api_token_revoke token_name=$token_name`;
+			}
+		}
+		{
+			my $revoked;
+			$SIG{INT} = sub {
+				unless ($revoked) {
+					$revoked = 1;
+					fork or exec('whmapi1', 'api_token_revoke', "token_name=$token_name");
+				}
+			die "Interrupted"
+			};
+		}
+	} else {
+		if ( !-s "/root/.accesshash" ) { 
+			$ENV{'REMOTE_USER'} = 'root';
+			system('/usr/local/cpanel/bin/realmkaccesshash');
+		}
+		$apic = cPanel::PublicAPI->new( ssl_verify_mode => "0" );
+	}
+	
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'DomainLookup', 'func' => 'getbasedomains', 'user' => $user, }, { }, 'json');
+	my $output = from_json($response);
+
+	if (ref($output->{'cpanelresult'}{'data'}) eq 'ARRAY'){
+		foreach my $obj (@{$output->{'cpanelresult'}{'data'}}){
+			my $tempu = $obj->{'domain'};
+			push (@domains, $tempu);
+		}
+	} else {
+		push (@domains, $output->{'cpanelresult'}->{'data'}->{'domain'});
+	}
+	push (@domains, $user);
+
+	my @list = ("", ".5min", ".hour", ".remainder");
+
+	foreach my $dom (@domains) {
+		foreach my $i (@list){
+			if (-s "/var/cpanel/bandwidth/$dom$i"){
+				push (@files, "$dom$i");
+			}
+		}
+		#remove any stagnant cache files - pretty safe to do.
+		if (-s "/var/cpanel/bandwidth.cache/$dom") {
+			unlink "/var/cpanel/bandwidth.cache/$dom";
+		}
+	}
+
+	return @files;
+}
+
+sub backupfiles {
+	my $files = $_[0];
+	my $user = $_[1];
+
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	my $workdir = "/home/hgtransfer/resetbw-".sprintf("%4d%02d%02d",$year+1900,$mon+1,$mday). "/";
+	if (!-d "$workdir") {
+		mkpath ($workdir, 0, 0700) or print "[!] Failed to create backup dir - '".colorify($workdir, "red")."' - Bailing!\n" && return 1;
+	}
+
+	my $timestr = sprintf("%04d%02d%02d%02d%02d%02d", $year+1900, $mon+1, $mday, $hour, $min, $sec);
+	my $nfile = $workdir."${user}-${timestr}.tar";
+
+	foreach my $f (@$files) {
+		if (-e "$nfile") {
+			`tar -rvf $nfile -C /var/cpanel/bandwidth/ $f 2>&1`;
+		} else {
+			`tar -cvf $nfile -C /var/cpanel/bandwidth/ $f 2>&1`;
+		}
+	}
+
+	print "[+] Backed up bandwidth files for '".colorify($user, "green")."' at '$nfile'\n";
+	return 0;
+}
+
+sub parse_args {
+
+	my $arg = $_[0];
+	my @usernames;
+
+	if (-s $arg && !-d $arg) {
+		open (INFILE, $arg);
+		while (<INFILE>) {
+			my $user = $_;
+			chomp $user;
+			if (userexists($user)) {
+				print "[*] Added '".colorify($user, "green")."' to be processed...\n";
+				push (@usernames, $user);
+			} else {
+				print "[!] '".colorify($user,"red")."' was not added, as it does not exist on the server.\n";
+			}
+		}
+		close INFILE;
+	} else {
+		my $user = $ARGV[0];
+		chomp $user;
+		if (userexists($user)) {
+			print "[*] Added '".colorify($user,"green")."' to be processed...\n";
+			push (@usernames, $user);
+		}
+	}
+	return @usernames;
+}
+
+sub userexists {
+
+	my $user = $_[0];
+	my ($name, $passwd, $uid, $gid, $quota, $comment, $gcos, $dir, $shell) = getpwnam ($user);
+
+	if (($name)  and (($dir) and (-d $dir)) and (-s "/var/cpanel/users/$user")) {
+		return 1;
+	}
+	return 0;
+}

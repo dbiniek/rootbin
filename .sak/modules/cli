@@ -1,0 +1,645 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife - Main CLI Library
+#|
+#| Direct CLI command parsing
+#|
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash
+#- @subpackage CLI
+
+
+# This library cannot be used when not in CLI mode
+! sak_cli_mode && return 0
+# Include all software cli libraries
+for MOD in "${SAK_MOD_DIR}"/soft/*/cli; do
+  . "${MOD}"
+done || return 1
+
+#+ Our main CLI processing loop.
+#| @uses sak_cli_wp
+#| @uses sak_cli_jos
+#- @param mixed $args... Positionals provided from main script.
+sak_cli() {
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    ""|info)              sak_cli_info_quick "$@" ;;
+    list|listall|listing) sak_cli_info_list "$@" ;;
+
+    cash)             sak_cli_find_cache "$@" ;;
+    bup|backup)       sak_cli_guess_backup "$@" ;;
+    db|database)      sak_cli_db "$@" ;;
+    diff)             sak_cli_diff "$@" ;;
+    orphan|orphans)   sak_cli_orphans "$@" ;;
+    replace)          sak_cli_replace "$@" ;;
+    massreplace|\
+    mreplace|massrep) sak_cli_mass_replace "$@" ;;
+
+    wp|word|wordpress)      sak_cli_wp "$@" ;;
+    jm|ja|jos|joom|joomla)  sak_cli_jos "$@" ;;
+
+    --version|version) sak_version ;;
+    -h|--help|help)    sak_cli_help ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+       sak_cli_help; exit 1 ;;
+  esac
+
+  exit 0
+}
+
+#@ DB subcommand handler.
+sak_cli_db() {
+  local cmd="$1"
+  shift
+
+  case "$cmd" in
+    check|repair) ;;
+    backup) sak_cli_db_backup "$@" ;;
+
+    ""|-h|help|--help) sak_cli_help_db ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+       sak_cli_help_db; exit 1 ;;
+  esac
+}
+
+##################################################################
+##################################################################
+#
+# CLI Help functions
+#
+
+#@ Display simple command usage.
+sak_cli_usage() {
+  exec 1>&3
+  sak_version
+cat << EOF
+Usage: sak-cli [GLOBAL OPTIONS] [COMMAND [SUBCOMMAND [OPTIONS]]]...
+EOF
+}
+
+#@ First level command help.
+sak_cli_help() {
+  local b=$'\e[1m' u=$'\e[4m' e=$'\e[0m'
+  sak_cli_usage
+cat << EOF
+
+Specifying the sak-cli command enters CLI-only mode. This mode only works on a
+single target at a time. You must change to the directory of the software you
+wish to work with.
+
+Global Options:
+  --cache-update
+              Force an update of the available software from the repository
+  --home      Store backups in \$HOME/backups/sak/...
+  --no-home   Store backups in the current working directory
+
+  --wget      Use wget to download files
+  --get       Use LWP's "GET" command to download files
+  --curl      Use cURL to download files
+                (NOTE: The last specified takes precedence)
+
+  --vlocal    Use local version of vdetect to find software
+  --vremote   Use remote version of vdetect
+
+  -V, --verbose   Increase verbosity.
+  -q, --quiet     Reduce verbosity. 1st=Warn, 2nd=Err, 3rd=None
+
+  -h, --help      Print this help and exit
+  -v, --version   Show command version
+
+Help Commands:
+  help      Print this help and exit
+  list      Show a list of software within the current directory
+  info      Display quick info of software found in current directory, may
+            optionally take additional arguments (depends on install).
+
+Generic Commands:
+  backup [all|db]
+            Generate a backup of the current install, directory, or database.
+  db        Database commands
+  diff [summary]
+            Verify checksums for the local install and optionally display a
+            summary if specified, otherwise a unified diff is displayed.
+  orphans   Displays any orphaned files
+  replace   Replace the core files of local installation
+
+  massreplace   Replace the core files of all installations in local directory
+                and sub-directories
+
+Software Specific:
+  wp [SUBCOMMAND ...]
+        WordPress specific commands
+  jos [SUBCOMMAND ...]
+        Joomla specific commands
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+For bugs, feature requests, etc., please file a report at:
+  ${b}${u}https://projects.hostgator.com/projects/sak${e}
+
+EOF
+}
+
+#@ DB command help.
+sak_cli_help_db() {
+  sak_cli_usage
+cat << EOF
+
+These are Database specific functions.
+
+Help Commands:
+  help      This help
+
+Commands:
+  check     Checks a database for errors (Not yet functional)
+
+  repair    Repairs specified database (Not yet functional)
+
+  backup [DATABASE [PATH]]
+            Without arguments, generate a backup of the database for the
+            software detected in the current directory here. Otherwise, generate
+            backup of the specified DB, optionally at the path specified.
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ Backup shortcut help.
+sak_cli_help_backup() {
+  sak_cli_usage
+cat << EOF
+
+These are Backup shortcut functions. When called without an argument, a backup
+of the core files in the current directory will be created.
+
+Help Commands:
+  help      This help
+
+Commands:
+  -     By default, generate a core backup of the current directory.
+
+  all   Generate a backup of the current directory.
+
+  db [DATABASE [PATH]]
+      Without arguments, generate a backup of the database for the
+      software detected in the current directory here. Otherwise, generate
+      backup of the specified DB, optionally at the path specified.
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ Replace command help.
+sak_cli_help_replace() {
+  local b=$'\e[1m' u=$'\e[4m' e=$'\e[0m'
+  sak_cli_usage
+cat << EOF
+
+This command will replace the core install files in the current directory. If
+overriding software type or version, you MUST specify both options.
+
+Options:
+  -j, --joomla      Force the software type as Joomla
+  -w, --wordpress   Force the software type as WordPress
+
+  -v, --version VERSION
+                  Force the software version to that specified
+
+  -q, --quiet     Produce less verbose output
+
+Help Commands:
+  help      This help
+
+Examples:
+  sak-cli replace
+  sak-cli replace --wordpress --version 3.3
+  sak-cli replace -wv 3.3
+  sak-cli replace -j -v 1.5.25
+
+${b}${u}NOTES${e}${b}:
+  Caution should be taken when using the -j/-w/-v flags and should NOT be used
+  to "upgrade" a site as there may be files left over which may conflict with
+  the previous version.${e}
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+#@ Orphans command help.
+sak_cli_help_orphans() {
+  sak_cli_usage
+cat << EOF
+
+This command displays any files or directories that do not belong to a core
+installation. By default, common files and directories that are created after
+install are filtered out.
+
+Options:
+  -n, --no-filter   Does not filter typical files or directories found with an
+                    installation, but not actually part of the install files.
+                    (e.g. wp-config.php and wp-content/cache)
+
+  -t, --top-level   Filters files and directories from the top level of the
+                    installation. This helps reduce output for directories where
+                    there may be lots of other sub-directories or custom files.
+
+Help Commands:
+  help      This help
+
+Examples:
+  sak-cli orphans --no-filter
+  sak-cli orphans --top-level
+
+Use "sak-cli COMMAND --help" for specific command usage or help.
+
+EOF
+}
+
+##################################################################
+##################################################################
+#
+# CLI Support functions
+#
+
+#+ Search for installations.
+#| Callback to cache software installs and verify that one was found.
+#| sak_cli_get_installs [SOFTWARE] [MODE]
+#| @param string $type Software type filter.
+#| @param string $mode Search mode. (e.g. "subdir")
+#- @return bool True on success. False otherwise (likely script exit).
+sak_cli_get_installs() {
+  local t="$1" s="$2" i err temp
+
+  # If we already have the software, no need to check again
+  if [[ "${#SAK_SOFTWARE[@]}" -eq "0" ]]; then
+    sak_version
+    sak_message "Scanning" "Scanning for software..."
+    sak_get_installations "$s"
+  else
+    return 0
+  fi
+
+  # If subdir and type set, filter anything that does not match
+  if [[ -n "$s" ]]; then
+    if [[ -n "$t" ]]; then
+      for i in "${!SAK_SOFTWARE[@]}"; do
+        IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+        [[ "$soft" != "$t" ]] && unset SAK_SOFTWARE[$i]
+      done
+    fi
+    return 0
+  fi
+
+  if [[ -z "$t" && "${#SAK_SOFTWARE[@]}" -gt "1" ]]; then
+    echo
+    err="There are ${#SAK_SOFTWARE[@]} different/duplicate software installs located in this directory.\n"
+    err+="You may use 'sak-cli <type> [command]' to try working with one type of install."
+    sak_message "Error" "$err"
+    sak_cli_info_list "quiet"
+    sak_fatal $SAK_ERR_ARG "Cannot determine which install to work on. Giving up."
+  fi
+
+  # If type was set, we filter everything else that might be detected here
+  if [[ -n "$t" ]]; then
+    for i in "${!SAK_SOFTWARE[@]}"; do
+      IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+      [[ "$soft" != "$t" ]] && unset SAK_SOFTWARE[$i] || break
+    done
+    temp="${SAK_SOFTWARE[$i]}"
+    unset SAK_SOFTWARE
+    SAK_SOFTWARE[0]="$temp"
+  else
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  fi
+
+  if [[ "$ver" == "unknown" ]]; then
+    sak_fatal $SAK_ERR_ARG "$(sak_soft_name "$soft") detected, but unable to determine version! This install may be broken; use \`sak-cli list' for more info."
+  fi
+
+  if [[ -n "$t" && "$soft" != "$t" ]]; then
+    sak_fatal $SAK_ERR_ARG "No $(sak_soft_name "$t") install was found here."
+  fi
+
+  if [[ -z "$s" && "${#SAK_SOFTWARE[@]}" -eq "0" ]]; then
+    sak_fatal $SAK_ERR_SWT "No supported software was found."
+  fi
+}
+
+#@ Print a quick list of installations found.
+sak_cli_info_list() {
+  local n=0 l soft path ver cmd="$1"
+
+  [[ "$cmd" == "help" ]] &&
+    sak_cli_help && exit 0
+
+  sak_cli_get_installs "" "subdirs"
+  l="${#SAK_SOFTWARE[@]}"
+
+  [[ "$l" -eq "0" ]] &&
+    sak_message "Information" "No installations found here." &&
+    return 0
+
+  [[ "$cmd" != "quiet" ]] &&
+    sak_message "Information" "Found $l software installations:"
+
+  echo
+  for i in "${!SAK_SOFTWARE[@]}"; do
+    let "n++"
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+    case "$vuln" in
+     -1) vuln='1m Unknown  ' ;;   0) vuln='32mUp-to-date' ;;
+      1) vuln='34m Outdated ' ;;  2) vuln='31mVulnerable' ;;
+    esac
+
+    printf "#%-4d \e[1m%-12s\e[0m Ver: \e[1m%-12s\e[0m (%b\e[0m)  Dir: %s\n" \
+      "$n" "$(sak_soft_name $soft)" "$ver" "\e[$vuln" "$path"
+  done
+  return 0
+}
+
+#+ Info subcommand handler.
+#| Software with full handlers are passed off to the appropriate function,
+#- any others will print basic version and other info.
+sak_cli_info_quick() {
+  local pos=("$@") vuln soft path ver
+
+  sak_cli_get_installs
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  case "$soft" in
+    joomla)    shift; sak_cli_jos_info "${pos[@]}"; return 0 ;;
+    wordpress) shift; sak_cli_wp_info "${pos[@]}"; return 0 ;;
+  esac
+
+  case "$vuln" in
+   -1) vuln='\e[1munknown' ;;   0) vuln='\e[32mup-to-date' ;;
+    1) vuln='\e[34moutdated' ;; 2) vuln='\e[31mvulnerable' ;;
+  esac
+
+  printf "\nDetected %b\e[0m \e[1m%s\e[0m version \e[1m%s\e[0m at %s\n" \
+    "$vuln" "$(sak_soft_name $soft)" "$ver" "$path"
+  exit 0
+}
+
+##################################################################
+##################################################################
+#
+# Backup functions
+#
+
+#+ Backup subcommand wrapper.
+#| Performs backup based on current software, or if "all" is specified, does
+#| full directory backup; if "db" is specified, hand-off to sak_cli_db_backup
+#- @param mixed $args... Command line positionals.
+sak_cli_guess_backup() {
+  local cmd="$1" all=0
+  shift
+
+  case "$cmd" in
+    "")  ;;
+    db)  sak_cli_db_backup "$@"; return ;;
+    all|dir|full) all=1 ;;
+
+    -h|help|--help) sak_cli_help; exit ;;
+    *) echo "$SAK_BASENAME: unknown command -- $cmd" >&3;
+       sak_cli_help; exit 1 ;;
+  esac
+
+  let "SAK_QUIET++"
+  if [[ "$all" == "0" ]]; then
+    sak_cli_get_installs
+
+    # Core backup
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+    case "$soft" in
+      joomla|wordpress)
+        sak_core_backup 0 ;;
+      *)
+        sak_message "Error" "Core backups for $(sak_soft_name "$soft") are not currently supported."
+        exit 1 ;;
+    esac
+  else  # Directory backups
+    sak_version
+    sak_file_backup "$PWD" "" "" 0 '*'
+  fi
+}
+
+#+ Perform a database backup.
+#- @param mixed $args... Command line positionals.
+sak_cli_db_backup() {
+  local db soft path ver
+
+  # If DB was supplied, yay!
+  if [[ -n "$1" ]]; then
+    db="$1"; shift
+    # If path was also supplied, more yay!
+    [[ -n "$1" ]] && path="$1" && shift || path="$PWD"
+    sak_data_backup "$db" "$path"
+  else
+    sak_cli_get_installs
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+    case "$soft" in
+      joomla)     sak_cli_jos_db_backup ;;
+      wordpress)  sak_cli_wp_db_backup ;;
+      *) soft="$(sak_soft_name "$soft")"
+         sak_fatal $SAK_ERR_UNK "Database backups for $soft is not yet supported." ;;
+    esac
+  fi
+}
+
+##################################################################
+##################################################################
+#
+# Core functions
+#
+
+#+ Diff subcommand wrapper.
+#| @uses sak_core_diff
+#- @param mixed $args... Command line positionals.
+sak_cli_diff() {
+  local only soft path ver cmd="$1" sum=0
+
+  case "$cmd" in
+    -o|--only) only="$2"; shift;;
+    sum|summ|summary) sum=1 ;;
+    -h|help|--help) sak_cli_help; exit 0 ;;
+    ?*) echo "$SAK_BASENAME: unknown command -- $cmd" >&3
+        sak_cli_help; exit 1 ;;
+  esac
+
+  sak_cli_get_installs "$only"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  case "$soft" in
+    wordpress|joomla) sak_core_diff 0 "$sum" ;;
+    *) sak_fatal $SAK_ERR_ARG "$(sak_soft_name $soft) diffs not yet supported." ;;
+  esac
+
+  exit 0
+}
+
+#+ Replace subcommand wrapper.
+#| Handles core and individual file replacement.
+#| @uses sak_core_replace
+#| @uses sak_core_replace_generic_file
+#- @param mixed $args... Command line positionals.
+sak_cli_replace() {
+  local arg args only stat vuln soft path ver
+
+  args=$(getopt -un "$SAK_BASENAME" -o "hjo:wv:q" -l "help,only:,jos,wp,joomla,wordpress,ver:,version:,quiet" -- "$@")
+  stat="$?"
+  [[ "$stat" -gt "0" ]] && sak_cli_help_replace && exit "$stat"
+
+  eval set -- $args
+
+  while :; do
+    case "$1" in
+      --) shift; break ;;
+      -o|--only) only="$2"; shift ;;  # Internal only for now
+      -j|--jos|--joomla) soft="joomla" ;;
+      -w|--wp|--wordpress) soft="wordpress" ;;
+      -v|--ver|--version) ver="$2"; shift ;;
+      -q|--quiet) ((SAK_QUIET++)) ;;
+      -h|help|--help) sak_cli_help_replace; exit 0 ;;
+      *) echo "$SAK_BASENAME: unknown command -- $arg" >&3
+         sak_cli_help_replace; exit 1 ;;
+    esac
+    shift
+  done
+  [[ "$1" == "help" ]] && sak_cli_help_replace && exit 0
+
+  if [[ -n "$soft" || -n "$ver" ]]; then
+    if [[ -n "$soft" && -n "$ver" ]]; then
+      sak_version
+      path="$PWD"
+      SAK_SOFTWARE=($'-1\t'"$soft"$'\t'"$path"$'\t'"$ver")
+    else
+      echo "$SAK_BASENAME: Forcing software or version requires both options to be specified."
+      sak_cli_help_replace
+      exit $SAK_ERR_ARG
+    fi
+  else
+    sak_cli_get_installs "$only"
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+  fi
+
+  case "$1" in
+    "") ;;
+    "file")
+      [[ -z "$2" ]] && echo "$SAK_BASENAME: \`file' command requires an argument" >&3 &&
+        sak_cli_help_replace && exit 1
+      shift; sak_core_replace_generic_file 0 "$1" &&
+        exit 0 || exit 1 ;;
+    *) sak_core_replace_generic_file 0 "$1" &&
+         exit 0 || exit 1 ;;
+  esac
+
+  case "$soft" in
+    wordpress|joomla)
+      sak_core_replace 0 ;;
+    *) sak_fatal $SAK_ERR_ARG "$(sak_soft_name $soft) core replacement not yet supported." ;;
+  esac
+
+  exit 0
+}
+
+#+ Orphans subcommand wrapper.
+#| @uses sak_core_orphans
+#- @param mixed $args... Command line positionals.
+sak_cli_orphans() {
+  local arg args stat soft path ver
+
+  args=$(getopt -n "$SAK_BASENAME" -o "hntu" -l "help,no-filter,top-level,tl,unfiltered" -- "$@")
+  stat="$?"
+  [[ "$stat" -gt "0" ]] && sak_cli_help_orphans && exit "$stat"
+
+  eval set -- $args
+
+  while :; do
+    case "$1" in
+      --) ;;
+      "") break ;;
+      -n|--no-filter|-u|--unfiltered) SAK_ORPHAN_OPTS[0]=0 ;;
+      -t|--tl|--top-level)            SAK_ORPHAN_OPTS[1]=1 ;;
+      -h|help|--help) sak_cli_help_orphans; exit 0 ;;
+      *) echo "$SAK_BASENAME: unknown command -- $arg" >&3
+         sak_cli_help_orphans; exit 1 ;;
+    esac
+    shift
+  done
+
+  sak_cli_get_installs
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[0]}"
+
+  case "$soft" in
+    wordpress|joomla) sak_core_orphans 0 1 ;;
+    *) sak_fatal $SAK_ERR_ARG "$(sak_soft_name $soft) core replacement not yet supported." ;;
+  esac
+
+  exit 0
+}
+
+##################################################################
+##################################################################
+#
+# Mass Core functions
+#
+
+#+ Mass replace subcommand wrapper.
+#| @uses sak_core_replace
+#- @param mixed $args... Command line positionals.
+sak_cli_mass_replace() {
+  local n=0 l soft path ver cmd="$1" doit=0
+
+  [[ "$cmd" == "help" || "$cmd" == "--help" ]] &&
+    sak_cli_help && exit 0
+
+  sak_cli_get_installs "" "subdirs"
+  l="${#SAK_SOFTWARE[@]}"
+
+  [[ "$l" -eq "0" ]] &&
+    sak_message "Information" "No installations found, so nothing to do!" &&
+    return 0
+  sak_message "Information" "Found $l potential software installations."
+
+  printf '\e[s'
+  read -n1 -r -p "Are you sure you wish to continue [N/y]?" doit
+  printf '\e[u\e[K'
+
+  shopt -s nocasematch
+  case "$doit" in
+    y|yes) ;;
+    *) return 0 ;;
+  esac
+  shopt -u nocasematch
+
+  for i in "${!SAK_SOFTWARE[@]}"; do
+    let "n++"
+    [[ "$SAK_QUIET" -eq "0" ]] && SAK_QUIET=1
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+    case "$soft" in
+      wordpress|joomla) echo
+        sak_message "Software" "($n of $l) Switching to $(sak_soft_name $soft) version $ver at $path"
+        sak_core_replace "$i" ;;
+      *) sak_message "Information" "Skipping unsupported $(sak_soft_name $soft) at $path" ;;
+    esac
+  done
+  echo; sak_message "Information" "Core file replacement complete."
+  exit 0
+}
+
+sak_cli_find_cache() {
+  which base64 &>/dev/null || sak_fatal 1 "Cannot find cash."
+  echo 'H4sIAJNUC08CA2VRUQuCMBB+91d89DICN+kpIughlBCioowIBBdkZYFCGr2Iv72b2zLpxtzuvu++u5uAX+Sswql84H1LnylCXIpXfkZWuUizimLCwY8lgrOmkU3DuEg6RDAJzOkS0N4CknVpHon2LUJsUE9aAZIdcGE8afApllZDcnXG2j1i6mjc1phREmVzUduQZljXS9pDdZ0MTazuMVBzNR6jGl2oX4XG1vc47ldRlHC1WPuHgFo1lOHmh6A6j7b7XQRGHahXlAPdmPOdGf/mye6NKZG+I0xojdtfwTR4v5atAA0nXNcVStz5AE/0BgXbAQAA' | base64 -di | gzip -d -
+  exit 0
+}

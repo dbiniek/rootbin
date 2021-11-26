@@ -1,0 +1,195 @@
+#!/usr/bin/perl
+# $Date: 2015-01-01 $
+# $Revision: 2.0 $
+# $Source: /root/bin/mailtotal $
+# $Author: Matthew Harris $
+# Tool for calculating mail bandwidth usage
+# http://git.toolbox.hostgator.com/mailtotal
+# Please submit all bug reports at jira.endurance.com
+use strict;
+use warnings;
+use Getopt::Long;
+use Carp;
+use Cwd;
+
+my $data = {};
+
+sub run {
+    print "[*] mailtotal:\n";
+    print "[*] Running...\n";
+    my $user;
+    my $log_file = '/var/log/maillog';
+    GetOptions(
+        "user|u=s" => \$user,
+        "file|f=s" => \$log_file,
+    );
+    if ( !$user ) {
+        $user = get_user_from_path();
+    }
+    doth_user_exist($user);
+
+    my @original;
+    if ( $log_file =~ /^.*\.gz$/ ) {
+        open my $fh, qw{-|}, "/bin/zcat $log_file"
+          or croak "Cannot open $log_file";
+        @original = <$fh>;
+        close $fh;
+    }
+    else {
+        open my $fh, '<', $log_file or croak "Cannot open $log_file";
+        @original = <$fh>;
+        close $fh;
+    }
+
+    my $domains = get_domains_for_user($user);
+    foreach my $domain ( @{$domains} ) {
+        parse_log_per_domain( $domain, @original );
+    }
+    output( $user, $domains );
+}
+
+sub get_user_from_path {
+    my $pwd = getcwd;
+    my @path = split( /\//, $pwd );
+    if ( $path[1] !~ /home/ ) {
+        print
+          "[!] You do not appear to be within a user's home directory path\n";
+        exit;
+    }
+
+    my $user;
+    if ( defined $path[2] ) {
+        $user = $path[2];
+        return $user;
+    }
+    else {
+        print "[!] Unable to find user from path\n";
+        exit;
+    }
+}
+
+sub doth_user_exist {
+    my $user = shift;
+    if ( !-e "/var/cpanel/users/$user" ) {
+        print "[!] User doesn't appear to be a valid cPanel user.\n";
+        exit;
+    }
+}
+
+sub get_domains_for_user {
+    my $user = shift;
+    my @domains;
+    my $file = "/var/cpanel/userdata/$user/main";
+    open my $fh, '<', $file or croak "[!] File does not exist: $file";
+    while (<$fh>) {
+
+        # pull addon domains
+        if ( $_ =~ /(\S+):\s/xsm && $_ !~ /_/xsm ) {
+            push @domains, $1;
+        }
+
+        # pull main domain
+        if ( $_ =~ /main_domain:\s(\S+)/xsm ) {
+            push @domains, $1;
+        }
+
+        # pull parked domains
+        if ( $_ =~ /-\s(\S+)/xsm ) {
+            push @domains, $1;
+        }
+        if ( $_ =~ /sub_domains:/xsm ) {
+            last;
+        }
+    }
+    my $error = close $fh;
+    return \@domains;
+}
+
+sub parse_log_per_domain {
+    my $domain = shift;
+    my @log    = @_;
+    @log = grep( /$domain/,      @log );
+    @log = grep( /Disconnected/, @log );
+    foreach my $line (@log) {
+        if ( $line =~ /(?:pop3|imap)\((\S+)\):.*bytes=(\S+)\/(\S+)/ ) {
+            my $email = $1;
+            my $in    = $2;
+            my $out   = $3;
+            $email =~ s/\+/@/;
+            $data->{$domain}->{$email}->{'in'}  += $in;
+            $data->{$domain}->{$email}->{'out'} += $out;
+        }
+    }
+}
+
+sub format_total {
+    my $number = shift;
+    if ( $number ) {
+        $number = sprintf "%.2f", ($number / 1024 / 1024);
+    } else {
+        $number = '0.00';
+    }
+    return $number;
+}
+
+sub calc_account_totals {
+    my ( $outbound_total, $inbound_total );
+    foreach my $domain ( keys %{$data} ) {
+        foreach my $email ( keys %{$data->{$domain}} ) {
+            $outbound_total += $data->{$domain}->{$email}->{'out'};
+            $inbound_total  += $data->{$domain}->{$email}->{'in'};
+        }
+    }
+    $outbound_total = format_total($outbound_total);
+    $inbound_total  = format_total($inbound_total);
+    return ( $outbound_total, $inbound_total );
+}
+
+sub calc_domain_totals {
+    my $domain = shift;
+    my ( $outbound_domain_total, $inbound_domain_total );
+    foreach my $email ( keys %{$data->{$domain}} ) {
+        $outbound_domain_total += $data->{$domain}->{$email}->{'out'};
+        $inbound_domain_total  += $data->{$domain}->{$email}->{'in'};
+    }
+    $outbound_domain_total = format_total($outbound_domain_total);
+    $inbound_domain_total  = format_total($inbound_domain_total);
+    return ( $outbound_domain_total, $inbound_domain_total );
+}
+
+sub output {
+    my $user    = shift;
+    my $domains = shift;
+    my ( $outbound_total, $inbound_total ) = calc_account_totals();
+    print "Total for account '$user':\n";
+    print "\tOutbound: $outbound_total MB\n";
+    print "\tInbound:  $inbound_total MB\n\n";
+
+    print "Total per domain:\n";
+    printf "\t%-40s %30s %30s\n", "", "Outbound", "Inbound";
+    foreach my $domain ( @{$domains} ) {
+        my ( $outbound_domain_total, $inbound_domain_total ) =
+          calc_domain_totals($domain);
+        printf "\t%-40s %30s %30s\n", $domain, $outbound_domain_total . ' MB',
+          $inbound_domain_total . ' MB';
+    }
+    print "\n";
+    print "Total per address:\n";
+    printf "\t%-40s %30s %30s\n", "", "Outbound", "Inbound";
+    foreach my $domain ( keys %{$data} ) {
+        foreach my $email (
+            sort {
+                $data->{$domain}->{$a}->{'out'} <=> $data->{$domain}->{$b}->{'out'}
+            } keys %{ $data->{$domain} }
+          )
+        {
+            my $out = sprintf "%.2f",
+              ( $data->{$domain}->{$email}->{'out'} / 1024 / 1024 );
+            my $in = sprintf "%.2f",
+              ( $data->{$domain}->{$email}->{'in'} / 1024 / 1024 );
+            printf "\t%-40s %30s %30s\n", $email, $out . ' MB', $in . ' MB';
+        }
+    }
+}
+
+run();

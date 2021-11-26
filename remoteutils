@@ -1,0 +1,672 @@
+#! /usr/local/cpanel/3rdparty/bin/perl
+###########
+# remoteutils
+# Remote utilities for the Migrations Group
+# http://git.toolbox.hostgator.com/remoteutils/pages/Home/
+# http://git.toolbox.hostgator.com/remoteutils/
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2012 - HostGator.com, LLC
+###########
+# By Rish
+
+use strict;
+use Sys::Hostname;
+use Socket;
+use LWP::UserAgent;
+use MIME::Base64;
+use POSIX qw(strftime);
+use Term::ANSIColor;
+use Getopt::Long qw (:config pass_through);
+use JSON;
+use cPanel::PublicAPI;
+
+my @listwhmaccts;
+my @masspasschg;
+my @ptcheck;
+my @mysqlwl;
+my @getdr;
+my @ereset;
+my $users;
+my $help;
+my $short;
+my $bad;
+my $missing;
+
+GetOptions ( 'bad'                        => \$bad,
+             'help|h'                     => \$help,
+             'users=s'                    => \$users,
+             'short'                      => \$short,
+             'tcheck|c=s{1,4}'            => \@ptcheck,
+             'missing'                    => \$missing,
+             'listwhmaccts|l=s{3}'        => \@listwhmaccts,
+             'masspasschg|p=s{3}'         => \@masspasschg,
+             'mysqlwhitelist|mw=s{3}'     => \@mysqlwl,
+             'getdocroots|gd=s{3}'        => \@getdr,
+             'resetemailpasswords|e=s{3}' => \@ereset,
+           );
+
+if ($help) {
+	help();
+}
+
+if ( ( (scalar(@listwhmaccts) != 3)  and (scalar(@masspasschg) != 3) and 
+       ( (scalar(@ptcheck) != 1) and (scalar(@ptcheck) != 4) ) and 
+       (scalar(@mysqlwl) != 3) and (scalar(@getdr) != 3) and 
+       (scalar(@ereset) != 3) 
+     ) or @ARGV ) {
+	print "[!] Unknown option passed. Please see --help\n";
+	exit 1;
+}
+
+main();
+
+sub help {
+
+	print "[+] Remote utilities for the Migrations Group\n";
+	print "[#] By Rish - please report bugs at https://projects.hostgator.com/projects/hg_migrations/\n\n";
+	print "Remoteutils has the following options:\n\n";
+	print "-l, --listwhmaccts:\n";
+	print "\tThis option takes the following (order matters):\n";
+	print "\t\t[Remote hostname|IP]\n";
+	print "\t\t[WHM Username]\n";
+	print "\t\t[Password]\n\n";
+	print "\tOutputs a list of usernames that the provided WHM user has access to. The list is formated in the typical 'host user pass' format\n\n";
+
+	print "-p, --masspasschg:\n";
+	print "\tThis option takes the following (order matters):\n";
+	print "\t\t[Remote hostname|IP]\n";
+	print "\t\t[WHM Username]\n";
+	print "\t\t[Password]\n";
+	print "\t\tOptional:\n";
+	print "\t\t\t --users [filename with users that you want to reset passwords for...]\n";
+	print "\t\t\t If no --users is specified then all of the accounts will have their passwords reset.\n\n";
+	print "\tOutputs a list of usernames with the new passwords that the WHM user has access to. The list is formated in the typical 'host user pass' format\n\n";
+
+	print "-e, --resetemailpasswords:\n";
+	print "\tThis option takes the following (order matters):\n";
+	print "\t\t[Remote hostname|IP]\n";
+	print "\t\t[cPanel Username]\n";
+	print "\t\t[Password]\n\n";
+	print "\tOutputs a list of email addresses along with the new RESET passwords for each.\n";
+
+	print "-gd, --getdocroots:\n";
+	print "\tThis option takes the following (order matters):\n";
+	print "\t\t[Remote hostname|IP]\n";
+	print "\t\t[cPanel Username]\n";
+	print "\t\t[Password]\n";
+	print "\tOutputs a list of domains and their associated document roots\n\n";
+
+	print "-c, --tcheck:\n";
+	print "\tThis option takes the following (order matters):\n";
+	print "\t\t<name of file contain 'host user pass' lines\n";
+	print "\t\t OR the following four arguments:\n";
+	print "\t\t'whm' or 'cpanel' (indicates what level of access we should attempt).\n";
+	print "\t\t[Remote hostname|IP]\n";
+	print "\t\t[Username]\n";
+	print "\t\t[Password]\n";
+	print "\t\tOptional:\n";
+	print "\t\t\t --short\n";
+	print "\t\t\t Cuts the output down to just the checks (no details).\n";
+	print "\t\t\t --missing\n";
+	print "\t\t\t Prints the usernames for accounts that are present on the remote server but missing on the local server.\n";
+	print "\t\t\t --bad\n";
+	print "\t\t\t Print information for accounts that do not have the same settings.\n";
+	print "\tOutputs differences (if any) between the accounts on the current server, and the remote server.\n\n";
+
+	print "-mw, --mysqlwhitelist:\n";
+	print "\tThis option takes the following (order matters):\n";
+	print "\t\t[Remote hostname|IP]\n";
+	print "\t\t[Username]\n";
+	print "\t\t[Password]\n";
+
+	exit 1;
+}
+
+sub main {
+
+	my $exit;
+	if (scalar(@listwhmaccts) == 3) {
+		$exit = lwaccts(@listwhmaccts);
+	} elsif (scalar(@masspasschg) == 3) {
+		$exit = mpchg(@masspasschg);
+	} elsif (scalar(@ptcheck) == 1) {
+		$exit = ptcheck_file($ptcheck[0]);
+	} elsif (scalar(@ptcheck) == 4) {
+		$exit = ptcheck_args(@ptcheck);
+	} elsif (scalar(@mysqlwl) == 3) {
+		$exit = mysqlwl(@mysqlwl);
+	} elsif (scalar(@getdr) == 3) {
+		$exit = getdr(@getdr);
+	} elsif (scalar(@ereset) == 3) {
+		$exit = emailchg(@ereset);
+	} else {
+		print "[!] Argument parsing failed. Please double check the input\n";
+		exit 1;
+	}
+	exit (not $exit);
+}
+
+sub colorify {
+
+	my $string = shift;
+	my $color  = shift;
+	return color($color).$string.color("reset");
+}
+
+sub lwaccts {
+
+	my ($host, $user, $pass) = @_;
+	print "[+] Listing accounts for '$user'\@'$host'...\n";
+	my $apic = cPanel::PublicAPI->new ('user' => "$user", 'pass' => "$pass", 'host' => "$host", 'ssl_verify_mode' => "0");
+
+	my $request;
+	if ($user eq "root") {
+		$request = $apic->whm_api('listaccts', { 'search' => "*" }, 'json');
+	} else { 
+		$request = $apic->whm_api('listaccts', { 'searchtype' => "owner", 'search' => "$user"}, 'json');
+	}
+
+	my $output = from_json($request);
+	my @users;
+
+	if ( $output->{'metadata'}->{'result'} == 1 ){
+
+		foreach my $obj (@{$output->{'data'}->{'acct'}}){
+			my $tempu = $obj->{'user'};
+			push (@users, $tempu);
+		}
+
+		@users = sort (@users);
+		print "[*] Number of Users found under this account: ".scalar(@users)."\n";
+		print "Host lines to use are:\n";
+
+		my $request1;
+		foreach my $tuser (@users){
+			print "$host $tuser $pass\n";
+		}		
+	} else {
+		print "[!] Unable to login, or valid WHM access was not provided.\n";
+	}
+
+}
+
+sub mpchg {
+
+	my ($host, $user, $pass) = @_;
+	my @pusers;
+	my $apic = cPanel::PublicAPI->new ('user' => "$user", 'pass' => "$pass", 'host' => "$host", 'ssl_verify_mode' => "0");
+	my $request;
+
+	if (-s $users) {
+		open my $FILE, "<", $users;
+		
+		while (<$FILE>) {
+			chomp $_;
+			if (!($_ eq "") && !($_ eq $user)) {
+				push (@pusers, $_);
+			}
+		}
+		close($FILE);
+
+		print "[*] Only processing the following users:\n";
+		foreach (@pusers) {
+			if ($_ eq $user) { 
+				next; 
+			}
+			print colorify(" $_", "green"); 
+		}
+		print "\n";
+	} else {
+		print "[*] Processing all users under '$user'\@'$host'...\n";
+	}
+
+	if ($user eq "root") {
+		$request = $apic->whm_api('listaccts', { 'search' => "*" }, 'json');
+	} else { 
+		$request = $apic->whm_api('listaccts', { 'searchtype' => "owner", 'search' => "$user"}, 'json');
+	}
+
+	my $output = from_json($request);
+	my @users;
+
+	if ( $output->{'metadata'}->{'result'} == 1 ){
+
+		my $pushtest = 0;
+		if (scalar(@pusers) == 0) {
+			$pushtest = 1;
+		}
+
+		foreach my $obj (@{$output->{'data'}->{'acct'}}){
+			my $tempu = $obj->{'user'};
+			if ($user eq $tempu) {
+					next;
+			} else {
+				push (@users, $tempu);
+				if ($pushtest) {
+					push (@pusers, $tempu);
+				}
+			}
+		}
+		
+		print "[*] Total number of users found under this account: ".scalar(@users)."\n";
+		print "[*] Number of users to process: ".scalar(@pusers)."\n";
+
+		my $request1;
+		my @output;
+		foreach my $tuser (@pusers) {
+			if ($tuser eq $user) {
+				next;
+			}
+			
+			if (grep(/^$tuser$/, @users)) {
+				my $pass = "";
+				my $possible = 'abcdefghijkmnpqrstuvwxyz23456789';
+				while ( length($pass) < 12 ) {
+			        	$pass .= substr( $possible, ( int( rand( length($possible) ) ) ), 1 );
+				}
+				$request1 = $apic->whm_api('passwd', {'user' => "$tuser", 'password' => "$pass"}, 'json');
+				my $output1 = from_json($request1);
+				if ($output1->{'metadata'}->{'result'} == 1){
+					push (@output, "$host $tuser $pass");
+				} else {
+					print "[!] $tuser\'s password was not updated.\n";
+					print $output1->{'metadata'}->{'reason'};
+				}
+			} else {
+				print "[!] '$tuser' does not exist on '$host' server.\n";
+			}
+		}
+		print "[+] New set of host lines are:\n\n";
+		foreach (@output) {
+			print "$_\n";
+		}
+	} else {
+		print "[!] Unable to login, or valid WHM access was not provided.\n";
+	}
+
+}
+
+sub ptcheck_file {
+
+	my $file = shift;
+	if (-s $file) {
+		use Tie::File;
+		tie my @lines, 'Tie::File', $file;
+		foreach my $line (@lines) {
+			my @args = split(/\s/, $line);
+			if (scalar(@args) == 3) {
+				ptcheck_args('cpanel', @args);
+			} else {
+				print "[!] Skipping malformed line in $file: '$line'\n";
+				next;
+			}	
+		}
+		untie @lines;
+	} else {
+		print "[!] File specified does not exist: '$file'\n";
+		return 0;
+	}
+}
+
+sub ptcheck_args {
+
+	my ($type, $hostname, $user, $pass) = @_;
+
+	if (lc($type) eq "cpanel") {
+
+		if (userexists($user)) {
+			if (not $missing and not $bad) { print "\n[*] Gathering information for ".colorify($user,"green")."...\n"; }
+			my $result = processuser($hostname, $user, $pass);
+		} else {
+			print "[!] ".colorify($user,"red")." does not exist on the local server, so not bothering to check the remote server.\n";
+		}
+
+	} elsif (lc($type) eq "whm") {
+		processptwhm ($hostname, $user, $pass);
+	} else {
+		print "[!] Unknown type given... what is a '$type'?\n";
+	}
+}
+
+sub getdr {
+
+	my ($host, $user, $pass) = @_;
+	my $apic = cPanel::PublicAPI->new ('user' => "$user", 'pass' => "$pass", 'host' => "$host", 'ssl_verify_mode' => "0");
+	my $request = $apic->cpanel_api2_request('whostmgr', { 'module' => "DomainLookup", 'func' => "getdocroots", 'user' => "$user"}, { }, 'json');
+	my $output = from_json($request);
+
+	if ( $output->{'cpanelresult'}->{'event'}->{'result'} == 1 ){
+		print "[+] Successfully retrieved docroot information:\n";
+		my %docroots;
+
+		if (ref($output->{'cpanelresult'}{'data'}) eq 'ARRAY') {
+			foreach my $dom (@{$output->{'cpanelresult'}{'data'}}){
+				my $domain = $dom->{'domain'};
+				my $docroot = $dom->{'docroot'};
+				$docroots{$domain} = $docroot;
+			}
+		} else {
+			$docroots{$output->{'cpanelresult'}{'data'}->{'domain'}} = $output->{'cpanelresult'}{'data'}->{'docroot'};
+		}	
+		foreach my $domain (sort keys %docroots) {
+			print "\t".colorify($domain, "yellow")." : ".colorify($docroots{$domain}, "green")."\n";
+		}
+	} else {
+		print "[!] Failed to retreive docroot information from remote server.\n";
+	}
+}
+
+sub mysqlwl {
+
+	my ($host, $user, $pass) = @_;
+	my $localip = inet_ntoa((gethostbyname(hostname))[4]);
+	my $apic = cPanel::PublicAPI->new ('user' => "$user", 'pass' => "$pass", 'host' => "$host", 'ssl_verify_mode' => "0");
+	my $request = $apic->cpanel_api2_request('whostmgr', { 'module' => "MysqlFE", 'func' => "authorizehost", 'user' => "$user" }, { 'host' => "$localip" }, 'json');
+	my $output = from_json($request);
+
+	if ( $output->{'cpanelresult'}->{'event'}->{'result'} == 1 ){
+		print "[+] Successfully whitelisted '".colorify($localip,"green")."' on '$host'\n";
+	} else {
+		print "[!] Whitelist attempt failed on '".colorify($host, "red")."'.Check the cPanel manually.\n";
+	}
+}
+
+sub processptwhm { 
+
+	my ($host, $user, $pass) = @_;
+	my $request;
+	my $apic = cPanel::PublicAPI->new ('user' => "$user", 'pass' => "$pass", 'host' => "$host", 'ssl_verify_mode' => "0");
+	if ($user eq "root") {
+		$request = $apic->whm_api('listaccts', { 'search' => "*" }, 'json');
+	} else { 
+		$request = $apic->whm_api('listaccts', { 'searchtype' => "owner", 'search' => "$user"}, 'json');
+	}
+
+	my $output_list = from_json($request);
+	my @users;
+	if ( $output_list->{'metadata'}->{'result'} == 1 ){
+		print "[*] Retrived user list successfully.\n";
+		if (ref($output_list->{'data'}{'acct'}) eq 'ARRAY') {
+			foreach my $obj (@{$output_list->{'data'}{'acct'}}){
+				my $tempu = $obj->{'user'};
+				push (@users, $tempu);
+			}
+		} else {
+			push @users, $output_list->{'acct'}->{'user'};
+		}
+
+		
+		print "[*] Number of Users found under this account: ".scalar(@users)."\n";
+		my @missing;
+		my @bad;
+		my $ALLGOOD = 1;
+		my $counter = 0;
+
+		foreach my $tuser (@users){
+			$counter++;
+			if (not userexists($tuser)) {
+				if (not $bad) { print "\n[!] ".colorify($tuser,"red")." does not exist not the local server.\n"; }
+				$ALLGOOD = 0;
+				push @missing, $tuser;
+				next;
+			}
+			if (not $missing and not $bad) { 
+				print "\n[*] Gathering information for $tuser... ($counter/".scalar(@users).")";
+			}
+
+			my $result = processuser($host, $user, $pass, $tuser);
+			if (not $result) {
+				push @bad, $tuser;
+				$ALLGOOD = 0;
+			}
+		}
+
+		if ($ALLGOOD){
+			print "\n[+] ".colorify("All users' stats match between the servers.\n","green");
+			return 1;
+		} else {
+			print "\n[!] ".colorify("All users' stats DO NOT match between the servers.\n", "red");
+			if (@missing) {
+				print "\n[!] These users are missing from the server but are present on the remote server:\n";
+				foreach (@missing) {
+					print "\t".colorify($_, "red")."\n";
+				}
+			}
+			if (@bad) {
+				print "\n[!] These users' had different account stats on the remote server:\n";
+				foreach (@bad) {
+					print "\t".colorify($_, "red")."\n";
+				}
+			}
+			return 0;
+		}
+	} else {
+		print "[!] Unable to login, or valid WHM access was not provided.\n";
+	}
+}
+
+sub processuser {
+
+	my ($HOST, $USER, $PASS, $tuser) = @_;
+	my $user = $USER;
+	my ($maindom, $addons, $subs, $parks, $ftps, $du, $duunit, $mysqldu, $mysqldut, $sqldbs, $emails, $emailforwards, $emailfilters, $maillists) = fetch_remote_info($HOST, $user, $PASS, $tuser);
+	my ($maindom1, $addons1, $subs1, $parks1, $ftps1, $du1, $duunit1, $mysqldu1, $mysqldut1, $sqldbs1, $emails1, $emailforwards1, $emailfilters1, $maillists1) = fetch_local_info($user, $PASS, $tuser);
+
+	if (not $maindom) {
+		return 0;
+	}
+
+	my $isgood = 0;
+	if ($maindom eq $maindom1 and $addons == $addons1 and $subs == $subs1 and 
+	    $parks == $parks1 and $ftps == $ftps1 and $sqldbs == $sqldbs1 and
+	    $emails == $emails1 and $emailforwards == $emailforwards1 and $emailfilters == $emailfilters1) {
+		$isgood = 1;
+	}
+
+	if ($isgood) {
+		if (not $missing and not $bad) { print "\n[+] ".colorify($tuser,"green")." stats match between the servers.\n"; }
+	} else {
+		if (not $missing) { print "\n[!] ".colorify($tuser,"red")." stats do NOT match between the servers.\n"; }
+	}
+
+	if (not $short and not $missing) {
+		if ($bad and $isgood) { return $isgood; }
+		print "\n[*] Details for $tuser: (remote/local)\n";
+		print "[*] Primary Domain: "; ($maindom eq $maindom1)? print colorify("$maindom / $maindom1","green") : print colorify("$maindom / $maindom1","red"); print "\n";
+		print "[*] Addon domains: "; ($addons == $addons1)? print colorify("$addons/$addons1 ","green") : print colorify("$addons/$addons1 ","red");
+		print "- Subdomains: "; ($subs == $subs1)? print colorify("$subs/$subs1 ","green") : print colorify("$subs/$subs1 ","red");
+		print "- Parked domains: "; ($parks == $parks1)? print colorify("$parks/$parks1","green") : print colorify("$parks/$parks1","red"); print "\n";
+		print "[*] FTP accounts: "; ($ftps == $ftps1)? print colorify("$ftps/$ftps1 ","green") : print colorify("$ftps/$ftps1 ","red");
+		print "- Email accounts: "; ($emails == $emails1)? print colorify("$emails/$emails1 ","green") : print colorify("$emails/$emails1 ","red");
+		print "- Email forwarders: "; ($emailforwards == $emailforwards1)? print colorify("$emailforwards/$emailforwards1 ","green") : print colorify("$emailforwards/$emailforwards1 ","red");
+		print "- Email Filters: "; ($emailfilters == $emailfilters1)? print colorify("$emailfilters/$emailfilters1 ","green") : print colorify("$emailfilters/$emailfilters1","red");
+		print "- Mailing Lists: "; ($maillists == $maillists1)? print colorify("$maillists/$maillists1","green") : print colorify("$maillists/$maillists1","red"); print "\n";
+		print "[*] MySQL databases: "; ($sqldbs == $sqldbs1)? print colorify("$sqldbs/$sqldbs1 ","green") : print colorify("$sqldbs/$sqldbs1 ","red");
+		print "- MySQL disk usage: "; ($mysqldu == $mysqldu1)? print colorify("$mysqldu $mysqldut / $mysqldu1 $mysqldut1", "green") : print colorify("$mysqldu $mysqldut / $mysqldu1 $mysqldut1","red"); print "\n";
+		print "[*] Total disk usage by the account: "; ($du == $du1)? print colorify("$du $duunit / $du1 $duunit1","green") : print colorify("$mysqldu $mysqldut / $mysqldu1 $mysqldut1","red"); print "\n";
+	}
+
+	return $isgood;
+}
+
+sub fetch_remote_info {
+
+	my ($host, $user, $pass, $tuser) = @_;
+	my $apic = cPanel::PublicAPI->new ('user' => "$user", 'pass' => "$pass", 'host' => "$host", 'ssl_verify_mode' => "0");
+	if ($tuser){ 
+		$user = $tuser;
+	}
+	my $request;
+	my $request1;
+	$request = $apic->cpanel_api2_request('whostmgr', { 'module' => 'StatsBar', 'func' => 'stat', 'user' => "$user" }, { 'display' => 'addondomains|subdomains|parkeddomains|ftpaccounts|diskusage|mysqldiskusage|sqldatabases|emailaccounts|emailforwarders|emailfilters|mailinglists'}, 'json');
+	$request1 = $apic->cpanel_api2_request('whostmgr', { 'module' => 'DomainLookup', 'func' => 'getmaindomain', 'user' => "$user" }, { }, 'json'); 
+	my $output = from_json($request);
+	my $output1 = from_json($request1);
+	if ( $output->{'cpanelresult'}->{'event'}->{'result'} != 1 ) {
+		print "[!] Access denied: ".colorify($user,"red")." - $pass does not work at $host.\n";
+		return 0;
+	}
+	my $maindom = $output1->{'cpanelresult'}->{'data'}[0]{'main_domain'};
+	my $addons = $output->{'cpanelresult'}->{'data'}[0]{'count'};
+	my $subs = $output->{'cpanelresult'}->{'data'}[1]{'count'};
+	my $parks = $output->{'cpanelresult'}->{'data'}[2]{'count'};
+	my $ftps = $output->{'cpanelresult'}->{'data'}[3]{'count'};
+	my $du = $output->{'cpanelresult'}->{'data'}[4]{'count'};
+	my $duunit = $output->{'cpanelresult'}->{'data'}[4]{'units'};
+	my $mysqldu = $output->{'cpanelresult'}->{'data'}[5]{'count'};
+	my $mysqldut = $output->{'cpanelresult'}->{'data'}[5]{'units'};
+	my $sqldbs = $output->{'cpanelresult'}->{'data'}[6]{'count'};
+	my $emails = $output->{'cpanelresult'}->{'data'}[7]{'count'};
+	my $emailforwards = $output->{'cpanelresult'}->{'data'}[8]{'count'};
+	my $emailfilters = $output->{'cpanelresult'}->{'data'}[9]{'count'};
+	my %maillists = 0;
+	my $maillists = 0;
+	if (exists ( $output->{'cpanelresult'}->{'data'}[10]) ) {
+		if (ref($output->{'cpanelresult'}->{'data'}[10]{'count'}) eq 'HASH') {
+			%maillists = %{$output->{'cpanelresult'}->{'data'}[10]{'count'}};
+			$maillists = scalar(keys %maillists);
+		} else {
+			$maillists = $output->{'cpanelresult'}->{'data'}[10]{'count'};
+		}
+	}
+
+	return ($maindom, $addons, $subs, $parks, $ftps, $du, $duunit, $mysqldu, $mysqldut, $sqldbs, $emails, $emailforwards, $emailfilters, $maillists);
+}
+
+sub fetch_local_info {
+
+	my $user = shift;
+	my $pass = shift;
+	my $tuser = shift;
+	my $currversion = +(split /\./,`cat /usr/local/cpanel/version`)[1];
+	my $token_name;
+	my $apic;
+	my $token;
+	my $json;
+	if ($currversion >= 70){
+		END{
+			if($token_name){
+				`whmapi1 api_token_revoke token_name=$token_name`
+			}
+		}
+		{
+			my $revoked;
+			$SIG{INT} = sub { 
+				unless ($revoked) {
+					$revoked = 1;
+					fork or exec('whmapi1', 'api_token_revoke', "token_name=$token_name");
+				}
+				die "Interrupted"
+			};
+		}
+		$token_name = "remoteutils_".time();
+		$json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+		$token = from_json($json)->{'data'}{'token'};
+		$apic = cPanel::PublicAPI->new ('ssl_verify_mode' => "0", api_token => $token );
+		
+	} else{
+		print "\n";
+		die "Don't run this flag on servers less than 11.70";
+	}
+
+	if ($tuser){
+		$user = $tuser;
+	}
+	my $request;
+	my $request1;
+
+        $request = $apic->cpanel_api2_request('whostmgr', { 'module' => 'StatsBar', 'func' => 'stat', 'user' => "$user" }, { 'display' => 'addondomains|subdomains|parkeddomains|ftpaccounts|diskusage|mysqldiskusage|sqldatabases|emailaccounts|emailforwarders|emailfilters|mailinglists'}, 'json');
+        $request1 = $apic->cpanel_api2_request('whostmgr', { 'module' => 'DomainLookup', 'func' => 'getmaindomain', 'user' => "$user" }, { }, 'json');
+
+	my $output = from_json($request);
+	my $output1 = from_json($request1);
+
+	my $maindom = $output1->{'cpanelresult'}->{'data'}[0]{'main_domain'};
+	my $addons = $output->{'cpanelresult'}->{'data'}[0]{'count'};
+	my $subs = $output->{'cpanelresult'}->{'data'}[1]{'count'};
+	my $parks = $output->{'cpanelresult'}->{'data'}[2]{'count'};
+	my $ftps = $output->{'cpanelresult'}->{'data'}[3]{'count'};
+	my $du = $output->{'cpanelresult'}->{'data'}[4]{'count'};
+	my $duunit = $output->{'cpanelresult'}->{'data'}[4]{'units'};
+	my $mysqldu = $output->{'cpanelresult'}->{'data'}[5]{'count'};
+	my $mysqldut = $output->{'cpanelresult'}->{'data'}[5]{'units'};
+	my $sqldbs = $output->{'cpanelresult'}->{'data'}[6]{'count'};
+	my $emails = $output->{'cpanelresult'}->{'data'}[7]{'count'};
+	my $emailforwards = $output->{'cpanelresult'}->{'data'}[8]{'count'};
+	my $emailfilters = $output->{'cpanelresult'}->{'data'}[9]{'count'};
+	my %maillists = 0;
+	my $maillists = 0;
+	if (exists ( $output->{'cpanelresult'}->{'data'}[10]) ) {
+		if (ref($output->{'cpanelresult'}->{'data'}[10]{'count'}) eq 'HASH') {
+			%maillists = %{$output->{'cpanelresult'}->{'data'}[10]{'count'}};
+			$maillists = scalar(keys %maillists);
+		} else {
+			$maillists = $output->{'cpanelresult'}->{'data'}[10]{'count'};
+		}
+	}
+
+	return ($maindom, $addons, $subs, $parks, $ftps, $du, $duunit, $mysqldu, $mysqldut, $sqldbs, $emails, $emailforwards, $emailfilters, $maillists);
+}
+
+sub emailchg {
+
+	my ($host, $user, $pass) = @_;
+	my $apic = cPanel::PublicAPI->new ('user' => "$user", 'pass' => "$pass", 'host' => "$host", 'ssl_verify_mode' => "0");
+	my $request = $apic->cpanel_api2_request('cpanel', { 'module' => "Email", 'func' => 'listpopssingle', 'user' => "$user"}, { }, 'json');
+
+	my $output = from_json($request);
+
+	if ( $output->{'cpanelresult'}->{'event'}->{'result'} == 1 ) {
+
+		my @emails;
+		if (ref($output->{'cpanelresult'}->{'data'}) eq 'ARRAY') {
+			foreach my $obj (@{$output->{'cpanelresult'}->{'data'}}){
+				my $tempu = $obj->{'login'};
+				push (@emails, $tempu);
+			}
+		} else {
+			push @emails, $output->{'cpanelresult'}->{'data'}->{'login'};
+		}
+
+		@emails = sort (@emails);
+		print "[*] Total number of email addresses found under this account: ".scalar(@emails)."\n";
+
+		my $request1;
+		my @output;
+		foreach my $euser (@emails) {
+			my $pass = "";
+			my $possible = 'abcdefghijkmnpqrstuvwxyz23456789';
+			while ( length($pass) < 12 ) {
+				$pass .= substr( $possible, ( int( rand( length($possible) ) ) ), 1 );
+			}
+			my ($email, $domain) = split ('@', $euser, 2);
+			$request1 = $apic->cpanel_api2_request('cpanel', { 'module' => "Email", 'func' => "passwdpop" }, { 'domain' => "$domain", 'email' => "$email", 'password' => "$pass" }, 'json');
+			my $output1 = from_json($request1);
+
+			if ($output1->{'cpanelresult'}->{'data'}[0]{'result'} == 1){
+				push (@output, "$euser - $pass");
+			} else {
+				print "[!] $euser\'s password was not updated.\n";
+				print $output1->{'cpanelresult'}->{'data'}->{'reason'};
+			}
+		}
+		print "[+] New set of passwords are:\n\n";
+		foreach (@output) {
+			print "$_\n";
+		}
+		return 1;
+	} else {
+		print "[!] Unable to login, or valid cPanel access was not provided.\n";
+		return 0;
+	}
+}
+
+sub userexists {
+
+	my $user = shift;
+	if (-e "/var/cpanel/users/$user"){
+		return 1;
+	}
+	return 0;
+}

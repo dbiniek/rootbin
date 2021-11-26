@@ -1,0 +1,538 @@
+#!/bin/bash
+# install-mx
+# Setup doamins to use Google Apps, Windows Live and Godaddy
+# as the MX.
+# Wiki: https://gatorwiki.hostgator.com/Admin/Install-MX
+# Repo: http://git.toolbox.hostgator.com/install-mx/
+# Please submit all bug reports at bugs.hostgator.com
+#
+# Copyright 2012 Hostgator.com, LLC.
+##################################################
+
+# Defining these four externally due to using direct arguments.
+domain=$(echo "$1"|tr '[:upper:]' '[:lower:]')
+HostID="$3"
+mxservice=$(echo "$2"|tr '[:upper:]' '[:lower:]')
+sopts="${#}"
+
+# SPF includes depend on host
+unset spf_include
+hostname=$(cat /proc/sys/kernel/hostname)
+if [[ "${hostname}" =~ \.ehost\.com$ ]] ; then
+    spf_include=" include:ehost.com "
+elif [[ "${hostname}" =~ \.ehosts\.com$ ]] ; then
+    spf_include=" include:ehosts.com "
+elif [[ "${hostname}" =~ \.ideahost\.com$ ]] ; then
+    spf_include=" include:ideahost.com "
+elif [[ "${hostname}" =~ \.hostclear\.com$ ]] ; then
+    spf_include=" include:hostclear.com "
+else
+    spf_include=" include:websitewelcome.com "
+fi
+
+color() {
+     # Define colors in case we decide to use them
+     Red='\e[0;31m'
+     Blue='\e[0;34m'
+     Cyan='\e[0;36m'
+     Nc='\e[0m' # No Color
+     Black='\e[0;30m'
+     Dark_Gray='\e[1;30m'
+     Light_Blue='\e[1;34m'
+     Green='\e[0;32m'
+     Light_Green='\e[1;32m'
+     Light_Cyan='\e[1;36m'
+     Light_Red='\e[1;31m'
+     Purple='\e[0;35m'
+     Light_Purple='\e[1;35m'
+     Brown='\e[0;33m'
+     Yellow='\e[1;33m'
+     Light_Gray='\e[0;37m'
+     White='\e[1;37m'
+
+     return 0
+}
+
+setmainvariables() {
+     version="1.0"
+     release="-STABLE"
+     domainre="${domain//./\.}"
+     #domainuser=$(grep -i "^$domain:" /etc/userdomains | awk '{print $2}')
+     #SAVED_CLI="$*"
+     Todays_Date=$(date +%d/%m/%Y)
+     Current_Time=$(date +%H:%M:%S)
+     script=$(basename ${0})
+     if [[ ! -d /home1 ]]; then
+     	backupdir="/home/.install-mx-backups"
+     else
+     	backupdir="/home1/.install-mx-backups"
+     fi
+     cpuser=$(/scripts/whoowns ${domain})
+     cpuserfile="/var/cpanel/users/$cpuser"
+     zonefile="/var/named/${domain}.db"
+     zonefiletmp="$zonefile.tmp"
+     cpuserbackup="${backupdir}/${cpuser}.$(date +%s)"
+     zonefilebackup="${backupdir}/${domain}.db.$(date +%s)"
+     restore=false
+     . /etc/init.d/functions # Import 'success' and 'failure'
+}
+
+print() {
+     printf "${Cyan}[+] $* ${Nc}\n" 
+     return 0
+}
+
+warn() {
+     printf "${Red}[*] $* ${Nc}\n"
+     return 0
+}
+
+
+quit() { 
+     if [[ ! -z "$1" ]]; 
+     then 
+             printf "\n${Red}[!] $* ${Nc}\n" 
+             exit 2 
+     fi 
+}
+
+use() { 
+     printf "\n%20s %40s\n" "USE: ${script}" "<domain name> [gapps|godaddy|office365]"
+     printf "%20s %36s\n" "${script}" "<domain name> live <HostID>"
+     printf "\n%20s %40s\n" "RESTORE: ${script}" "<domain name> restore"
+     exit 2 
+}
+
+checkdnszone() {
+     if [[ ! -f "/var/named/${domain}.db" ]]
+     then
+          printf "\n\n"
+          quit "$1 HAS NO ZONE FILE -- EXITING"
+     fi
+     return 0
+}
+
+checkcpuserfile() {
+     if [[ -z ${cpuserfile} ]]
+     then
+          #Domain owner userfile doesn't exist!
+          quit "****ERROR: I am unable to determine the domain's owner. Bailing."
+     fi
+     return 0
+}
+
+
+preflight() {
+     if ! /usr/local/cpanel/cpanel -V 2&>/dev/null
+     then
+          quit "This is not a cPanel server. This script requires cPanel. Bailing."
+     fi
+
+     setmainvariables # Setting this inside preflight-- some of these variables require cpanel executables.
+
+     case ${mxservice} in
+          live)
+               if [[ "${sopts}" -ne 3 ]]
+               then
+                    use
+               fi
+          ;;
+          gapps)
+               if [[ "${sopts}" -ne 2 ]]
+               then
+                    use
+	       fi
+          ;;
+
+          godaddy)
+               if [[ "${sopts}" -ne 2 ]]
+               then
+                    use
+               fi
+          ;;
+          office365)
+               if [[ "${sopts}" -ne 2 ]]
+               then
+                    use
+               fi
+          ;;
+          restore)
+               if [[ "${sopts}" -ne 2 ]]
+               then
+                    use
+               else
+                    restore=true
+               fi
+          ;;
+          *)
+               use
+          ;;
+     esac
+
+     checkdnszone
+     checkcpuserfile
+
+     if "$restore" #If this is a restore request, the rest of these preflight checks will get in the way.
+     then
+          return 0
+     fi
+
+     # check for existing entries....
+     # Test for all 3 services. 
+
+     grep -qiE "ASPMX.L.GOOGLE.COM" "$zonefile" && \
+          quit "$zonefile already has google apps entries. Quitting."
+     grep -qiE "PAMX1.HOTMAIL.COM" "$zonefile" && \
+          quit "$zonefile already has Windows Live entries. Quitting."
+     grep -qiE "secureserver.net" "$zonefile" && \
+          quit "$zonefile already has GoDaddy MX entries. Quitting."
+     grep -qiE "outlook.com" "$zonefile" && \
+          quit "$zonefile already has Office365 entries. Quitting."
+
+     # Get info on who changed the zone for documentaton purposes. 
+
+     printf "\nThe below two questions are used to note the DNS zone with why it was changed\n\n"
+     read -p "Please Enter The HG Ticket ID, Chat ID or Phone:  " ticketid
+     read -p "Please Enter Your Name: " adminsname
+
+     if [[ -z "${ticketid}" ]] || [[ -z "${adminsname}" ]]
+     then
+          quit "You must specify a Ticket ID and your Name. Update Aborted.\n\n**** THE ZONE HAS NOT BEEN MODIFIED ****\n\n"
+     fi
+}
+
+backupfiles() {
+     mkdir -p "$backupdir" > /dev/null
+     if ! cp -a "$zonefile" "$zonefilebackup"; then
+          quit "Could not create backup of zone file! Bailing."
+     else
+          print "${zonefile} backed up to ${zonefilebackup}"
+     fi
+     if ! cp -a "$cpuserfile" "$cpuserbackup"; then
+          quit "Could not create backup of user file! Bailing."
+     else
+          print "${cpuserfile} backed up to ${cpuserbackup}"
+     fi
+}
+
+restorebackup() {
+     zonerestorecandidates=("$backupdir/${domain}.db."*)
+
+     if ! (( ${#zonerestorecandidates[@]} ))
+     then
+          quit "No restore candidates found for ${domain}. Either this domain has not been modified by Install-MX, or the backup has been removed."
+     elif ! (( ${#zonerestorecandidates[@]} == 1 ))
+     then
+          warn "!!!Warning!!! Multiple backups found for this zone. Restoring most recent. If you need an older one, restore by hand."
+          restorezone=
+          for file in "${zonerestorecandidates[@]}"; do
+               [[ -z $restorezone || $file -ot $restorezone ]] && restorezone=$file
+          done
+     else
+          restorezone="${zonerestorecandidates}"
+     fi
+
+     if ! cp -a "$restorezone" "$zonefiletmp"
+     then
+          quit "Unable to create temporary file!"
+     fi
+
+     if ! cp -a "$zonefile" "$zonefilebackup"
+     then
+          quit "Unable to back up current version of zone file!"
+     fi
+
+     if ! cp -a "$cpuserfile" "$cpuserbackup"
+     then
+          quit "Unable to back up current version of user file!"
+     fi
+
+     preserialline=$(grep -i ';.*Serial' "$zonefiletmp" |sed -e 's/^[ \t]*//')
+     oldserialline=$(grep -i ';.*Serial' "$zonefile" |sed -e 's/^[ \t]*//') 
+     newserialline=$(echo $oldserialline | awk '{$1++; print $0}')
+     sed -i'' -e "s/$preserialline/$newserialline/" "$zonefiletmp" #We need to preserve continuity for serial numbers.
+
+     if ! cp -a "$zonefiletmp" "$zonefile"
+     then
+          quit "Unable to replace zone file!"
+     fi
+
+     sed -i'' -e "/MXCHECK-${domain}=/d" "$cpuserfile"
+     sed -i'' -e "/#Added by install-MX/d" "$cpuserfile"
+
+     warn "MXCheck on ${domain} removed. Please check the restored zone file and make sure that's what you really wanted."
+     warn "Any special changes to the zone file may have been lost. You should check ${zonefilebackup} for anything you may need to add back in."
+
+}
+
+maketmpfile() {
+     if ! cp -a "$zonefile" "$zonefiletmp"
+     then
+          quit "Unable to create temporary file!"
+     fi
+}
+
+replacezonefile() {
+     if ! cp -a "$zonefiletmp" "$zonefile"
+     then
+          quit "Could not replace zone file!"
+     fi
+     if ! rm -f "$zonefiletmp"
+     then
+          printf "${Red}Could not remove temporary file: ${zonefiletmp} . Remove manually."
+     fi
+}
+
+update_soa() {
+     serial=$(grep -i ';.*Serial' "$zonefiletmp" | awk '{$1++; print $1}')
+     print "Adding note to zonefile"
+     sed -i "3i\; $serial: Install-MX zone entries added/modified\n;" "$zonefiletmp"
+     print "Updating SOA for $domain"
+
+     #The sed here handles the preceeding whitespace. Whitespace after may be simplified.
+     oldserialline=$(grep -i ';.*Serial' $zonefiletmp |sed -e 's/^[ \t]*//') 
+     #Some assumptions are being made here on the structure of the zone file. 
+     #There may be a better way to handle this, but this should handle nearly all real-world cases on a cPanel server.
+
+     newserialline=$(echo $oldserialline | awk '{$1++; print $0}') 
+     sed -i'' -e "s/$oldserialline/$newserialline/" "$zonefiletmp"
+}
+
+
+mx_remove() {
+     print "Removing existing MX entries"
+     # don't catch any already-commented MX's
+
+# updated regex to include [:punct:] -- referece JHC-18625702 where this failed --LB
+
+     while read -r mx_entry; do
+          echo "  - Commenting out: ${mx_entry}" ;
+          sed -i -e "s/^${mx_entry}/; & ; removed for Install MX/" "$zonefiletmp"
+     done < <(grep -iE "^[[:upper:][:lower:][:punct:]0-9.]+([[:space:]][0-9]+)?[[:space:]]+IN[[:space:]]+MX" "$zonefiletmp")
+
+     while read -r cname_entry; do
+          echo "  - Commenting out: ${cname_entry}" ;
+          sed -i -e "s/^${cname_entry}/; & ; removed for Install MX/" "$zonefiletmp"
+     done < <(grep -iE "^(web)*mail([[:space:]][0-9]+)?[[:space:]]+IN[[:space:]]+(CNAME|A)" "$zonefiletmp")
+
+     while read -r spf_entry; do
+          echo "  - Commenting out: ${spf_entry}" ;
+          sed -i -e "s/^${spf_entry}/; & ; removed for Install MX/" "$zonefiletmp"
+     done < <(grep -iE '^[[:upper:][:lower:][:punct:]0-9.]+([[:space:]][0-9]+)?[[:space:]]+IN[[:space:]]+TXT[[:space:]]+"v=spf' "$zonefiletmp")
+}
+
+
+mx_add() {
+     print "Adding MX entries"
+
+     case ${mxservice} in
+
+          gapps)
+               cat << GOOGLE_ENTRIES_END >> "$zonefiletmp"
+
+
+
+; DNS Zone Updated By Install-MX
+; Zone Updated Per Ticket: ${ticketid}
+; Zone Updated By: ${adminsname}
+; Zone Modified on ${Todays_Date} @ ${Current_Time}
+
+
+
+; ------ MX entries for Google Apps ------
+${domain}. IN MX 10 ASPMX.L.GOOGLE.COM.        
+${domain}. IN MX 20 ALT1.ASPMX.L.GOOGLE.COM.    
+${domain}. IN MX 20 ALT2.ASPMX.L.GOOGLE.COM.    
+${domain}. IN MX 30 ASPMX2.GOOGLEMAIL.COM.      
+${domain}. IN MX 30 ASPMX3.GOOGLEMAIL.COM.      
+${domain}. IN MX 30 ASPMX4.GOOGLEMAIL.COM.      
+${domain}. IN MX 30 ASPMX5.GOOGLEMAIL.COM.      
+${domain}. IN TXT "v=spf1 a mx include:_spf.google.com ~all"
+
+
+; ------ Typical CNAMES for google apps --
+mail            IN CNAME ghs.google.com.     
+docs            IN CNAME ghs.google.com.    
+start           IN CNAME ghs.google.com.      
+calendar        IN CNAME ghs.google.com.    
+sites           IN CNAME ghs.google.com.      
+; ------   End entries for Google   ------
+
+
+GOOGLE_ENTRIES_END
+          ;;
+
+          live)
+               print "DEBUG: HostID is ${HostID}"
+               cat << WINDOWS_ENTRIES_END >> "$zonefiletmp"
+
+
+
+; DNS Zone Updated By Install-MX
+; Zone Updated Per Ticket: ${ticketid}
+; Zone Updated By: ${adminsname}
+; Zone Modified on ${Todays_Date} @ ${Current_Time}
+
+
+
+; ------ MX entries for Windows Live ------
+${domain}. IN MX 10 ${HostID}.pamx1.hotmail.com.        
+${domain}. IN TXT "v=spf1 a mx include:hotmail.com ~all"
+
+
+; ------ Typical CNAMES for Windows Live --
+${HostID}            IN CNAME domains.live.com.     
+
+; ------ Messanger SRV Record ------
+_sipfederationtls._tcp.${domain}. IN SRV 10 2 5061 federation.messenger.msn.com.
+
+; ------   End entries for Windows Live   ------
+
+WINDOWS_ENTRIES_END
+          ;;
+          godaddy)
+               cat << GODADDY_ENTRIES_END >> "$zonefiletmp"
+
+
+
+; DNS Zone Updated By Install-MX
+; Zone Updated Per Ticket: ${ticketid}
+; Zone Updated By: ${adminsname}
+; Zone Modified on ${Todays_Date} @ ${Current_Time}
+
+
+
+; ------ MX entries for Godaddy --------
+${domain}. IN MX 10 smtp.secureserver.net.          ; $serial: Godaddy MX
+${domain}. IN MX 20 mailstore1.secureserver.net.     ; $serial: Godaddy MX
+
+; ------ Typical CNAMES for Godaddy ----
+mail IN CNAME pop.secureserver.net.                   ; $serial: Godaddy MX
+; ------   End entries for Godaddy   ------
+
+GODADDY_ENTRIES_END
+          ;;
+          office365)
+mxhost=${domain//./-}
+               cat << OFFICE_ENTRIES_END >> "$zonefiletmp"
+
+
+
+; DNS Zone Updated By Install-MX
+; Zone Updated Per Ticket: ${ticketid}
+; Zone Updated By: ${adminsname}
+; Zone Modified on ${Todays_Date} @ ${Current_Time}
+
+
+
+; ------ MX entries for Office 365------
+${domain}. IN MX 0 ${mxhost}.mail.eo.outlook.com.          ; $serial: Install-MX
+
+; ------ Typical CNAMES for Office 365 ----
+autodiscover IN CNAME autodiscover.outlook.com.                   ; $serial: Install-MX
+; ------   End entries for Godaddy   ------
+
+; ------ TXT records for Office 365 ------
+${domain}.	3600	IN	TXT	"v=spf1 a mx ${spf_include} include:outlook.com ~all"
+
+; ------ SRV records for Office 365 ------
+_sip._tls.${domain}.	3600	IN	SRV	100	1	443	sipdir.online.lync.com.
+_sipfederationtls._tcp.${domain}.	3600	IN	SRV	100	1	5061	sipfed.online.lync.com.
+
+OFFICE_ENTRIES_END
+          ;;
+
+          *)
+               quit "****ERROR: ${mxservice} is an UNKNOWN service!\n Please go to https://bugs.hostgator.com and submit a bug report at once."
+          ;;
+     esac
+
+}
+
+remove_localdomains() {
+
+     grep -qiE "^$domainre" /etc/localdomains && \
+          print "Removing $domain from localdomains"
+     sed -i -e "s/^${domainre}$//g" /etc/localdomains &>/dev/null
+
+}
+
+add_remotedomains(){
+     if grep -qiE "^$domainre" /etc/remotedomains
+     then
+          print "${domain} Already exists in /etc/remotedomains. Not Adding."
+     else
+          printf "\n${domain}\n" >> /etc/remotedomains
+     fi
+}
+
+update_mxcheck(){
+     print "Updating cPanel User File...."
+
+     sed -i "/MXCHECK-${domain}/d" ${cpuserfile}
+     printf "\n#Added by install-MX\n" >> ${cpuserfile}
+     printf "MXCHECK-${domain}=remote\n" >> ${cpuserfile}
+
+     # Lets updateuserdomains
+     /usr/local/cpanel/scripts/updateuserdomains
+     print "cPanel User File Updated. "
+}
+
+dns_restart() {
+     declare errormessage=`named-checkzone $domain $zonefiletmp`
+
+     if [[ `echo $errormessage | grep -c OK` -gt 0 ]]
+     then
+          printf "\nChecking DNS Zone: ${domain} "
+          success
+          replacezonefile
+     else
+          printf "\nChecking Zone: ${domain} "
+          failure
+          printf "${Red}\n\n**** FATAL ERROR ****\n\nThe Zone Check FAILED. The Specific message is below. You can find the work file at $zonefiletmp . Replace the original zone file with the corrected work file when finished.\n\n"
+          quit "${errormessage}\n\n"
+     fi
+
+
+     print "Reloading DNS Zone: ${domain}"
+
+     if grep -qi ^view.*ternal /etc/named.conf
+          then
+          rndc reload $domain in internal &>/dev/null
+          rndc reload $domain in external &>/dev/null
+     else
+          rndc reload $domain &>/dev/null
+     fi
+
+}
+
+logit() {
+     printf "${Green}\n\nDNS Zone Updated By ${script} ${version}${release}\nZone Updated Per Ticket: ${ticketid}\nZone Modified on ${Todays_Date} @ ${Current_Time}\nZone Updated By: ${adminsname}\n\n\n${Nc}"
+     logger -p info -t install-mx "DNS Zone ${domain} Updated By ${script} ${version}${release}. Zone Updated Per Ticket: ${ticketid}. Zone Modified on ${Todays_Date} @ ${Current_Time}.Zone Updated By: ${adminsname}"
+     printf "\n[ Message Logged to Syslog ]\n\n"
+     return 0
+}
+
+color
+preflight
+
+if "$restore"
+    then
+    shopt -s nullglob
+    restorebackup
+    shopt -u nullglob
+    dns_restart
+    exit
+fi
+
+maketmpfile
+backupfiles
+update_soa
+mx_remove
+mx_add
+remove_localdomains
+add_remotedomains
+update_mxcheck
+dns_restart
+logit
+

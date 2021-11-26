@@ -1,0 +1,591 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+use Benchmark;
+use Digest::MD5;
+use File::HomeDir::Unix;
+use File::Type;
+use Fcntl qw{:flock :mode};
+use Getopt::Long;
+use IO::AIO qw { fadvise };
+use IO::Dirent qw(readdirent DT_DIR DT_REG DT_LNK DT_SOCK DT_FIFO);
+use IO::Handle; STDOUT->autoflush(1);
+use POSIX;
+use TOSconfig;
+use TOSconfig::Whitelist;
+use TOSconfig::Blacklist;
+
+#Removeable
+use Data::Dumper;
+
+#Variables from other files
+my $whitelist = TOSconfig::Whitelist::list;
+my $blacklist = TOSconfig::Blacklist::list;
+my $config    = TOSconfig::config_spamhack;
+my $HOME      = File::HomeDir::Unix->my_home;
+my $time      = new Time::Keep;
+my ($qr_file, $map_file) = regex_gen($config->{'file_content_scan'});
+my ($qr_html, $map_html) = regex_gen($config->{'html_file_content_scan'});
+
+
+sub regex_gen {
+    my $aref = shift;
+    my %map = map {$_->[0] => $_->[1]} @$aref;
+    my $s = join '|', map {quotemeta} keys %map;
+    my $qr = qr{($s)};
+    return ($qr, \%map);
+}
+
+#Generating regex
+my (%qr_map,$qr);
+
+#spamhack stats
+my (%file_list) = ();
+my ($skip_count, $file_count, $total_size, $scan_size, $whitelist_count) = (0,0,0,0,0);
+
+#flags
+my $path = $HOME."/public_html";
+my ($append,$verbose,$debug,$rescan,$skip_perms,$depth) = (0,0,0,0,0,$config->{'max_depth'});
+
+#daemon stats
+my ($pid,$child_pid);
+
+
+MAIN: {
+    #TODO: unset/unalias $ENV{HISTFILE};
+    $time->start;
+    load();
+    flags();
+    signal_handle();
+    daemonize();
+    get_rescanlist() if $rescan;
+    opening_message();
+    get_filelist() unless $rescan;
+    check_for_hacks();
+    $time->finish;
+    report();
+    daemonize_cleanup();
+}
+sub opening_message {
+    malware("The Content listed below may not be a complete list of malicious content on your account.\nYou are ultimately responsible for all of your content.\nThis is just what we have found that appears to be malicious.\nThese files appear to contain malicious code. You will want to review the files and remove the injected code from important files and/or remove unused or invalid files.\n\n")
+}
+sub report {
+    print qq{
+        Total Files: $file_count
+        Skipped Whitelisted md5sum: $whitelist_count
+        Files Scanned: }.scalar (keys %file_list).qq{
+        Total Size: }.process_size($total_size).qq{
+        Scan Size: }.process_size($scan_size).qq{
+        Scan Time: }.$time->display."\n";
+    close(MALWARE);
+}
+sub flags {
+    GetOptions (
+        "b|bug"       => \$debug,
+        "v|verbose"   => \$verbose,
+        "a|append"    => \$append,
+        "help"        => \&help,
+        "s|skip"      => \$skip_perms,
+        "r|rescan"    => \$rescan,
+        "path=s"      => \$path,
+        "d|depth=s"   => \$depth,
+        "<>"          => \&help,
+    ) || help();
+    unless ($rescan) {
+        if ($append) {
+            open(MALWARE, ">>", "$HOME/malware.txt");
+        } else {
+            open(MALWARE, ">",  "$HOME/malware.txt");
+        }
+    }
+    if ($depth !~ /^\d+$/) {
+        print STDOUT "You may only specific a digit when using --depth\n";
+        exit;
+    }
+    if ($path ne $HOME."/public_html") {
+        $path = fix_path($path);
+    }
+}
+sub help {
+    print "\033[2J";
+    print "\033[0;0H";
+    print qq{
+spamhack(1)                           User Commands
+
+NAME
+       spamhack - This scanning tool is designed to perform a full scan of all local files/folders on a server
+
+SYNOPSIS
+
+DESCRIPTION
+       This search flags KNOWN bad files and searches for the most common spam scripts as well as some of the most common back doors.
+           This also looks for meta refreshes and iframes which are recirects to pharmacies.
+           It searches for files which contain the words 'viagra' and cialis' because there are a lot of files with this information.
+           There are many files with meta refreshes and iframes and files with DIV tags that have those specific words in them.
+           Be aware that a legit medical site may mention viagra and cialis for legit reasons so keep that in mind.
+
+        -h, --help
+               This help page
+
+        -r|--rescan
+               Takes the results from the malware.txt file and scans only those found in that file.
+
+        -p|--path
+               Use full path, or use a ./ from current path, ../ for files above this current location.
+                   Example: --path ./public_html/wordpress/wp-content/
+        -s|--skip
+               Skip Fixing permissions (Not much faster, but used for secondary runs)
+
+        -d|--depth
+               Specifiy a maximum descending level of directories.
+
+        -v|--verbose
+               Specify what triggered the found file to be considered malicious or malware.
+        -a|--append
+               Normally when you execute this script, it will delete the malware.txt file, this will prevent that and
+               append additional information to the bottom of the malware.txt
+
+    };
+    exit(1);
+}
+sub load {
+    if ($debug) {
+        print "Loaded Whitelist\n" if defined($whitelist);
+        print "Loaded Blacklist\n" if defined($blacklist);
+    }
+}
+sub fix_path {
+    my $path = shift;
+    my $command = 1 if $path ne $HOME;
+    $path =~ s/$HOME/~/ unless $command == 1;
+    $path =~ s/~/$HOME/ if $command == 1;
+    my $pwd = getcwd();
+    if ($path =~ /^\.\./) {
+        $path =~ s/\.\./$pwd\/\.\./;
+    } elsif ($path =~ /^\./) {
+        $path =~ s/^\./$pwd/;
+    }
+    return $path;
+}
+sub malware {
+    print "                                                        \r\n";
+    my $passed_string = shift;
+    my $verbose_string = shift;
+    unless (print MALWARE "$passed_string\n") {
+        unless (-e $HOME."/malware.txt") {
+            print STDOUT "The file malware.txt no longer exists.\n";
+            exit;
+        }
+        if (-w $HOME."/malware.txt") {
+            print STDOUT "Failed to write to malware.txt\n";
+            exit;
+        } else {
+            print STDOUT "The file malware.txt doesn't have write permissions.\n";
+            exit;
+        }
+    }
+    my $string;
+    $string .= $verbose_string." " if defined($verbose_string) && $verbose;
+    $string .= $passed_string;
+    print "$string\n";
+}
+sub get_filelist {
+    find_valid_files($path);
+}
+sub get_rescanlist {
+    if (open(LIST, "<:perlio", $HOME."/malware.txt")) {
+        flock(LIST, LOCK_EX);
+        while (my $line = <LIST>) {
+            chomp ($line);
+            my @column = split(/\s+/, $line);
+            if (defined($column[0])) {
+                $column[0] =~ s/~/$HOME/;
+                if (-e $column[0]) {
+                    next if defined($file_list{$column[0]});
+                    my @stats = stat($column[0]);
+                    my $size = $stats[7];
+                    if (defined($size)) {
+                        $file_count++;
+                        $total_size += $size;
+                        $scan_size += $size;
+                        $file_list{$column[0]} = \@stats;
+                    }
+                }
+            }
+        }
+    flock(LIST, LOCK_UN);
+    fadvise(*LIST,0,0,8);
+    close(LIST);
+    } else {
+        if (-e $HOME."/malware.txt") {
+            print "Unable to open malware.txt\n";
+            exit(2);
+        } else {
+            print "Unable to locate malware.txt\n";
+            exit(2);
+        }
+    }
+    if ($rescan) {
+        if ($append) {
+            open(MALWARE, ">>", "$HOME/malware.txt");
+        } else {
+            open(MALWARE, ">", "$HOME/malware.txt");
+        }
+    }
+}
+sub check_for_hacks {
+    my $i = 0;
+    for my $file_path (sort {$file_list{$a}[1] <=> $file_list{$b}[1]} keys %file_list) {
+        $i++;
+        progress_bar( $i, scalar (keys %file_list), 20, '=', $file_path );
+        if (-e $file_path) {
+            scan_file($file_path);
+        }
+    } 
+}
+sub scan_file {
+    my ($file) = @_;
+    if (open(my $fh, "<:perlio", $file)) {
+        binmode($fh);
+        flock($fh, LOCK_EX);
+        local $/ = undef;
+        my $digest = Digest::MD5->new();
+		$digest->addfile($fh);
+		my $md5_checksum = $digest->hexdigest;
+		if (defined($whitelist->{$md5_checksum})) {
+			$whitelist_count++;
+			return;
+		}
+		if (defined($blacklist->{$md5_checksum})) {
+			print "$file black listed by md5sum\n";
+			return;
+		}
+		my $buf = lc($fh);
+		regex_scan($file, \$buf, $qr_file, $map_file);
+		my $html_extension = $config->{'html_extension'};
+		if ($file =~ $html_extension) {
+			regex_scan($file, \$buf, $qr_html, $map_html);
+		}
+        flock($fh, LOCK_UN);
+        fadvise($fh,0,0,8);
+        close($fh);
+    }
+}
+sub regex_scan {
+    my ($file, $buf_ref, $qr, $map) = @_;
+    return -1 if $$buf_ref !~ $qr;
+    if ($map->{$1} eq '1') {
+        malware($file, $1);
+        return $1;
+    }
+    my $k = $1;
+    return -1 if $$buf_ref !~ $map->{$k};
+    malware($file, $map->{$k});
+    return $map->{$k};
+}
+
+sub find_valid_files {
+    my $dir = shift;
+    my $level = shift || 1;
+
+    my $max_depth = $depth;
+    if ($level > $max_depth ) { return }
+
+    opendir my $dh, $dir or do {
+        warn "Could not open ",$dir,": ",$!,"\n";
+        return;
+    };
+        
+    for my $entry (readdirent($dh)) {
+        next if $entry->{name} =~ /^\.\.?$/;  ## skip . and ..
+        $file_count++;
+        updatecount(1) and next if ($entry->{type} == DT_LNK);   #Skip soft links
+        updatecount(1) and next if ($entry->{type} == DT_FIFO);  #Skip named pipes
+        updatecount(1) and next if ($entry->{type} == DT_SOCK);  #Skip sockets
+
+        my $file_fullpath = "$dir/" . $entry->{name};
+        my $file          = $entry->{name};
+        my @stats         = stat($file_fullpath);
+        my $mode          = sprintf "%04o", S_IMODE($stats[2]);
+
+        if( $entry->{type} == DT_DIR ) {
+            chmod(0755, $file_fullpath) if $mode ne '0755';
+
+            if (defined($config->{'skip_dir_list'}->{$file}) || $file =~ $config->{'skip_dir_regex'}) {
+                updatecount(1) and next;
+            }
+            find_valid_files("$dir/" . $entry->{name}, $level + 1);
+            next;
+        }
+
+        if (defined($config->{'skip_file_list'}->{$file}) || $file =~ $config->{'skip_file_regex'}) {
+            updatecount(1) and next;
+        }
+        if (defined($config->{'file_name_scan'}->{$file}) || $file =~ $config->{'file_name_regex'}) {
+            malware("Black Listed by file name: $file_fullpath\n");
+            next;
+        }
+
+        FIX_PERMS: {
+            unless ($skip_perms) {
+                if ($file =~ $config->{extensions755}) {
+                    chmod(0755, $file_fullpath) if $mode ne '0755';
+                } elsif ($file =~ $config->{extensions644}) {
+                    chmod(0644, $file_fullpath) if $mode ne '0644';
+                } elsif ($mode eq '0777') {
+                    chmod(0644,$file_fullpath);
+                }
+            }
+        }
+        my $size = $stats[7];
+        if (defined($size)) {
+            $total_size += $size;
+            updatecount(1) and next if ($size > MB(1));
+        } else {
+            print STDOUT "$file_fullpath didn't report a file size.\n";
+        }
+
+        #http://perldoc.perl.org/functions/-X.html
+        #next if (-B $file_fullpath);
+
+        my $file_types_to_skip = {
+            'image/png'                       => 1,
+            'image/x-png'                     => 1,
+            'image/gif'                       => 1,
+            'image/jpeg'                      => 1,
+            'image/x-bmp'                     => 1,
+            'application/zip'                 => 1,
+            'application/x-gzip'              => 1,
+            'application/x-gtar'              => 1,
+            'application/x-rar'               => 1,
+            'application/data'                => 1,
+            'application/x-ms-dos-executable' => 1,
+            'application/x-gimp-image'        => 1,
+            'application/pdf'                 => 1,
+            'audio/x-669-mod'                 => 1,
+            'audio/x-wav'                     => 1,
+            'audio/midi'                      => 1,
+            'font/ttf'                        => 1,
+        };
+        my $file_type = File::Type->new();
+        my $type_of_file = $file_type->checktype_filename($file_fullpath);
+        if (defined($type_of_file)) {
+            updatecount(1) and next if defined($file_types_to_skip->{$type_of_file});
+        }
+        #print $type_of_file." -> $file_fullpath\n";
+        push (@stats, $type_of_file);
+
+        $scan_size += $size;
+        $file_list{$file_fullpath} = \@stats;
+        updatecount(0);
+    }
+}
+sub updatecount {
+    my $skip = shift || 0;
+    $skip_count += $skip;
+    local $| = 1;
+    print "Getting list ".scalar (keys %file_list)." Skipped $skip_count\r\n";
+}
+
+sub MB {
+    my $amt = shift;
+    return 1048576*$amt;
+}
+sub process_size {
+    my $size = shift || 0;
+    my $string;
+    my @size = (0, 0, 0,);
+    my @size_scheme = (1099511627776, 1073741824, 1048576, 1024);
+    my @size_name = (" TB "," GB ", " MB ", " KB ", " B");
+
+    for (my $i = 0; $i < scalar @size_scheme; $i++) {
+        while($size > $size_scheme[$i]) {
+            $size -= $size_scheme[$i];
+            $size[$i] += 1;
+        }
+        if (defined($size[$i]) && $size[$i] > 0) {
+            $string .= $size[$i].$size_name[$i];
+        }
+    }
+    $string .= $size." B" if defined($size);
+    return $string;
+}
+sub progress_bar {
+    my ($got, $total, $width, $char, $working_with ) = @_;
+    $width ||= 25;
+    $char  ||= '=';
+    my $num_width = length $total;
+    local $| = 1;
+    printf "|%-${width}s| Scanned %${num_width}s/%s (%.2f%%)\r\n",
+        $char x (($width-1)*$got/$total). '>', $got, $total, 100*$got/$total;
+}
+sub signal_handle {
+    $SIG{INT} = \&interrupt;
+    $SIG{TERM} = \&interrupt;
+    $SIG{KILL} = \&interrupt;
+    $SIG{ABRT} = \&interrupt;
+    $SIG{HUP} = \&interrupt;
+}
+sub interrupt {
+    daemonize_cleanup();
+    exit(10);
+}
+sub daemonize {
+    my $scriptname = "spamhack";
+    chdir("/") || die "can't chdir to /: $!";
+    mkdir("$HOME/tmp") unless -e "$HOME/tmp";
+
+    my $fifo = "$HOME/tmp/$scriptname.fifo";
+    my $parent = 0;
+
+    defined($pid = fork()) || die "can't fork: $!";
+    unless (-e "$fifo") {
+        mkfifo("$fifo", 0755);
+    }
+    if ($pid) {
+        $parent = 1;
+    }
+    if ($parent == 1) {
+        if($^O eq 'linux') {
+            $0 = $scriptname;
+            prctl_name($scriptname);
+        }
+        if (open(FIFO, "<:perlio", "$fifo")) {
+            while(my $line = <FIFO>) {
+                if ($line =~ /\r/) {
+                    chomp($line);
+                }
+                print $line;
+            }
+        } else {
+            die "FIFO missing. $fifo";
+        }
+    } else {
+        #child prints stdout to ~/tmp/spamhack.fifo
+        open(STDIN,  "<", "/dev/null") || die "can't read /dev/null: $!";
+        open(STDOUT, ">", "$fifo") || die "can't print STDOUT: $! $fifo";
+        open(STDERR, ">&STDOUT") || die "can't dup stdout: $!";
+        $0 = $scriptname;
+        if($^O eq 'linux') {
+            prctl_name("$scriptname");
+        }
+        if (open(PID, '>', "$HOME/tmp/$scriptname.pid")) {
+            print PID $$;
+            close(PID);
+        }
+    }
+    if ($parent) {
+        exit(0);
+    }
+    (setsid() != -1) || die "Can't start a new session: $!";
+    if ($parent == 0) {
+        $child_pid = $$;
+    }
+}
+sub daemonize_cleanup {
+    my $scriptname = "spamhack";
+    my $fifo = "$HOME/tmp/$scriptname.fifo";
+    my $pid_to_kill;
+    if (-e $fifo) {
+        unlink "$fifo";
+    } else {
+        print "unable to find $fifo to delete\n";
+    }
+
+    #Obtain Child PID, and Kill that process
+    if (open(PID, "<:perlio","$HOME/tmp/$scriptname.pid")) {
+        while (my $line = <PID>) {
+            chomp($line);
+            $pid_to_kill = $line;
+        }
+        close(PID);
+        unlink "$HOME/tmp/$scriptname.pid";
+        if (kill 0, $pid_to_kill) {
+            kill('KILL', $pid_to_kill);
+            if (kill 0, $pid_to_kill) {
+                kill(9, $pid_to_kill);
+            }
+        } else {
+            print "$pid_to_kill is not running\n";
+        }
+    } else {
+        print "Unable to open PID file\n";
+    }
+}
+sub prctl_name {
+    my $TASK_COMM_LEN = 16;
+    my $SYS_prctl = 157;
+    my $SYS_PR_SET_NAME = 15;
+    my $SYS_PR_GET_NAME = 16;
+
+    my ($str) = @_;
+
+    if(defined $str) {
+        my $rv = prctl($SYS_PR_SET_NAME, $str);
+        if($rv == 0) {
+            return 1;
+        } else {
+            return;
+        }
+
+    } else {
+        $str = "\x00" x ($TASK_COMM_LEN + 1); # allocate $str
+        my $ptr = unpack( 'L', pack( 'P', $str ) );
+        my $rv = prctl($SYS_PR_GET_NAME, $ptr);
+        if($rv == 0) {
+            return substr($str, 0, index($str, "\x00"));
+        } else {
+            return;
+        }
+    }
+}
+sub prctl {
+    my $SYS_prctl = 157;
+    my ($option, $arg2, $arg3, $arg4, $arg5) = @_;
+    syscall($SYS_prctl, $option,
+        ($arg2 or 0), ($arg3 or 0), ($arg4 or 0), ($arg5 or 0));
+}
+
+package Time::Keep;
+use Time::HiRes qw();
+
+sub new {
+    my ($class,$name) = @_;
+    my $self = {
+    };
+    bless $self, $class;
+    return $self;
+}
+sub start {
+    my $self = shift;
+    $self->{'start'} = Time::HiRes::time();
+    return $self->{'start'};
+}
+sub finish {
+    my $self = shift;
+    $self->{'finish'} = Time::HiRes::time();
+    return $self->{'finish'};
+}
+sub current {
+    my $self = shift;
+    $self->{'current'} = Time::HiRes::time();
+    return ($self->{'current'}-$self->{'start'});
+}
+sub display {
+    my $self = shift;
+    my $time = "".$self->{finish}-$self->{start};
+    my $min = 0;
+    while ($time > 60) {
+        $min++;
+        $time -= 60;
+    }
+    return "$min Min, ".int($time)." Sec";
+}
+sub display_sec {
+    my $self = shift;
+    my $time = "".$self->{finish}-$self->{start};
+    return $time;
+}
+1;
+

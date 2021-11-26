@@ -1,0 +1,426 @@
+#!/usr/bin/perl
+###########
+# added_by_ip
+# checks PureFTP xferlog and /var/log/messages* for files manipulated by a particular IP
+# https://gatorwiki.hostgator.com/Security/Added_by_ip
+# http://git.toolbox.hostgator.com/iphistory/iphistory
+#
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011, 2012 - HostGator.com, LLC
+###########
+use strict; use warnings; $|++;
+use Data::Dumper qw( Dumper );
+use Cwd qw( cwd );
+#my $VERSION  = 20120520;
+my $VERSION  = 20120621;
+
+# basic setup
+my $DEBUG  = 0;
+my $xferlog_dir = '/usr/local/apache/domlogs';
+my ( $ftp_log, $ip );
+
+my %helpers = (
+    'command' => '',
+    'files' => '/var/log/messages*',
+    'open_pipe' => '|',
+    'zcat' => '/bin/zcat',
+    'gunzip' => '/bin/gunzip',
+    'gzip' => '/bin/gzip',
+    'cat' => '/bin/cat',
+);
+my %options = (
+    'alt_messages_files' => '',
+    'user' => undef,
+    'verbose' => 0,
+    'deleted' => 0,
+    'moved' => 0,
+    'do_cPanel' => 0,
+    'do_xferlog' => 0,
+    'do_all_xferlogs' => 0,
+    'downloads_only' => 0,
+    'downloads_too' => 0,
+    'json_output' => 0,
+    'do_messages' => 0,
+    'show_version' => 0,
+    'show_help' => 0,
+);
+my ( %in, %out, %deleted, %moved, $restarted );
+
+# init
+get_args();
+debug_header() if $DEBUG;
+check_options();
+dump_args() if $DEBUG;
+
+# process
+process_messagelogs() if $options{ 'do_messages' } or $options{ 'alt_messages_files' };
+if ( $options{ 'do_all_xferlogs' } ) {
+    if ( defined $options{ 'user' } && length $options{ 'user' } ) {
+        my $dir = $xferlog_dir . '/' . $options{ 'user' };
+        opendir( my $d, $dir ) || die "Cannot open directory $dir : $!\n";
+        my @xfer_log_files = grep { $_ =~ m/ftp_log$/ } readdir( $d );
+        closedir $d;
+        for my $xfl ( @xfer_log_files ) {
+            process_pureftpd_xferlog( $xfl );
+        }
+    } else {
+        warn "Cannot process PureFTPd xferlogs based on the user, as the user is not defined.\n";
+    }
+}
+process_pureftpd_xferlog( $ftp_log ) if $options{ 'do_xferlog' };
+warn "I thought I TOLD you that cPanel checking is not implemented yet!\n" if $options{ 'do_cPanel' };
+
+dump_in_and_out() if $DEBUG > 1;
+
+my ( %down_only, %up_only, %both );
+for ( keys %out ) {
+    $down_only{ $_ }++ unless exists $in{ $_ };
+    $both{ $_ }++ if exists $in{ $_ };
+}
+for ( keys %in ) {
+    $up_only{ $_ }++ unless exists $out{ $_ };
+}
+
+# output
+if ( $options{ 'json_output' } ) {
+    json_output();
+} else {
+    if ( $options{ 'downloads_only' } ) {
+        print "Downloaded only:\n" if $options{ 'verbose' };
+        print "$_\n" for sort keys %down_only;
+    } elsif ( $options{ 'downloads_too' } ) {
+        print "Downloaded only:\n" . ( join "\n", sort keys %down_only ) . "\n\nUploaded only: \n"
+        . ( join "\n", sort keys %up_only ) . "\n\nTransferred in both directions:\n" . ( join "\n", sort keys %both ) . "\n";
+        if ( 0 < scalar keys %deleted ) {
+            print "\n\nDeleted:\n" . ( join "\n", sort keys %deleted ) . "\n";
+        }
+    } elsif ( $options{ 'deleted' } ) {
+        print "\n\nDeleted:\n" if $options{ 'verbose' };
+        print "$_\n" for sort keys %deleted;
+    } elsif ( $options{ 'moved' } ) {
+        for my $user ( sort keys %moved ) {
+            print "\n\nuser '$user' moved or renamed:\n";
+            for my $old ( sort keys %{ $moved{ $user } } ) {
+                ( printf "%-42s ->\t%-42s\n", $old, $_ ) for sort keys %{ $moved{ $user }{ $old } };
+            }
+        }
+    } else { # only uploaded files not downloaded
+        print "Uploaded only:\n" if $options{ 'verbose' };
+        print "$_\n" for sort keys %up_only;
+    }
+}
+exit;
+
+# subs
+sub get_args {
+    while ( defined $ARGV[0] ) {
+        if (  $ARGV[0] eq '-V' ) { $options{ 'show_version' } = 1; }
+        elsif ( $ARGV[0] =~ /^-v+$/ ) { $options{ 'verbose' } = ( length $ARGV[0] ) - 1; }
+        elsif ( $ARGV[0] =~ /^-D+$/ ) { $DEBUG = ( length $ARGV[0] ) - 1; }
+        elsif ( $ARGV[0] =~ /^--?h(elp)?$/ ) { $options{ 'show_version' } = 1;  $options{ 'show_help' } = 1; }
+        elsif ( $ARGV[0] eq '-f' ) { $ftp_log = $ARGV[1]; shift @ARGV; $options{ 'do_xferlog' } = 1; }
+        elsif ( $ARGV[0] eq '-x' ) { $options{ 'do_all_xferlogs' } = 1; }
+        elsif ( $ARGV[0] eq '-u' ) { $options{ 'user' } = $ARGV[1]; shift @ARGV; }
+        elsif ( $ARGV[0] eq '-c' ) { $options{ 'do_cPanel' } = 1; }
+        elsif ( $ARGV[0] eq '-moved' ) { $options{ 'moved' } = 1; }
+        elsif ( $ARGV[0] eq '-m' ) { $options{ 'do_messages' } = 1; }
+        elsif ( $ARGV[0] eq '-M' ) { $options{ 'alt_messages_files' } = $ARGV[1]; shift @ARGV; }
+        elsif ( $ARGV[0] eq '-do' ) { $options{ 'downloads_only' } = 1; }
+        elsif ( $ARGV[0] eq '-del' ) { $options{ 'deleted' } = 1; warn "Currently deletions only work for system messages log processing. (PureFTPd doesn't log deletions in the xferlog.)\n"; }
+        elsif ( $ARGV[0] eq '-d' ) { $options{ 'downloads_too' } = 1; }
+        elsif ( $ARGV[0] eq '-j' ) { $options{ 'json_output' } = 1; }
+        elsif ( check_ip( $ARGV[0] ) ) { $ip = $ARGV[0] }
+        else  { warn "\n\nNot an IPv4 address: $ARGV[0]\nAborting.\n\n" ; $options{ 'show_help' } = 1; }
+        shift @ARGV;
+    }
+}
+
+sub check_options {
+    print "Added By IP $VERSION by Christopher E. Stith\n\n" if  ( $options{ 'verbose' } > 2 ) or $options{ 'show_version' };
+
+    if ( $options{ 'show_help' } ) {
+        print "added_by_ip [-u <username>] [-f <ftp_log>] [-x] [-m] [-c] [-h] [-D|-DD|...] [-v|-vv|...] [-j] [-V] <ip>\n"
+        . "\n\t-u <username> to set the user to check for if outside their home directory\n"
+        . "\t-f <ftp_log> to specify a PureFTPd style xferlog (as <ftp_log>)\n"
+        . "\t-x to check all PureFTPd style xferlogs for the user, found from current directory or the -u option\n"
+        . "\t-m to check /var/log/messages*\n"
+        . "\t-c to check /var/log/cpanel/logs/access_log (not implemented yet)\n"
+        . "\t-h to get this help screen\n"
+        . "\t-d to get downloads, too (downloaded-only, uploaded-only, and both ways file lists) (incompatible with -do)\n"
+        . "\t-do to get only a downloaded file list (incompatible with -d)\n"
+        . "\t-del to get a list of deleted files (only works with messages logs until pureFTPd gets xferlogs fixed for this)\n"
+        . "\t-D -DD or more to get debugging\n"
+        . "\t-v -vv or more to get verbose output\n"
+        . "\t-j to get your output in JSON (for another program, for example)\n"
+        . "\t-V to show the version (although the help and a verbose enough mode will too)\n";
+        exit;
+    }
+
+    if ( 1 < ( $options{ 'downloads_too' } + $options{ 'downloads_only' } + $options{ 'deleted' } + $options{ 'moved' } ) ) {
+        die "Use at most one of these flags please:\n-d\n-do\n-del\n-moved\n";
+    }
+    if (
+     ! ( $options{ 'do_xferlog' }
+     || $options{ 'do_all_xferlogs' }
+     || $options{ 'do_cPanel' }
+     || $options{ 'do_messages' }
+     || length $options{ 'alt_messages_files' }
+     ) ) {
+        $options{ 'do_messages' } = 1;
+        warn "No flags were set for the log type. Defaulting to checking messages logs.\n";
+    }
+
+    check_user() if ( $options{ 'do_xferlog' } || $options{ 'do_all_xferlogs'} );
+
+    if ( $options{ 'do_messages' } || length $options{ 'alt_messages_files' } ) {
+        if ( -f $helpers{ 'zcat' } && -x $helpers{ 'zcat' } ) {
+            $helpers{ 'command' } = $helpers{ 'zcat' } . ' --force ';
+        } elsif ( -f $helpers{ 'gunzip' } && -x $helpers{ 'gunzip' } ) {
+            $helpers{ 'command' } = $helpers{ 'gunzip' } . ' --stdout --force ';
+        } elsif ( -f $helpers{ 'gzip' } && -x $helpers{ 'gzip' } ) {
+            $helpers{ 'command' } = $helpers{ 'gunzip' } . ' -d --stdout --force ';
+        } elsif ( -f $helpers{ 'cat' } && -x $helpers{ 'cat' } ) {
+            $helpers{ 'command' } = $helpers{ 'cat' };
+            warn "Will not be checking archived system messages logs. None of zcat, gunzip, or gzip available (please fix or escalate).\n";
+        } else {
+            $helpers{ 'files' } = '/var/log/messages';
+            $helpers{ 'open_pipe' } = '';
+        }
+        $helpers{ 'files' } = '' unless $options{ 'do_messages' };
+    } else {
+        warn "Cannot show deletions without processing the messages logs. Option -del ignored.\n" if $options{ 'deleted' };
+        warn "Cannot show moved and renamed items without processing the messages logs. Option -moved ignored.\n" if $options{ 'moved' };
+    }
+
+    die "No IP address was given, so nothing to do! Use -h for help.\n" unless defined $ip;
+    return;
+}
+
+sub check_ip {
+    my $is_an_ipv4;
+    if ( my @bytes = ( $_[0] =~ m/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/ ) ) {
+        $is_an_ipv4 = ( 4 == grep { $_ >= 0 && $_ <= 255 } @bytes );
+    }
+    return $is_an_ipv4;
+}
+
+sub check_user {
+    if ( ! ( defined $options{ 'user' } && length $options{ 'user' } ) ) {
+        $options{ 'user' } = my $cwd = cwd();
+        $options{ 'user' } =~ s{^/home/([^/]+)/?.*$}{$1};
+        my ( $user_name, undef, $uid, $gid, undef, undef, undef, $homedir, undef, undef ) = getpwnam( $options{ 'user' } );
+        if ( ! ( defined $uid ) && ( $options{ 'do_xferlog' } || $options{ 'do_all_xferlogs'} ) ) {
+            warn "no system account entry retrieved for user " . $options{ 'user' } . ": $!\n";
+        }
+        print debug_wrapper( "DEBUG:: cwd: $cwd\t\tuser option: " . $options{ 'user' } . "\thomedir: $homedir\t\tusername: $user_name\n" ) if $DEBUG;
+    }
+}
+
+sub process_messagelogs {
+    my $open_string = $helpers{ 'command' } . ' ' .  $helpers{ 'files' } . ' ' . $options{ 'alt_messages_files' }  . $helpers{ 'open_pipe' };
+    print debug_wrapper( "open string: $open_string\n" ) if $DEBUG > 1;
+    open ( my $cmd, "$open_string" ) or die "cannot pipe from command: $!\n";
+
+    while ( <$cmd> ) {
+        next unless m/^[A-Z][a-z]{2} (?: \d|\d{2}) \d{2}:\d{2}:\d{2} \S+ pure-ftpd: \((.+?$ip)\) \[NOTICE\] (.*?)$/;
+        my $done_by = $1;
+        my $rem = $2;
+        my ( $done_by_user ) = $done_by =~ m/(.*)\@$ip/;
+
+        if ( $rem =~ m/^Deleted (.*?)$/ ) {
+            my $file = $1;
+            $file =~ s{/\.?/|//}{/}g;
+            $deleted{ $file }++;
+        } elsif ( $rem =~ m/^Restarting/ ) {  
+            $restarted++;
+        } elsif ( $rem =~ /^File successfully renamed or moved: \[([^\]]+)\]->\[([^\]]+)\]$/ ) {
+            $moved{ $done_by_user }{ $1 }{ $2 }++;
+        } elsif ( $rem =~ m/^(\/.*?) uploaded / ) {
+            my $file = $1;
+            $file =~ s{/\.?/|//}{/}g;
+            $in{ $file }++;
+        } elsif ( $rem =~ m/^(\/.*?) downloaded / ) {
+            my $file = $1;
+            $file =~ s{/\.?/|//}{/}g;
+            $out{ $file }++;
+        } else {
+            # currently unhandled... nothing known important here
+        }
+
+    }
+    close $cmd or ( $DEBUG > 1 ? warn( "error on pipe: $! $?\n" ) : 1 );
+    print debug_wrapper( "$restarted file transfer restarts occurred.\n" ) if ( $restarted && $DEBUG );
+    return;
+}
+
+sub process_pureftpd_xferlog { # let's hope the field order doesn't change
+    my $log = shift;
+    if ( defined $options{ 'user' } ) {
+        unless ( $log =~ m{/} ) {
+            $log = $xferlog_dir . '/' . $options{ 'user' } . '/' . $log;
+        }
+    }
+    open ( my $fh, '<', $log ) || die "Cannot read $log : $!\n";
+
+    while ( <$fh> ) {
+        print debug_wrapper( $_ . "\n" ) if $DEBUG;
+        next unless m/^[A-Z][a-z]{2} [A-Z][a-z]{2} (?: \d|\d{2}) \d{2}:\d{2}:\d{2} \d+ \d $ip \d+ (.*?) \w _ ([iod]) r (.*?) ftp /;
+        my ( $file, $direc, $user ) = ( $1, $2, $3 );
+        print "file: $file\t\tdirection: $direc\t\tuser: $user\n" if $options{ 'verbose' } > 2;
+
+        if ( $direc eq 'i' ) {
+             $in{ $file }++;
+        } elsif ( $direc eq 'o' ) {
+            $out{ $file }++
+        } elsif ( $direc eq 'd' ) {
+            $deleted{ $file }++;
+            warn "Deletion logged in xferlog unexpectedly.\n";
+        } else {
+            # currently unhandled, shouldn't need to be
+        }
+    }
+    close $fh;
+
+    return;
+}
+
+sub json_output { # shamelessly borrowed directly from Michael Karr, with permission. It's all one company, yeah?
+    my $output = {
+        'uploaded_only'     => \%up_only,
+        'downloaded_only'   => \%down_only,
+        'both_directions'   => \%both,
+        'deleted'           => \%deleted,
+        'moved'             => \%moved,
+        'options'           => \%options,
+    };
+
+    if ( eval { require JSON } ) {
+        JSON->import( -convert_blessed_universally );
+        print( JSON->new->allow_blessed->convert_blessed->encode( $output ) . "\n" );
+    } else {
+        print debug_wrapper( 'JSON requirement error:: ',  $@ ) if $DEBUG;
+        die "Error: Perl module 'JSON' not found. Please install to get JSON output.\n";
+    }
+}
+
+sub debug_header {
+    print "\n\n### DEBUGGING MODE ON. Debug level is $DEBUG.\n\n";
+}
+
+sub debug_wrapper {
+    return "\n\n### DEBUG DATA (debug level $DEBUG): " . ( shift ) . " :\n" . Dumper( @_ ) . "\n### END DEBUG DATA ###\n\n";
+}
+
+sub dump_args {
+    print debug_wrapper( 'arguments/options', \%options );
+}
+
+sub dump_in_and_out {
+    print debug_wrapper( 'files in/files out', \%in, \%out );
+}
+
+__END__
+
+=pod
+HISTORY
+
+2012-09-23
+===========
+* fixed a one-character bug in line 243 which caused download lines in messages logs not to be matched properly
+
+2012-06-21
+===========
+* fixed messages logs handling for cPanel breakage of allowing spaces in FTP usernames (but it's still cPanel breakage)
+* made more robust around file names with spaces
+* more regexes, fewer splits to accomplish some of this and more; simplifies a few things
+
+2012-05-20
+===========
+* fixed messages logs handling for file transfer restarts logged for the IP
+* check for definedness of field for "moved" (field 11) in messages log
+* traded out zgrep dependency for any of zcat, gunzip, or gzip
+* added ability to specify alternate or specific messages logs rather than or in addition to the standard ones
+* made the code more modular and some other refactoring
+
+2012-05-11
+===========
+* cleaned up some code formatting
+* put the reference to the wiki page in the header comments
+
+2012-05-10
+===========
+* fixed error handling for undefined user condition (outside of home directory and no -u flag)
+* added support for moved/renamed files and directories from the messages logs
+* fixed error handling for no defined used and -m flag
+* quieted expected error about piped command closure as it was found to be confusing to users
+* clarified error message when no log types are specified
+* warnings for -del and -moved and the xferlogs made clearer
+* fixed a bug in selecting only exact IP matches in messages logs
+
+2012-04-12
+===========
+* changed the order of some code to fix help display
+
+2012-02-02
+===========
+* added error handling for missing zgrep just in case
+* now allows IP to not be the absolute last thing on the command line
+* checks the octets in an IP for validity rather than just the numbers/dots positions
+* added -del flag to check deletions (need better xferlogs, system messages only for now)
+
+2012-01-18
+===========
+* moved from printing directly from tests to building the %up_only, %down_only, and %both hashes
+* added JSON output and the -j flag (thanks MKarr)
+* added handling of all xferlogs for a user
+* added -x flag, all xferlogs can be found from $PWD or from specified user ( -x or -x -u user for example )
+* added -u flag and processing to support -x -u in combination
+
+2011-12-09
+===========
+* cleaned up some PerlCritic complaints
+* moved the copyright/doc reference banner closer to the top
+* fixed some formatting
+
+2011-12-08
+===========
+* help mode ( -h ) no longer continues to run after displaying the help
+* now has a README
+
+2011-09-10
+===========
+* added -d and -do options
+* made $DEBUG configurable at the command line
+* brought in Data::Dumper for debugging rather than hand-dumping
+* gave a default action of checking the /var/log/messages* with no options
+* put in rudimentary IP format checking (ipv4 only right now, as the script only handles that anyway)
+* (re)added version printing, but now only upon verbose mode or -V or added to the top of the help text
+* simplified the code for option handling
+* switched from a bunch of file-scoped lexical control variables to the %options hash
+* removed a spurious mention of an unused variable
+* made main program flow simpler and more clear
+* added distinction of up only/down only/both to the upload/download option rather than just showing two lists
+* made the code far more modular, using several subs where the program had been a fairly long linear chunk
+* fixed the help display (better wording, added the new options, etc)
+* added a bunch of debugging code
+* added checks for errors in the xferlog format
+
+2011-09-09
+===========
+* fixed a bug in handling odd paths in messages logs containing things like /./ or /.././ and such
+
+2011-06-15
+===========
+* changed name from ftp_added to added_by_ip
+* a tweak or two
+* I think this was the original message logs feature
+
+up until 2011-06-15
+====================
+* made a few swipes at this as a one-liner to handle just one pureftpd xferlog
+* refined the one-liner and turned it into a script
+* may have added at some point the message logs feature
+
+=cut
+

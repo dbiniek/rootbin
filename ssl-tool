@@ -1,0 +1,1140 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# ssl-tool
+# Utility script to install SSL certs using cPanel's api.
+# http://git.toolbox.hostgator.com/ssl-tool/pages/Home/
+# http://git.toolbox.hostgator.com/ssl-tool/
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2013 - HostGator.com, LLC
+###########
+#
+# Rishwanth Y
+#
+#
+# Version History:
+# 0.2  - Added --setdediip option.
+# 0.3  - Updated owner parse routines to parse the information differenly. Cpanel's whoowns script is insufficent.
+# 0.4  - Updated to not use subshells
+# 0.5  - Updated to use cPanel's perl api module
+# 0.6  - fixed setdediips to double check IP for resevered status.
+# 1.0  - Updated switches, and added functionality for --installfromfile
+# 1.1  - Redid the findssl functionality and streamlined the process to have 'more' validation checks.
+# 1.2  - Added --unsetdediip, --uninstallssl switches to make some situations easier to handle.
+# 1.2a - Add eval block to catch file::path existance cause our vps/dedis dont have the latest variant of this installed.
+# 1.3  - Added '--removessls' option
+# 1.4  - Updated uninstallssl() to process removals directly from the whm instead of api, this workaround must be in place due to the 'sslinstall' features being disabled on our farm.
+# 1.4a - Do not let this be used on SEO servers. These SSL installations should be handled by billing admins only. 
+# 1.5  - Update IP checks to match what is used in cppc, also updated the mainip fetches to ensure that the 'proper' ip is used.
+# 1.5a - Updated uninstall ssl to process the CRT/KEY/CSR data removal via scripts2 calls. Fixed minor bug with parse_main_ip function.
+# 1.6  - Updated uninstall ssl to process SSLs for addon domains in a 'different' way, as cPanel tracks these by the subdomain instead.
+# 1.7  - Script renamed from 'ssl-tools' to 'ssl-tool'. Added ability to reset service certificates, and updated removessl functionality to pay attention to SSL installation status.
+# 1.8  - Adjust hostname check regex
+#
+
+use strict;
+use XML::Simple;
+use Data::Dumper;
+use Getopt::Long qw (:config pass_through);
+use Term::ANSIColor;
+use File::Find ();
+use Sys::Hostname;
+use POSIX qw(strftime);
+
+my $findssl;
+my $installssl;
+my $fetchssl;
+my $listfreeips;
+my $setdediip;
+my $unsetdediip;
+my $uninstallssl;
+my $removessls;
+my $resetsrv;
+my @sslfromfile;
+my $help;
+
+GetOptions ( 'displayssl|d=s'           => \$fetchssl,
+             'findssl|f=s'              => \$findssl,
+             'installssl|i=s'           => \$installssl,
+             'uninstallssl|u=s'         => \$uninstallssl,
+             'listfreeips'              => \$listfreeips,
+             'setdediip|ip=s'           => \$setdediip,
+             'unsetdediip|uip=s'        => \$unsetdediip,
+             'installfromfile|iff=s{4}' => \@sslfromfile,
+             'removessls=s'             => \$removessls,
+             'resetsrvcerts=s'          => \$resetsrv,
+             'help|h'                   => \$help
+           );
+
+if (@ARGV || $help) {
+        help();
+}
+
+if (not -e "/usr/local/cpanel/cpanel") {
+	print "[!] This tool is meant to be used on cPanel servers only.\n";
+	exit 1;
+}
+
+unshift @INC, '/usr/local/cpanel';
+require Cpanel::DIp;
+
+if (servertype() eq 'seo') {
+	print "[!] Due to the way dedicated IPs are assigned and configured on our SEO servers, SSL installations and IP assignments MUST be handled by our Billing Administrators.\n";
+	print "[!] Please contact a Senior Billing Administrator or Billing Supervisor for assistance.\n";
+	exit 1;
+}
+
+eval { 
+	require File::Path;
+	File::Path->import(qw/make_path/);
+	1;
+} or print "[!] Failed to load the necessary modules for this script to function properly. Please install File::Path via '/scripts/perlinstaller File::Path'\n" and exit 1;
+
+eval {
+	require cPanel::PublicAPI;
+	1;
+} or print "[!] Failed to load the necessary modules for this script to function properly. Please install cPanel::PublicAPI via '/scripts/perlinstaller cPanel::PublicAPI'\n" and exit 1;
+
+
+sub help {
+
+	my $text = <<END;
+SSL Tools version 1.7
+By Rish, Please submit bugs at https://projects.hostgator.com/projects/hg_ssltools
+
+Usage: 'perl <(GET git.hgfix.net/ssl-tool/ssl-tool)' with the following switches:
+
+	-f,  --findssl           <domain name>       - Finds and shows the different CRT files available for the domain on the server. Will indicate if they are installed or not.
+	-d,  --displayssl        <domain name>       - Finds and displays the RAW SSL information that is available for the domain on the server.
+	                                               Will show the key, crt, and cabundle if they are found.
+
+	-i,  --installssl        <domain name>       - Finds and installs the SSL certificate for the domain on the server.
+	                                               Only works if the SSL certificate is already on the server in a location that cPanel can find the ssl files
+
+	-iff,--installfromfile   <domain name>       - If the SSL certificate was never installed, and you are doing a fresh SSL install then use the following.
+	                         <path-to-.key>        You will need to save the key, crt, and cabundle into separate files.
+	                         <path-to-.crt>        Note: If there is no CA bundle available, then you will need to touch an empty file and specify the path to the file.
+	                         <path-to-.cab>
+
+	-u,  --uninstallssl      <domain name>       - Uninstalls the SSL certificate for the domain from the server.
+	                                               BOLDNOTE: This REMOVES the ssl data from the server, so you should back this information up prior to using this.
+	                                               An attempt to backup the SSL data will be made, if any issues come up then you will be prompted.
+
+	-ip, --setdediip         <cPanel username>   - Sets the account to use a dedicated IP. If the account is already on a dedicated IP, or if there are no free IPs, it will fail.
+	-uip,--unsetdediip       <cPanel username>   - Sets the account to use the server's main shared IP address. If the account has an SSL installed, it will fail.
+
+	--removessls             <cPanel username>   - Uninstalls all the SSL certificates for the user from the server, and unsets the dedicated IP address (if applicable).
+	                                               BOLDNOTE: This REMOVES the ssl data from the server.
+	                                               An attempt to backup the SSL data will be made, if any issues come up then you will be prompted. 
+	                                               It is highly recommended that you generate a full cPanel backup prior to using this switch.
+
+	--resetsrvcerts          <service name>      - Resets the service SSL certificates on the server.
+	                                               BOLDNOTE: This is only available on VPS and Dedicated servers.
+	                                               If the service SSLs are not 'self-signed' then it will not reset them.
+	                                               BOLDVALID service names are: cpanel (includes whm and webmail), mail (dovecot), ftp, exim, all
+
+END
+
+	my $BOLDNOTE = colorify('Note', 'bold');
+	$text =~ s/BOLDNOTE/$BOLDNOTE/g;
+	my $BOLDVALID = colorify('Valid', 'bold');
+	$text =~ s/BOLDVALID/$BOLDVALID/g;
+	print $text;
+	exit 1;
+}
+
+if ( !-e "/root/.accesshash" ) {
+	$ENV{'REMOTE_USER'} = 'root';
+	system('/usr/local/cpanel/bin/realmkaccesshash');
+}
+
+my $apic = cPanel::PublicAPI->new( ssl_verify_mode => 'SSL_VERIFY_NONE' );
+main();
+
+sub main {
+
+	print "\n";
+
+	if ($listfreeips) {
+		my @freeips = listfreeips();
+		if (scalar(@freeips)) {
+			print "[+] The following free IPs are available on the server:\n";
+			foreach my $ip (@freeips) {
+				print "\t$ip\n";
+			}
+		} else {
+			print "[!] No Free IPs found on the server.\n";
+		}
+	}
+
+	if ($removessls) {
+		removessls($removessls);
+		exit;
+	}
+
+	if ($findssl) {
+		findssl($findssl);
+	}
+
+	if ($fetchssl) {
+		fetchssl($fetchssl);
+	}
+
+	if ($uninstallssl) {
+		uninstallssl($uninstallssl);
+	}
+
+	if ($unsetdediip) {
+		unsetdediip($unsetdediip);
+	}
+
+	if ($setdediip) {
+		setdediip($setdediip);
+	}
+
+	if ($installssl){
+		installssl($installssl);
+	}
+
+	if (scalar(@sslfromfile) == 4){
+		sslfromfile(@sslfromfile);
+	}
+
+	if ($resetsrv) {
+		my $server_type = servertype();
+		if ($server_type ne 'unknown') {
+			print "[!] This is only available on VPS/Dedicated servers!\n";
+			exit 1;
+		}
+		reset_srv_ssls($resetsrv);
+	}
+
+	if (not $findssl and not $fetchssl and not $setdediip and not $uninstallssl and
+	    not $unsetdediip and not $installssl and not $listfreeips and 
+	    not $resetsrv and scalar(@sslfromfile) != 4 )
+	{
+		help();
+	}
+	
+	print "\n";
+	exit 0;
+}
+
+sub removessls {
+
+	my $user = shift;
+	if ( $user eq "" || ( !-e "/var/cpanel/users/$user" ) ) {
+		print "'$user' NOT found on the server. Please check the spelling.\n";
+		return 0;
+	}
+
+	if (my @ssl_domains = has_ssls_cpanel($user)) {
+		foreach my $ssldom (@ssl_domains) {
+			print "[*] Removing SSL from $ssldom...\n";
+			uninstallssl($ssldom);
+		}
+	} else {
+		print "[+] No SSLs setup for domains under '$user'.\n";
+	}
+	unsetdediip($user);
+	return;
+}
+
+sub findssl {
+
+	my $domain = shift;
+	my $docroot;
+	
+	my $owner = findowner($domain); 
+
+	if ( $owner eq "" || ( !-e "/var/cpanel/users/$owner" ) ) {
+		print "[!] $domain - NOT found. Please check the spelling.\n";
+		return 0;
+	}
+
+	print "[*] Finding SSL certs for $domain...\n";
+	my %ssls = findssl_helper($domain);
+
+	if (scalar(keys %ssls) > 1){
+		print "[+] Found multiple CRT files for $domain on the server. Please be sure to pick the valid one from the following CRTs...:\n";
+	} elsif (scalar(keys %ssls) == 1) {
+		print "[+] Found one CRT for $domain on the server.\n";
+	} else {
+		print "[!] No SSLs found for $domain.\n";
+	}
+
+	foreach my $ssl (keys %ssls) {
+		print "$ssl: \n";
+		my ($validity, @info) = @{$ssls{$ssl}};
+		foreach my $line (@info) {
+			print $line;
+		}
+		if ($validity == 0) { print "\t".colorify($ssl, "green")." - Valid SSL Certificate\n\n"; }
+		elsif ($validity == 1) { print "\t".colorify($ssl, "yellow")." - Self-signed or Not valid yet.\n\n"; }
+		elsif ($validity == 2) { print "\t".colorify($ssl, "red")." - Expired SSL.\n\n"; }
+		else { print "\t".colorify($ssl, "red")." - ERROR parsing info.\n\n"; }
+
+		open (my $httpconf, "<", "/usr/local/apache/conf/httpd.conf");
+		my $grep = (grep(/$ssl/, <$httpconf>))[0];
+		if ($grep) {
+			print "[+] SSL certificate: $ssl appears to be installed and configured on Apache.\n";
+		} else {
+			print "[!] SSL certificate: $ssl does not seem to be installed on the server.\n";
+		}
+	}
+}
+
+# Input: domain
+# Output: Empty hash if there's a failure.
+#         On success, a one element hash with;
+#         Full path to SSL file as key (i.e. '/usr/share/ssl/certs/somedomain.com.crt')
+#         Array with: [0] Output code from valid_crt (i.e. 0 = OK - Appears to be valid.)
+#                     [1] "Not Before: Oct  3 00:00:00 2013 GMT"
+#                     [2] "Not After : Oct  3 23:59:59 2014 GMT"
+#                     [3] "DNS:apnaandhra.com, DNS:www.apnaandhra.com"
+sub findssl_helper {
+	my $domain = shift;
+        my $user = findowner($domain); 
+        my @info;
+	my %sslvalidity;
+	my $sslfile = "/var/cpanel/userdata/$user/$domain" . "_SSL";
+	my $crtfile = lookup_ssl_cert($sslfile);
+	if ($crtfile) {
+		my $validity = valid_crt($crtfile, \@info);
+		$sslvalidity{$crtfile} = [$validity, @info];
+	}
+	return %sslvalidity;
+}
+
+# Input: Full path including filename to _SSL filename in /var/cpanel/userdata/user
+# Output: Return value is filename of the SSL certificate.
+#         or undef if there was a problem.
+sub lookup_ssl_cert {
+     my $sslfile = shift;
+     my $crtfile;
+     my @file;
+     eval {
+          open (my $INFILE, $sslfile);
+          @file = <$INFILE>;
+          close $INFILE;
+     } or do {
+          print "[!] Error opening $sslfile\n";
+          return undef;
+     };
+     foreach my $line (@file) {
+          chomp($line);
+          if ($line =~ /^sslcertificatefile: /) {
+              $crtfile = $line;
+              $crtfile =~ s/^sslcertificatefile: //;
+              return $crtfile;
+          }
+     }
+     return undef;
+}
+
+
+#Output: 0 = OK - Appears to be valid.
+#        1 = Not valid yet (i.e. today is before the start date)
+#        2 = Expired       (i.e. today is after the end data)
+#        3 = Error
+
+sub valid_crt {
+
+	my $crt  = shift;
+	my $info = shift;
+
+	if (not -e $crt) {
+		return 3;
+	}
+
+	my @sslmembers;
+	my $return;
+
+	my $start_date;
+	my $start_year;
+	my $start_month;
+	my $start_day;
+	my $end_date;
+	my $end_year;
+	my $end_month;
+	my $end_day;
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	my $now = sprintf("%04d%02d%02d", $year+1900, $mon+1, $mday);
+	my %months = ("Jan", 1, "Feb", 2, "Mar", 3, "Apr", 4, "May", 5, "Jun", 6, "Jul", 7, "Aug", 8, "Sep", 9, "Oct", 10, "Nov", 11, "Dec", 12);
+
+	if (lookup_cert_info($crt, \@sslmembers)) {
+		return 3;
+	}
+
+	my $start = $sslmembers[1];
+	$start =~ s/Not Before: //;
+	($start_month, $start_day, undef, $start_year, undef) = split (/\s+/, $start);
+	$start_date = sprintf("%04d%02d%02d", $start_year, $months{$start_month}, $start_day);
+
+	my $end = $sslmembers[2];
+	$end =~ s/Not After : //;
+	($end_month, $end_day, undef, $end_year, undef) = split(/\s+/, $end);
+	$end_date = sprintf("%04d%02d%02d", $end_year, $months{$end_month}, $end_day);
+
+	if (length($sslmembers[1])) { push @{$info}, "\t$sslmembers[1]\n"; }
+	if (length($sslmembers[2])) { push @{$info}, "\t$sslmembers[2]\n"; }
+	if (length($sslmembers[3])) { push @{$info}, "\t$sslmembers[3]\n"; }
+
+	if ($sslmembers[0] =~ /Self Signed/) {
+		return 1;
+	}
+
+	if ($now < $start_date) {
+		return 1;
+	}
+	if ($now > $end_date) {
+		return 2;
+	}
+	return 0;
+}
+
+sub lookup_cert_info {
+
+	my $crt = shift;
+	my $out = shift;
+
+	my @sslinfo = `openssl x509 -text -in \"$crt\"`;
+	my $sslissuer = (grep(/\s*Issuer:/, @sslinfo))[0];
+	$sslissuer =~ s/Issuer://g;
+	$sslissuer = trimspace($sslissuer);
+	my $sslsubject = (grep(/\s*Subject:/, @sslinfo))[0];
+	$sslsubject =~ s/Subject://g;
+	$sslsubject = trimspace($sslsubject);
+	my $sslstart = (grep(/\s*Not Before:/, @sslinfo))[0];
+	$sslstart = trimspace($sslstart);
+	my $sslend = (grep(/\s*Not After/, @sslinfo))[0];
+	$sslend = trimspace($sslend);
+	my $dns = (grep(/\s*DNS:/, @sslinfo))[0];
+	$dns = trimspace($dns);
+
+	if (length($sslsubject) == 0 or length($sslstart) == 0 or length($sslend) == 0) {
+		print "\tFailed to parse SSL info from $crt. Is it a valid certificate?\n";
+		return 1;
+	}
+
+	if ($sslissuer eq $sslsubject) {
+		$sslissuer = "Self Signed";
+	}
+
+	push (@{$out}, $sslissuer);
+	push (@{$out}, $sslstart);
+	push (@{$out}, $sslend);
+	push (@{$out}, $dns);
+	return 0;
+}
+
+sub trimspace {
+
+	my $string = shift;
+	chomp $string;
+	$string =~ s/^\s+//;
+	$string =~ s/\s+$//;
+
+	return $string;
+}
+
+sub colorify {
+
+	my $string = shift;
+	my $color = shift;
+	return color("$color").$string.color("reset");
+}
+
+sub fetchssl {
+
+	my $domain = shift;
+	my $owner = findowner($domain);
+
+	if ( $owner eq "" || ( !-e "/var/cpanel/users/$owner" ) ) {
+		print "$domain - NOT found. Please check the spelling.\n";
+		return 0;
+	}
+	
+	print "[*] Fetching SSL information for $domain...\n";
+	my @FETCH = fetchhelper($domain);
+
+	if (scalar(@FETCH) == 7){
+		print "[+] Domain: $FETCH[1]\n";
+		print "[+] IP: $FETCH[2]\n";
+		print "[+] User: $FETCH[3]\n";
+		print "[+] CRT:\n";
+		print "$FETCH[4]\n";
+		print "[+] CAB:\n";
+		print "$FETCH[5]\n";
+		print "[+] KEY:\n";
+		print "$FETCH[6]\n";
+		return 0;
+	} else {
+		print "[!] Fetching SSL information for $domain failed...\n";
+		if ($FETCH[0]) { print "$FETCH[0]\n"; }
+		return 0;
+	}
+}
+
+sub fetchhelper {
+
+	my $domain = shift;
+	my @OUTPUT;
+
+	my %ssls = findssl_helper($domain);
+	my @goodssls;
+
+SSL:foreach my $ssl (keys %ssls) {
+		my ($validity, @info) = @{$ssls{$ssl}};
+		foreach (@info) {
+			if (m/DNS:\s*\*\.$domain/) {
+				print "\n\n[!] '$ssl' is a wildcard certificate. Please install this manually. DNS configured in cert:\n";
+				print "\t$_\n";
+				next SSL;
+			}
+		}
+		if ($validity == 0) {
+			push @goodssls, $ssl;
+		}
+	}
+
+	if (scalar(@goodssls) > 1) {
+		print "\n[!] Multiple valid SSLs found! Narrow the domain selection down:\n";
+		foreach (@goodssls) {
+			print "\t$_\n";
+		}
+		return 0;
+	} elsif (scalar(@goodssls) == 0) {
+		print "\n[!] No valid SSLs found for '$domain' (Valid SSLs = non-expired, non-self-signed SSLs).\n";
+		return 0;
+	}
+
+	open FILE, "$goodssls[0]";
+	my $crtdata = do { local $/; <FILE>};
+	close FILE;
+	
+	my $response = $apic->whm_api('fetchsslinfo', { 'domain' => $domain, 'crtdata' => $crtdata }, 'xml');
+	my $output = XMLin($response);
+	
+	my $status = $output->{'sslinfo'}->{'statusmsg'};
+	push @OUTPUT, $status;
+	
+	if ($status eq "ok") {
+		my $domain = $output->{'sslinfo'}->{'domain'};
+		my $ip = $output->{'sslinfo'}->{'ip'};
+		my $user = $output->{'sslinfo'}->{'user'};
+		my $CRT = $output->{'sslinfo'}->{'crt'};
+		my $CAB = $output->{'sslinfo'}->{'cab'};
+		my $KEY = $output->{'sslinfo'}->{'key'}; 
+
+		if (ref($CAB)) { #this means that the CAB lookup was empty.
+			$CAB = "EMPTY";
+		}
+
+		chomp $CRT;
+		push @OUTPUT, $domain;
+		push @OUTPUT, $ip;
+		push @OUTPUT, $user;
+		push @OUTPUT, $CRT;
+		push @OUTPUT, $CAB;
+		push @OUTPUT, $KEY;
+	}
+	return @OUTPUT;
+}
+
+sub setdediip {
+
+	my $owner = shift;
+
+	if ( $owner eq "" || ( !-e "/var/cpanel/users/$owner" ) ) {
+		print "'$owner' NOT found on the server. Please check the spelling.\n";
+		return 0;
+	}
+
+	open (my $userfile, "<", "/var/cpanel/users/$owner");
+	my $ip = (split(/=/, (grep(/^IP=/, <$userfile>))[0]))[1];
+	close ($userfile);
+	chomp $ip;
+	print "[*] Current IP address for the '$owner' account is: '$ip' - ";
+		
+	if (isdedicated($ip)) {
+		print "this is already a dedicated IP.\n";
+		return 0;
+	} else {
+		print "this is NOT a dedicated IP.\n";
+	}
+
+	my @freeips = listfreeips();
+
+	if (not scalar(@freeips)){
+		print "[!] It appears that there are NO free IPs left on this system. We can not assign a dedicated IP address to '$owner'.\n";
+		return 0;
+	} else {
+		print "[+] We have ".scalar(@freeips)." free IP(s) on the system. Attempting to assign a free IP to the account, '$owner'...\n";
+		my $randip;
+
+		if (scalar(@freeips) == 1){
+			$randip = $freeips[0];
+		} else {
+			$randip = $freeips[rand(scalar(@freeips)-1)];
+		}
+
+		my $response = $apic->whm_api('setsiteip', { 'user' => $owner, 'ip' => $randip }, 'xml');
+		my $output = XMLin($response);
+
+		if ($output->{'result'}->{'status'} == 1){
+			print "[+] IP address for '$owner' successfully changed to '$randip'.\n";
+		} else {
+			print "[!] IP address change for '$owner' to '$randip' Failed. cPanel says:\n";
+			print $output->{'result'}->{'statusmsg'}."\n";
+		}
+	}
+}
+
+sub unsetdediip {
+
+	my $user = shift;
+
+	if ( $user eq "" || ( !-e "/var/cpanel/users/$user" ) ) {
+		print "'$user' NOT found on the server. Please check the spelling.\n";
+		return;
+	}
+
+	open (my $userfile, "<", "/var/cpanel/users/$user");
+	my $ip = (split(/=/, (grep(/^IP=/, <$userfile>))[0]))[1];
+	close ($userfile);
+	chomp $ip;
+	print "[*] Current IP address for the '$user' account is: '$ip'. ";
+
+	if (isdedicated($ip)) {
+		print "This is a dedicated IP.\n";
+	} else {
+		print "\n[+] This is NOT a dedicated IP.\n";
+		return;
+	}
+
+	if (not has_ssls_cpanel($user)) {
+		my $mainip = listfreeips(1);
+		if (not $mainip) {
+			print "[!] Unable to determine server's Main IP address... Aborting.\n";
+			return;
+		}
+		print "[*] Changing IP address to '$mainip' now... ";
+
+		my $response = $apic->whm_api('setsiteip', { 'user' => $user, 'ip' => $mainip }, 'xml');
+		my $output = XMLin($response);
+
+		if ($output->{'result'}->{'status'} == 1){
+			print "Done.\n";
+		} else {
+			print "\n[!] IP address change for '$user' to '$mainip' Failed. cPanel says:\n";
+			print $output->{'result'}->{'statusmsg'}."\n";
+			return 1;
+		}
+	} else {
+		print "[!] '$user' has SSL certificates still installed. Not changing IPs until that is removed.\n";
+		return;
+	}
+}
+
+sub has_ssls_cpanel {
+
+	my $user = shift;
+	my $ssldomains_fh;
+
+	if (-s "/etc/ssldomains") {
+		open ( $ssldomains_fh, "<", "/etc/ssldomains");
+	} else {
+		return;
+	}
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'DomainLookup', 'func' => 'getbasedomains', 'user' => $user, }, {}, 'xml');
+	my $output = XMLin($response);
+	my @ssls;
+	
+	if (ref($output->{'data'}) eq 'ARRAY'){
+		foreach my $obj (@{$output->{'data'}}){
+			my $domain = $obj->{'domain'};
+			if (grep (/$domain/, <$ssldomains_fh>)) {
+				push @ssls, $domain;
+			} else {
+				my %ssls = findssl_helper($domain);
+				foreach my $ssl (keys %ssls) {
+					my ($validity, @info) = @{$ssls{$ssl}};
+					if ($validity == 0 or $validity == 2) {
+						push @ssls, $domain if is_ssl_installed($domain, $ssl);
+					}
+				}
+			}
+		}
+	} else {
+		my $domain = $output->{'data'}->{'domain'};
+		my %ssls = findssl_helper($domain);
+		foreach my $ssl (keys %ssls) {
+			my ($validity, @info) = @{$ssls{$ssl}};
+			if ($validity == 0 or $validity == 2) {
+				push @ssls, $domain if is_ssl_installed($domain, $ssl);
+			}
+		}
+	}
+	return @ssls;
+}
+
+sub listfreeips {
+
+	my $mainonly = shift;
+	if ($mainonly) {
+		my $ip = parse_mainip();
+		return $ip if $ip;
+	}
+
+	my $ipdata = fetch_ipdata();
+	my @ips;
+	foreach my $ip (keys %$ipdata) {
+		if (not defined $ipdata->{$ip}) {
+			push @ips, $ip;
+		}elsif (defined $ipdata->{$ip}->{shared} && scalar(@{$ipdata->{$ip}->{shared}}) == 0) {
+			push @ips, $ip;
+		} else {
+			my @keys = keys %{$ipdata->{$ip}};
+			if (scalar(@keys) == 1 and $keys[0] eq 'nameserver') { 
+				push @ips, $ip;
+			}
+		}
+	}
+
+	return @ips;
+}
+
+sub reset_srv_ssls {
+
+	my $service = shift;
+
+	if ($service !~ m/^(cpanel|mail|ftp|exim|all)$/) {
+		print "[!] Unknown service specified. Valid service names are: cpanel, mail, ftp, exim, and all\n";
+		return;
+	}
+	if ($service =~ m/^all$/) {
+		foreach my $srv (qw[cpanel mail ftp exim]) {
+			reset_srv_cert($srv);
+		}
+	} else {
+		reset_srv_cert($service);
+	}
+}
+
+sub reset_srv_cert {
+
+	my $service = shift;
+	my $app;
+	my $name;
+	my @info;
+
+	if ($service eq 'exim') {
+		my $validity = valid_crt('/var/cpanel/ssl/exim/exim.crt', \@info);
+		if ($validity eq 1) {
+			$app  = 'exim';
+			$name = 'Exim%20%28SMTP%29%20Server';
+		}
+	} elsif ($service eq 'cpanel') {
+		my $validity = valid_crt('/var/cpanel/ssl/cpanel/cpanel.pem', \@info);
+		if ($validity eq 1) {
+			$app  = 'cpanel';
+			$name = 'cPanel%2fWHM%2fWebmail%20Service';
+		}
+	} elsif ($service eq 'ftp') {
+		my $validity = valid_crt('/var/cpanel/ssl/ftp/ftpd-rsa.pem', \@info);
+		if ($validity eq 1) {
+			$app  = 'ftp';
+			$name = 'Ftp%20Server';
+		}
+	} elsif ($service eq 'mail') {
+		my $validity = valid_crt('/var/cpanel/ssl/dovecot/dovecot.crt', \@info);
+		if ($validity eq 1) {
+			$app  = 'dovecot';
+			$name = 'Dovecot%20Mail%20Server';
+		}
+	} else {
+		print "[!] Unknown service: '$service' specified.\n";
+		return;
+	}
+	if (not ($app and $name) ) {
+		print "[!] Failed to check the SSL certificate for '$service'. Please reset this manually.\n";
+		return;
+	}
+
+	my $output = $apic->api_request('whostmgr', '/scripts2/doresetssl', 'POST', { 'app' => $app, 'name' => $name} );
+
+	if ($$output =~ m/SSL Certificates have been reset and SSL restarted/) {
+		print "[+] Service SSL certificate for $service has been reset.\n";
+	} else {
+		print "[!] Failed to reset service SSL certificate for $service.\n";
+	}
+}
+
+sub is_ssl_installed {
+
+	my $domain   = shift;
+	my $crt_file = shift;
+
+	my $grep;
+	open (my $httpconf, "<", "/usr/local/apache/conf/httpd.conf");
+	while (<$httpconf>) {
+		if (/\b$domain\b/i) {
+			while (<$httpconf>) {
+				$grep = $_ and last if $_ =~ m|\s*SSLCertificateFile\s$crt_file|i;
+			}
+		}
+	}
+
+	return 1 if $grep =~ /$crt_file/;
+	return;
+}
+
+sub uninstallssl {
+
+	my $domain = shift;
+	my $owner  = findowner($domain);
+
+	if ( $owner eq "" || ( !-e "/var/cpanel/users/$owner" ) ) {
+		print "'$domain' - NOT found. Please check the spelling.\n";
+		return;
+	}
+
+	my $answer;
+	if (not savessl($domain)) {
+		print "[!] Failed to save SSL data automatically! Uninstalling the SSL will remove the SSL information from the server, please make sure you have backups for the crt, key, and cabundle files associated with '$domain'!\n";
+		print "[!] Proceed without backup? y/n - ";
+		chomp($answer = <STDIN>);
+	} else {
+		$answer = 'y';
+	}
+
+	if (my $subdomain = lookup_sub($domain, $owner)) {
+		$domain = $subdomain;
+	}
+
+	if ($answer eq 'y') {
+		my $output = $apic->api_request('whostmgr', '/scripts2/realdelsslhost', 'POST', { 'host' => $domain} );
+		#my $response = $apic->cpanel_api1_request('whostmgr', { 'module' => 'SSL', 'func' => 'delete', 'user' => $owner}, [ $domain ], 'xml');
+		if ($$output !~ m/Deleted SSL domain: $domain/ms) {
+			print "[!] cPanel failed to remove the SSL. Attempting to remove the SSL data directly...\n";
+			$output = $apic->api_request('whostmgr', '/scripts2/scripts2/delssldata', 'GET', { 'domain' => $domain, 'type' => 'crt' } );
+			($$output =~ m/Successfully removed/ms) ? print "[+]\tRemoved the CRT data...\n" : print "[!]\tFailed to remove the CRT data...\n"; 
+			$output = $apic->api_request('whostmgr', '/scripts2/scripts2/delssldata', 'GET', { 'domain' => $domain, 'type' => 'key' } );
+			($$output =~ m/Successfully removed/ms) ? print "[+]\tRemoved the KEY data...\n" : print "[!]\tFailed to remove the KEY data...\n";
+			$output = $apic->api_request('whostmgr', '/scripts2/scripts2/delssldata', 'GET', { 'domain' => $domain, 'type' => 'csr' } );
+			($$output =~ m/Successfully removed/ms) ? print "[+]\tRemoved the KEY data...\n" : print "[!]\tFailed to remove the CSR data...\n";
+			return;
+		} else {
+			print "[+] SSL for '$domain' has been successfully removed.\n";
+			return 1;
+		}
+	} else {
+		return;
+	}
+}
+
+sub lookup_sub {
+
+	my $domain = shift;
+	my $owner  = shift;
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'AddonDomain', 'func' => 'listaddondomains', 'user' => $owner, }, { 'regex' => '^'.$domain.'$' }, 'xml');
+	my $output   = XMLin($response);
+	if (defined $output->{data}->{fullsubdomain}) {
+		return $output->{data}->{fullsubdomain};
+	}
+	return;
+}
+
+sub savessl {
+
+	my $domain = shift;
+	my %ssls = findssl_helper($domain);
+	my @goodssls;
+
+	foreach my $ssl (keys %ssls) {
+		my ($validity, @info) = @{$ssls{$ssl}};
+		if ($validity == 0) {
+			push @goodssls, $ssl;
+		}
+	}
+
+	if (scalar(@goodssls) > 1) {
+		print "\n[!] Multiple valid SSLs found for '$domain'! Don't know what to save. Please save this information manually.\n";
+		return;
+	} elsif (scalar(@goodssls) == 0) {
+		print "\n[!] No valid SSLs found for '$domain' (Valid SSLs = non-expired, non-self-signed SSLs). Nothing to save.\n";
+		return 1;
+	}
+
+	open FILE, "$goodssls[0]";
+	my $crtdata = do { local $/; <FILE>};
+	close FILE;
+
+	my $response = $apic->whm_api('fetchsslinfo', { 'domain' => $domain, 'crtdata' => $crtdata }, 'xml');
+	my $output = XMLin($response);
+
+	my $status = $output->{'sslinfo'}->{'statusmsg'};
+	if ($status eq "ok") {
+		my $domain = $output->{'sslinfo'}->{'domain'};
+		my $ip = $output->{'sslinfo'}->{'ip'};
+		my $user = $output->{'sslinfo'}->{'user'};
+		my $CRT = $output->{'sslinfo'}->{'crt'};
+		my $CAB = $output->{'sslinfo'}->{'cab'};
+		my $KEY = $output->{'sslinfo'}->{'key'};
+
+		if (ref($CAB)) { #this means that the CAB lookup was empty.
+			$CAB = "EMPTY";
+		}
+
+		if (my $backupfile = backup_file($domain)) {
+			print "\n[+] Backing up SSL data to: '$backupfile'\n";
+			open my $backupfile_fh, ">", $backupfile;
+			print $backupfile_fh "SSL DATA FOR '$domain'\n";
+			print $backupfile_fh "Current IP: $ip - cPanel User: $user\n\n";
+			print $backupfile_fh "CRT:\n";
+			print $backupfile_fh $CRT;
+			print $backupfile_fh "\nRSA KEY:\n";
+			print $backupfile_fh $KEY;
+			print $backupfile_fh "\nCA Bundle:\n";
+			print $backupfile_fh $CAB;
+			close $backupfile_fh;
+			return 1;
+		} else {
+			return;
+		}
+	}
+	return;
+}
+
+sub backup_file {
+
+	my $domain = shift;
+	my $timestamp = POSIX::strftime("%m-%d-%Y-%H-%M-%S", localtime);
+	my $dir = "/home/hgtransfer/ssltools-backups/";
+	my $backup = $dir."ssldata-$domain-$timestamp";
+
+	if (not -d $dir) {
+		make_path( $dir, { owner => 'root', group => 'root' } ) or print "[!] Failed to created '$dir' to backup SSL data." and return 0;
+	} 
+
+	if (not -f $backup) {
+		return $backup;
+	} else {
+		return 0;
+	}
+}
+
+sub installssl {
+
+	my $domain = shift;
+	my $owner = findowner($domain);
+
+	if ( $owner eq "" || ( !-e "/var/cpanel/users/$owner" ) ) {
+		print "'$domain' - NOT found. Please check the spelling.\n";
+		return 0;
+	}
+
+	print "[*] Fetching SSL information for $domain...";
+	my @FETCH = fetchhelper($domain);
+
+	if (scalar(@FETCH) != 7){
+		print "[!] Failed to fetch the proper SSL information from the API. If you have the SSL cert files in a different location, please use the -iff option.\n";
+		if ($FETCH[0]) { print "$FETCH[0]\n"; }
+		return 0;
+	} else {
+		print " Done.\n";
+		installhelper(@FETCH[1..6]);
+	}
+}
+
+sub installhelper {
+	my ($domain, $ip, $user, $CRT, $CAB, $KEY) = @_;
+
+	my $nocab = 0;
+	if ($CAB eq "EMPTY") {
+		$nocab = 1;
+		$CAB = "";
+	}
+
+	if (isdedicated($ip)) {
+		print "[+] $ip is a dedicated IP. Proceeding with the SSL installation...\n";
+	} else {
+		print "[!] $ip is NOT a dedicated IP. Please assign a proper IP address to the account first.\n";
+		return 0;
+	}
+
+	my $response = $apic->whm_api('installssl', { 'user' => $user, 'domain' => $domain, 'cert' => $CRT, 'key' => $KEY, 'cab' => $CAB, 'ip' => $ip }, 'xml');
+	my $output = XMLin($response);
+
+	my $status = $output->{'status'};
+	if ($status){
+		if ($nocab) {
+			print "[*] SSL installation has finished, however no CA BUNDLE was provided for the certificate. This might cause some browsers to display warnings. cPanel's Output:\n";
+		} else {
+			print "[+] SSL installation has finished successfully! cPanel's Output:\n";
+		}
+		my @cpout = $output->{'rawout'};
+		foreach my $line (@cpout){
+			chomp $line;
+			print striphtml($line)."\n";
+		}
+	} else {
+		print "[!] SSL installation FAILED. Reason given:\n";
+		print "$output->{'statusmsg'}\n";
+	}
+}
+
+sub sslfromfile {
+
+	my ($domain, $key, $crt, $cab) = @_;
+
+	if (!-e $key or !-e $crt or !-e $cab) {
+		print "[!] One or more of the SSL files passed do not exist or not accessible. Please double check the files.\n";
+		return 0;
+	}
+
+	my $owner = findowner($domain);
+
+	if ( $owner eq "" || ( !-e "/var/cpanel/users/$owner" ) ) {
+		print "$domain - NOT found. Please check the spelling.\n";
+		return 0;
+	}
+
+	my $grep = (grep(/DNS:/, `openssl x509 -text -in \"$crt\"`))[0];
+	if ($grep !~ /$domain/i) {
+		print "[!] The CRT file passed does not appear to be issued for $domain:\n";
+		print $grep;
+		return 0;
+	}
+
+	open (my $KEYFILE, $key);
+	my $KEY = do { local $/;  <$KEYFILE> };
+	close ($KEYFILE);
+
+	open (my $CRTFILE, $crt);
+	my $CRT = do { local $/;  <$CRTFILE> };
+	close ($CRTFILE);
+
+	my $CAB;
+	if (-z $cab) {
+		$CAB = "EMPTY";
+	} else {
+		open (my $CABFILE, $cab);
+		$CAB = do { local $/; <$CABFILE> };
+		close ($CABFILE);
+	}
+
+	open (my $userfile, "<", "/var/cpanel/users/$owner");
+	my $ip = (split(/=/, (grep(/^IP=/, <$userfile>))[0]))[1];
+	close ($userfile);
+	chomp $ip;
+
+	installhelper($domain, $ip, $owner, $CRT, $CAB, $KEY);
+}
+
+sub findowner {
+	my $domain = shift;
+	my $owner;
+
+	#this is what whoowns does
+	open(my $USERDOMAINS, "/etc/userdomains" );
+	while (<$USERDOMAINS>) {
+		if (/^$domain: (\S+)/i) {
+			$owner = $1;
+		}
+	}
+	close($USERDOMAINS);
+
+	if ($owner eq ""){
+		open (my $httpconf, "<", "/usr/local/apache/conf/httpd.conf");
+		my $grep;
+		while (<$httpconf>) {
+			if (/\b$domain\b/i) {
+				while (<$httpconf>){
+					$grep = $_;
+					last if (/documentroot/i);
+				}
+			}
+		}
+		close ($httpconf);
+		
+		if ($grep) {
+			$grep =~ s|documentroot||gi;
+			$grep =~ s/^\s+//;
+			$grep =~ s/\s+$//;
+			$owner = (split(/\//, $grep))[2];
+		}
+	}
+	return $owner;
+}
+
+sub isdedicated {
+
+	my $ip = shift;
+	my $ipdata = fetch_ipdata();
+	if ($ipdata->{$ip}->{'dedicated'}) {
+		return 1;
+	}
+	return 0;
+}
+
+sub fetch_ipdata {
+
+	my $ipdata = Cpanel::DIp::get_ip_info();
+	foreach my $ip (keys %$ipdata) {
+		delete $ipdata->{$ip} if $ip =~ m/^(192\.168|10|172\.16)\./;
+	}
+	return $ipdata;
+}
+
+sub parse_mainip {
+
+	my $ipdata = fetch_ipdata();
+	foreach my $ip (keys %$ipdata) {
+		if (ref $ipdata->{$ip} eq 'HASH' and ($ipdata->{$ip}->{reserved} or $ipdata->{$ip}->{shared})) {
+			if (ref $ipdata->{$ip}->{shared} eq 'ARRAY') {
+				foreach my $user (@{$ipdata->{$ip}->{shared}}) {
+					return $ip if $user eq 'root';
+				}
+			}
+		}
+	}
+	return;
+}
+
+sub striphtml {
+
+	my $html = shift;
+	$html =~ s/<[^>]*>//gs;
+	$html =~ s/<br>/\n/gs;
+	$html =~ s/<([^>]|\n)*>//g;
+	$html =~ s/&quot;/'/g;
+
+	return $html;
+}
+
+sub servertype {
+
+	my $hostname = Sys::Hostname::hostname;
+	my $srvtype;
+
+	if ($hostname =~ /\.(hostgator\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear)\.com)$/) {
+		$srvtype = "shared";
+	} elsif ($hostname =~ /\.((websitewelcome|webhostsunucusu)\.com|websitedns\.in|prodns\.com\.br)$/) {
+		open (my $wwwacct, "<", "/etc/wwwacct.conf");
+		my $ns = (grep(/NS/, <$wwwacct>))[0];
+		$ns = (split(' ', $ns))[1];
+		if ($ns =~ m/^sns/i) {
+			$srvtype = "seo";
+		} else {
+			$srvtype = "reseller";
+		}
+	} else {
+		$srvtype = "unknown";
+	}
+
+	return $srvtype;
+}

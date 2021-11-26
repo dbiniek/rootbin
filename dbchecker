@@ -1,0 +1,603 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# dbchecker
+# Simple script to parse and check database information for various scripts.
+# https://confluence.endurance.com/display/HGS2/Migrations+Script%3A+dbchecker
+# https://stash.endurance.com/projects/HGADMIN/repos/dbcheck/browse
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2013 - HostGator.com, LLC
+###########
+#
+# Rishwanth Y
+#
+# Version 0.1  - initial push
+# Version 0.2  - Changed the 'homedir' parsing code to read /etc/passwd without spawning a subshell per Josh and Shaun's review.
+# Version 0.3  - Updated mysql tests to use DBI instead of subshelled mysql calls.
+# Version 0.4  - Updated parsers to support WHMCS
+# Version 1.0  - Rewriten to process userlists, and also define the functions more clearly.
+# Version 1.0a - Fix output to properly use relative paths in the out when passed the --user or --userlist options.
+# Version 1.0b - Added PHP Weby support
+# Version 1.0c - Added Concrete5, Drupal7, Prestashop support
+# Version 1.1  - Added --dumptofile/-f support
+# Version 1.2  - Added DAP support
+# Version 2.0  - Added remote connection checks.
+# Version 2.1  - Added support for opencart.
+# Version 2.2  - Added support for mediawiki.
+# Version 2.2a - Added 'configuration_0.php' for joomla matches to support "multi domain" joomlas.
+# Version 2.3  - Added Moodle, MyBB, Coppermine, PHPList, TomatoCart, Piwik support 
+# Version 2.4  - Added CubeCart
+# Version 2.5  - Added Prosper202
+# Version 2.6  - Added Elgg
+# Version 2.7  - Catch fails on monitoring suspended accounts.
+# Version 3.0  - Converted to use dbconnect module in /root/bin/xfermodules.pm
+# Version 3.1  - Scoped dbc objects to processdir() to correct problems detailed in issue #15068.
+# Version 3.2  - Added '--domlist' option
+#
+
+use strict;
+use Getopt::Long qw (:config pass_through);
+use Term::ANSIColor;
+use Cwd;
+use File::Find ();
+use Cwd 'abs_path';
+
+my $user;
+my $badonly;
+my $userlist;
+my $domlist;
+my $directory;
+my $remotemysql;
+my $help;
+my $dumptofile;
+
+GetOptions(
+	'user=s'         => \$user,
+	'dir=s'          => \$directory,
+	'bad'            => \$badonly,
+	'help'           => \$help,
+	'userlist=s'     => \$userlist,
+	'domlist=s'      => \$domlist,
+	'remotehost=s'   => \$remotemysql,
+	'dumptofile|f=s' => \$dumptofile,
+);
+
+if (@ARGV) {
+	print "Unknown option passed. Please see --help\n";
+	exit 1;
+}
+
+if ($help) {
+	print "[#] DB Checker 3.2\n";
+	print "[#] By Rish - please report bugs at https://projects.hostgator.com/projects/hg_dbcheck\n\n";
+	print "Usage: dbchecker <optional switches>\n";
+	print "          When this script is run without any switches, it will check for scripts within the current directory.\n";
+	print "Remote options:\n";
+	print "          --remotehost <IP/HOSTNAME>   - Tests remote database access on the specified host.\n";
+	print "                                         Note: If the 'host' setting parsed is not 'localhost':\n";
+	print "                                               - It will first use the parsed hostname for the mysql host.\n";
+	print "                                               - If this fails, it will try to connect to the IP/Host specified.\n";
+	print "Optional switches:\n";
+	print "          --bad                        - Display only failed database configurations.\n";
+	print "          --user <username>            - On cPanel servers, you can give it an username and it will check the scripts within that user's directory.\n";
+	print "          --userlist <filename>        - On cPanel servers, you can give the script a list of users to process.\n";
+	print "          --domlist  <filename>        - You can gives the script a list of domains, and the documentroot for those domains will be scanned.\n";
+	print "          --dir <directory>            - Specify an exact directory to search in.\n";
+	print "          --dumptofile, -f <filename>  - Dump the database information into a file. Format (per line): dbname dbuser password dbhost appname\n\n";
+	if (deps_check()) {
+		my $dbc = dbconnect->new();
+		$dbc->show_supported_configs();
+	}
+	exit 1;
+}
+
+if (not deps_check()) {
+	exit 1;
+}
+
+if ($remotemysql) {
+	my $oldremote = $remotemysql;
+	$remotemysql = hostnametoip($remotemysql);
+	if (not $remotemysql) {
+		print "[!] Failed to resolved '$oldremote'. Not proceeding\n";
+		exit 1;
+	}
+	open_firewall('3306');
+}
+
+if (!$user && !$directory && !$userlist && !$domlist) {
+	$directory = getcwd();
+	chomp $directory;
+}
+
+if ($directory) {
+	if (!-d "$directory") {
+		print "[!] ".color("red").$directory.color("reset").": does not exist on the server.\n";
+	} else {
+		processdir($directory);
+	}
+}
+
+if ($user) {
+	if ( -s "/usr/local/cpanel/cpanel") {
+		if (-e "/var/cpanel/users/$user") {
+			$directory = find_homedir($user);
+			if ($directory) {
+				processdir($directory);
+			} else {
+				print "[!] ".color("red").$user.color("reset").": Unable to determine homedir.\n";
+			}
+		} else {
+			print "[!] ".color("red").$user.color("reset").": does not exist on this server.\n";
+		}
+	} else {
+		print "[!] --user option is only viable on cPanel servers. No cPanel installation found on this server.\n";
+	}
+}
+
+if ($userlist) {
+	if ( -s "/usr/local/cpanel/cpanel") {
+		if (!-s $userlist) {
+			print "[!] Invalid userlist passed. File does not exist or is empty.\n";
+			exit 1;
+		} else {
+			processulist($userlist);
+		}
+	} else {
+		print "[!] --userlist option is only viable on cPanel servers. No cPanel installation found on this server.\n";
+		exit 1;
+	}
+}
+
+if ($domlist) {
+	if (not -s $domlist) {
+		print "[!] Invalid domlist passed. File does not exist or is empty.\n";
+		exit 1;
+	} else {
+		my $domain_paths = process_domlist($domlist);
+		my ($total, $totalbad, $totalgood) = (0,0,0);
+		foreach my $domain (keys %{$domain_paths}) {
+			if (my $docroot = $domain_paths->{$domain} ) {
+				print "\n[+] Searching the document root for '$domain': $docroot\n";
+				my ($temptot, $tempbad, $tempgood) = processdir($docroot);
+				$total += $temptot;
+				$totalbad += $tempbad;
+				$totalgood += $tempgood;
+			} else {
+				print "\n[!] ".color("red").$domain.color("reset")." does not exist on this server - failed to determine the document root for this domain\n";
+			}
+		}
+		print "\n[*] Total configs found: ".color("green").$total.color("reset").". Good configs: ".color("green").$totalgood.color("reset").". Bad configs: ".color("red").$totalbad.color("reset").".\n";
+	}
+}
+
+sub process_domlist {
+
+	my $domlist = shift;
+	my @domlist;
+	readfile($domlist, \@domlist);
+
+	my $domain_paths = {};
+	foreach my $domain (@domlist) {
+		chomp $domain;
+		$domain = lc $domain;
+		$domain_paths->{$domain} = get_docroot($domain);
+	}
+	return $domain_paths;
+}
+
+sub get_docroot {
+
+	my $domain = shift;
+	if (-s '/etc/psa/.psa.shadow') {
+		return plesk_docroot($domain);
+	} elsif (-s '/usr/local/cpanel/cpanel') {
+		return cpanel_docroot($domain);
+	} else {
+		return;
+	}
+}
+
+sub processulist {
+
+	my $userlist = shift;
+	my @userlist;
+	readfile($userlist, \@userlist);
+
+	my ($total, $totalbad, $totalgood) = (0,0,0);
+	foreach my $user (@userlist) {
+		chomp $user;
+		$user = lc $user;
+		if (-e "/var/cpanel/users/$user") {
+			my $homedir = find_homedir($user) or next;
+			my ($temptot, $tempbad, $tempgood) = processdir($homedir);
+			$total += $temptot;
+			$totalbad += $tempbad;
+			$totalgood += $tempgood;
+		} else {
+			print "\n[!] ".color("red").$user.color("reset")." does not exist on this server.\n";
+		}
+	}
+	print "\n[*] Total configs found: ".color("green").$total.color("reset").". Good configs: ".color("green").$totalgood.color("reset").". Bad configs: ".color("red").$totalbad.color("reset").".\n";
+}
+
+sub processdir {
+
+	my @directories = (shift);
+	print "[*] Processing $directories[0]:\n";
+	my $dbc = dbconnect->new();
+	# Temp fix to discard output from find_configs
+	open my $null, ">>", "/dev/null" ;
+	my $stdout = select $null;
+	my $configlist = $dbc->find_configs(\@directories);  #Search directory and build an array of ConfigInfo objects. Each element contains info. about one configuration file.
+	select $stdout;
+
+	my ($total, $totalbad, $totalgood) = (0,0,0);
+	my $stufffound = 0;
+	my $gmysqldumps;
+	my $bmysqldumps;
+
+	foreach my $config (@{$configlist}) {
+		if (not $remotemysql) {
+			local_check_db($config);
+		} else {
+			remote_check_db($config);
+		}
+
+		if (length($config->{appname}) > 0){ 
+			$total++;
+			#awkward way to do it, but pretty much the best way to make the output pretty.
+			if (!$stufffound) {
+				print "\n";
+				$stufffound = 1;
+			}
+			if ($dumptofile) {
+				open my $FILE, ">>", $dumptofile or die ("Unable to open $dumptofile: $!\n");
+				print $FILE "$config->{olddb} $config->{dbuser} $config->{password} $config->{dbhost} $config->{appname}\n";
+				close $FILE;
+			}
+		}
+
+		if (($config->{DBC} == 1) and (length($config->{appname}) > 0)) {
+			$totalgood++;
+			if ( $config->{dbuser} eq "root" ) {
+				print color("magenta")."[!]ROOT USER[!]".color("green")."[+] $config->{appname}: $config->{configfile}".color("reset")."! Database: $config->{olddb} - Database user: $config->{dbuser} - Database password: $config->{password} - Database Host: $config->{dbhost} - Table count: $config->{tblcount}\n";
+			}elsif (not $badonly) { 
+				print color("green")."[+] $config->{appname}: $config->{configfile}".color("reset")."! Database: $config->{olddb} - Database user: $config->{dbuser} - Database password: $config->{password} - Database Host: $config->{dbhost} - Table count: $config->{tblcount}\n";
+				if ($remotemysql) {
+					$gmysqldumps .= "mysqldump -h'$config->{dbhost}' -u'$config->{dbuser}' -p'$config->{password}' $config->{olddb} > $config->{olddb}.sql\n";
+				}
+			}
+		} elsif (length($config->{appname}) > 0) {
+			$totalbad++;
+			if ( $config->{dbuser} eq "root" ) {
+				print color("magenta")."[!]ROOT USER[!]".color("red")."[!] $config->{appname}: $config->{configfile}".color("reset")."! NOT working: Database: $config->{olddb} - Database user: $config->{dbuser} - Database password: $config->{password} - Database Host: $config->{dbhost} $config->{errstr}\n";
+			}
+			else{
+				print color("red")."[!] $config->{appname}: $config->{configfile}".color("reset")."! NOT working: Database: $config->{olddb} - Database user: $config->{dbuser} - Database password: $config->{password} - Database Host: $config->{dbhost} $config->{errstr}\n";
+			}
+			if ($remotemysql) {
+				$bmysqldumps .= "mysqldump -h'$config->{dbhost}' -u'$config->{dbuser}' -p'$config->{password}' $config->{olddb} > $config->{olddb}.sql\n";
+			}
+		}
+	}
+
+	if (not $total) {
+		print color("red")."\tNothing found.\n".color("reset");
+		return (0,0,0);
+	} else {
+		if ($remotemysql) {
+			if ($gmysqldumps and not $badonly) { 
+				print "\n\nWorking remote mysqldump commands:\n";
+				print $gmysqldumps;
+			}
+
+			if ($bmysqldumps) {
+				print "\n\nNon-working remote mysqldump commands:\n";
+				print $bmysqldumps;
+			}
+		}
+		if ($total > 2) {
+			print "[*] Configs found: ".color("green").$total.color("reset").". Good configs: ".color("green").$totalgood.color("reset").". Bad configs: ".color("red").$totalbad.color("reset").".\n\n";
+		} else {
+			print "\n";
+		}
+		return ($total, $totalbad, $totalgood);
+	}
+}
+
+sub find_homedir {
+
+	my $user = shift;
+	my ($name, $passwd, $uid, $gid, $quota, $comment, $gcos, $homedir, $shell) = getpwnam ($user);
+
+	if ($homedir and -d "$homedir") {
+		return $homedir;
+	}
+	return;
+}
+
+
+sub local_check_db {
+
+	require DBI;
+	require DBD::mysql;
+	my $config = shift;
+	my $dbname = $config->{olddb};
+	my $dbuser = $config->{dbuser};
+	my $dbpass = $config->{password};
+	my $appname = $config->{appname};
+
+	if ($dbname && $dbuser && $dbpass && $appname) {
+		my $dsn = "DBI:mysql:$dbname:localhost:3306";
+		my $connect;
+		eval {
+			$connect = DBI->connect($dsn, $dbuser, $dbpass, { RaiseError => 1, PrintError => 0 });
+		};
+
+		if ($@ or not $connect) {
+			$config->{errstr} = "\n[!]\tDBI call failed with the following error: $DBI::errstr";
+			$config->{DBC} = 0;
+			$config->{tblcount} = 0;
+		} else {
+			my $tblcount = eval {$connect->do('show tables'); };
+			if ($@) {
+				$config->{errstr} = "\n[!]\tCould not get table count: $DBI::errstr";
+			} else {
+				chomp $tblcount;
+				if ($tblcount eq '0E0') { $tblcount = 0; }
+				$config->{DBC} = 1;
+				$config->{tblcount} = $tblcount;
+				$connect->disconnect();
+			}
+		}
+	} else {
+		$config->{DBC} = 0;
+		$config->{tblcount} = 0;
+	}
+}
+
+sub remote_check_db {
+
+	require DBI;
+	require DBD::mysql;
+	my $config = shift;
+	my $dbname = $config->{olddb};
+	my $dbuser = $config->{dbuser};
+	my $dbpass = $config->{password};
+	my $dbhost = $config->{dbhost};
+	my $appname = $config->{appname};
+
+	if ($dbname && $dbuser && $dbpass && $appname) {
+		my $dsn;
+		my $connect;
+
+		eval {
+			if ($dbhost !~ m/^localhost$/i) {
+				$dsn = "DBI:mysql:$dbname:$dbhost:3306";
+				$connect = DBI->connect($dsn, $dbuser, $dbpass, { RaiseError => 1 });
+			} elsif (not $connect or $dbhost =~ m/^localhost$/i) {
+				$config->{dbhost} = $remotemysql;
+				$dsn = "DBI:mysql:$dbname:$remotemysql:3306";
+				$connect = DBI->connect($dsn, $dbuser, $dbpass, { RaiseError => 1 });
+			}
+		};
+
+		if ($@ or not $connect) {
+			$config->{DBC} = 0;
+			$config->{tblcount} = 0;
+			$config->{errstr} = "\n[-]\tDBI call failed with the following error: $DBI::errstr";
+		} else {
+			my $tblcount = $connect->do('show tables'); 
+			chomp $tblcount;
+			if ($tblcount eq '0E0') { $tblcount = 0; }
+			$config->{DBC} = 1;
+			$config->{tblcount} = $tblcount;
+			$connect->disconnect();
+		}
+	} else {
+		$config->{DBC} = 0;
+		$config->{tblcount} = 0;
+	}
+}
+
+sub open_firewall {
+
+	my $port = shift;
+	if (-e "/etc/csf" or -e "/etc/apf") {
+		print "[!] Custom firewall installation found. Not altering any rules, please be sure to open port 3306 for outgoing traffic manually.\n";
+		return 0;
+	}
+
+	my $ipt = `which iptables 2>/dev/null`;
+	chomp $ipt;
+
+	if (not $ipt) {
+		print "[!] IPtables not found. Skipping firewall procedures.\n";
+		return 0;
+	}
+
+	my $result = system ("$ipt -I OUTPUT -p tcp --dport $port -j ACCEPT");
+	if ($result) {
+		print "[!] IPtables open call failed for port '$port'. Watch out for timeouts and failed connections\n";
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+sub hostnametoip {
+
+	my (@bytes, @octets, $packedaddr, $raw_addr, $host_name, $ip);
+	if($_[0] =~ /[a-zA-Z]/g) {
+		$raw_addr = (gethostbyname($_[0]))[4];
+		@octets = unpack("C4", $raw_addr);
+		$host_name = join(".", @octets);
+	} else {
+		$host_name = $_[0];
+	}
+	return $host_name;
+}
+
+sub deps_check {
+
+	my $errors = 0;
+	if (eval {require "/root/bin/xfermodules.pm";} ) {
+		if ($xfermodules::VERSION < 1.05) {
+			print_warning(2) and $errors++;
+		}
+	} else {
+		print_warning(1) and $errors++;
+	}
+	if (eval {require DBI;} ) {
+		require DBI;
+		if (eval {require DBD::mysql;} ) {
+			require DBD::mysql;
+		} else {
+			print_warning(4) and $errors++;
+		}
+	} else {
+		print_warning(3) and $errors++;
+	}
+
+	if (not $errors) {
+		return 1;
+	}
+	return;
+}
+
+sub print_warning {
+
+	my $error = shift;
+	# 1 => xfermodules not installed
+	# 2 => xfermodules outdated
+	# 3 => DBI not installed
+	# 4 => DBD::mysql not installed
+
+	if ($error == 1) {
+		print "[!] The transfers modules do not appear to be on this server or one of its dependencies is not installed.\n";
+	} elsif ($error == 2) {
+		print "[!] This server appears to have an outdated version of the transfers modules.\n";
+	}
+
+	if ($error <= 2) {
+		print "[*] Please install the latest version. If this is a shared/reseller server, have a level 2 admin install them for you.\n";
+		print "[+] Install with: ".colorify("yum install ESO-utils\n", "YELLOW");
+                print "If the repository is not installed, you can create it with:\n\n";
+                print "cat <<'EOF'> /etc/yum.repos.d/dedi.repo\n";
+                print "[hgdedi]\n";
+                print "name=HG Monitoring Repo\n";
+                print "baseurl=http://repo.websitewelcome.com/dedi/centos/\$releasever/\$basearch\n";
+                print "enabled=1\n";
+                print "gpgcheck=0\n";
+                print "timeout=5\n";
+                print "EOF\n";
+	} elsif ($error == 3) {
+		print "[!] Failed to load DBI! Install this with:\n";
+		if (-s '/usr/local/cpanel/cpanel') {
+			print "[+]\t'/scripts/perlinstaller DBI'\n";
+		} else {
+			print "[+]\t'cpan install DBI'\n";
+		}
+	} elsif ($error == 4) {
+		print "[!] Failed to load DBI's MySQL driver! Install this with:\n";
+		if (-s '/usr/local/cpanel/cpanel') {
+			print "[+]\t'/scripts/perlinstaller DBD::mysql'\n";
+		} else {
+			print "[+]\t'cpan install DBD::mysql'\n";
+		}
+	}
+}
+
+sub readfile {
+
+	my ($filename, $arrayref) = @_;
+	eval {
+		open my $fh, "<", $filename;
+		@$arrayref = <$fh>;
+		close $fh;
+	} or do {
+		print "Error reading file: $filename - $!\n";
+		exit 1;
+	};
+}
+
+sub cpanel_docroot {
+
+	my $domain = shift;
+	if ($domain !~ m/^www\./) {
+		$domain = "www.$domain";
+	}
+	my $docroot;
+	my @filestocheck;
+
+	File::Find::find( sub { filestocheck (\@filestocheck, $domain, $_); }, "/var/cpanel/userdata/"); 
+
+	foreach my $file (@filestocheck) {
+		open (my $ud, "<", $file) or next;
+		my $grep = (grep (/documentroot/, <$ud>))[0];
+		close ($ud);
+
+		if ($grep) {
+			$grep =~ s|documentroot||gi;
+			$grep =~ s/://g;
+			$grep =~ s/^\s+//;
+			$grep =~ s/\s+$//;
+			$docroot = $grep;
+			last;
+		}
+	}
+
+	if (not $docroot or (not -d $docroot) ) {
+		return;
+	}
+
+	return $docroot;
+}
+
+sub filestocheck {
+
+	my ($filestocheck, $domain, $filename ) = @_;
+
+	#if we have a file already, then just return and save us some time.
+	if (scalar @{$filestocheck} ) {
+		return;
+	}
+
+	if ($filename !~ m/\.cache$/ or $filename !~ m/main/){
+
+		open (my $userdata, "<", $File::Find::name) or return;
+		my $grep = (grep (/$domain/, <$userdata>))[0];
+		close($userdata);
+
+		if ($grep) {
+			push (@{$filestocheck}, $File::Find::name);
+		}
+	}
+}
+
+sub plesk_docroot {
+
+	return if not -e '/etc/psa/.psa.shadow';
+	my $domain = shift;
+
+	open my $fh, '<', '/etc/psa/.psa.shadow';
+	my $mysqlpass = do { local $/; <$fh> };
+	close($fh);
+	chomp $mysqlpass;
+
+	my $docroot = `mysql -uadmin -p'$mysqlpass' -ss -e "select hosting.www_root from hosting inner join domains on domains.id=hosting.dom_id where domains.name = '$domain' limit 1;" psa`;
+	chomp $docroot;
+
+	if ($docroot) {
+		return $docroot;
+	}
+	return;
+}
+
+sub colorify {
+
+	my $string = shift;
+	my $color = shift;
+	return color("$color").$string.color("reset");
+}

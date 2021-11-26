@@ -1,0 +1,257 @@
+#!/usr/bin/perl 
+# $Date: 2014-12-18$
+# $Revision: 2.2$
+# $Source: /root/bin/hpaste$
+# $Author: Matthew Harris$
+# $Description: Submit to pastebin$
+# $Git: https://stash.endurance.com/projects/HGADMIN/repos/hpaste/browse$
+# $Wiki: https://confluence.endurance.com/display/HGS/Hpaste$
+use strict;
+use warnings;
+use LWP::UserAgent;
+use Getopt::Long;
+use IPC::Open3;
+use Carp;
+
+# sub defs
+sub send_paste;
+sub show_usage;
+sub colorstrip;
+
+# set defaults
+my $help    = 0;
+my $lang    = 'text';
+my $retain  = 0; # Default to keep pastes forever since they are often linked in ticket notes.
+my $private = 0;
+my $raw     = 0;
+
+# grab command line options
+GetOptions(
+    'usage|help|u|h'    => \$help,
+    'language|lang|l=s' => \$lang,
+    'retain|r=i'        => \$retain,
+    'private|p'         => \$private,
+    'raw|k'             => \$raw,
+);
+
+if ($help) {
+    # Pod::Usage was being stupid during testing so we will just use a heredoc
+    show_usage;
+}
+else {
+    send_paste;
+}
+
+sub send_paste {
+
+    # Some Settings
+    my $form_url = 'http://hgfix.net/paste/api/create';
+    my $name = $ENV{'RUSER'};
+    if ( ! $name ) {
+        $name = "Anonymous Employee";
+    }
+    # Read in output
+    my $content;
+    while ( my $line = <> ) {
+        $content .= colorstrip $line;
+    }
+    if ($content) {
+        # Fix Retain date
+        $retain = $retain * 1440;
+        # Send to Pastebin
+        my $ua       = LWP::UserAgent->new;
+        my $response = $ua->post(
+            "$form_url",
+            [
+                'text'    => $content,
+                'private' => $private,
+                'expire'    => $retain,
+                'lang'    => $lang,
+                'name'    => $name,
+            ],
+        );
+        croak 'Error: ', $response->status_line unless $response->is_success;
+
+        # Print link
+        my $link = $response->content;
+        if ( $raw ) {
+            $link =~ s/view/view\/raw/;
+            print $link . "\n";
+        } else {
+            print $link . "\n";
+        }
+    }
+    return;
+}
+
+sub show_usage {
+    print <<'EOF';
+
+NAME
+       hpaste - Submit data from standard input to Hostgator Pastebin
+
+OPTIONS
+       -l <lang>, --language=<lang>
+             Allows specification of language for syntax highlighting
+
+       -r <interval>, --retain=<interval>
+             Sets the amount of time in days to retain the file for
+
+       -p, --private
+             Marks the pastebin item as private
+
+       -k, --raw
+             Prints the raw pastebin link
+
+       -h, --help
+             Shows usage and examples
+
+LANGUAGE SUPPORT
+       The following options can be used with the -l or --language flags:
+       "text", "apache", "awk", "bash", "html", "js"
+       "mysql", "perl", "php", "python", "ruby", "yaml"
+        See: http://hgfix.net/paste/api for more language options
+
+EXAMPLES
+       Send file to pastebin
+             "cat file.txt | hpaste"
+
+       Set language
+             "cat script.pl | hpaste -l perl"
+
+       Set retain time
+             "smartctl -a /dev/sda | hpaste -r 30"
+
+       SSeett private for 30 days with perl syntax highlighting
+             "cat script.pl | hpaste -p -r 30 -l perl"
+
+BUGS AND LIMITATIONS
+       If you do not pipe to hpaste then input will be from stdin(your
+       keyboard) so you type what message you want to send and then hit CTRL +
+       D to send EOF
+
+DEPENDENCIES
+       LWP::UserAgent, Getopt::Long and Carp Modules
+
+LICENSE AND COPYRIGHT
+       (C) 2012 - HostGator.com, LLC
+
+AUTHOR
+       Matthew Harris
+
+SEE ALSO
+       Git: https://stash.endurance.com/projects/HGADMIN/repos/hpaste/browse
+
+       Wiki: https://confluence.endurance.com/display/HGS/Hpaste
+
+EOF
+    return;
+}
+
+# taken from Term::ANSIColor due to old versions not including function
+sub colorstrip {
+    my (@string) = @_;
+    for my $string (@string) {
+        $string =~ s/\e\[[\d;]*m//g;
+    }
+    return wantarray ? @string : join ('', @string);
+}
+
+__END__
+
+=head1 NAME
+
+hpaste - Submit data from standard input to Hostgator Pastebin
+
+=head1 USAGE
+
+command | hpaste <options>
+
+=head1 OPTIONS
+
+=over 6
+
+=item B<-l> I<lang>, B<--language>=I<lang>
+
+Allows specification of language for syntax highlighting
+
+=item B<-r> I<interval>, B<--retain>=I<interval>
+
+Sets the amount of time in days to retain the file for
+
+=item B<-p>, B<--private>
+
+Marks the pastebin item as private
+
+=item B<-h>, B<--help>
+
+Shows usage and examples
+
+=back
+
+=head1 DESCRIPTION
+
+This script makes a POST request to the Hostgator Pastebin to allow for easy saving of data and transfer of data for internal sharing and use.
+
+=head1 LANGUAGE SUPPORT
+
+=over 12
+
+=item The following options can be used with the B<-l> or B<--language> flags:
+
+=item C<text>, C<apache>, C<awk>, C<bash>, C<html>, C<js>
+
+=item C<mysql>, C<perl>, C<php>, C<python>, C<ruby>, C<yaml>
+
+=back
+
+=head1 EXAMPLES
+
+=over 6
+
+=item B<Send file to pastebin>
+
+C<cat file.txt | hpaste>
+       
+=item B<Set language>
+
+C<cat script.pl | hpaste -l perl>
+       
+=item B<Set retain time>
+
+C<smartctl -a /dev/sda | hpaste -r 30>
+       
+=item B<Set private for 30 days with perl syntax highlighting>
+
+C<cat script.pl | hpaste -p -r 30 -l perl>
+
+=back
+
+=head1 BUGS AND LIMITATIONS
+
+If you do not pipe to hpaste then input will be from stdin(your keyboard) so you
+type what message you want to send and then hit CTRL + D to send EOF
+
+Checks if user is logged in via wizard2, if user is not logged in via wizard2 they will be unable to post to the pastebin without manual changes to the script.
+
+=head1 DEPENDENCIES
+
+LWP::UserAgent, Getopt::Long and Carp Modules
+
+=head1 LICENSE AND COPYRIGHT
+
+(C) 2012 - HostGator.com, LLC
+
+=head1 AUTHOR
+
+Matthew Harris
+
+=head1 SEE ALSO
+
+Git: https://stash.endurance.com/projects/HGADMIN/repos/hpaste/browse
+
+Wiki: https://confluence.endurance.com/display/HGS/Hpaste
+
+Full Language Support: http://pygments.org/languages/
+
+=cut

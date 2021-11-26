@@ -1,0 +1,2439 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+###########
+# gofetch
+# Gofetch is a cPanel backup management script which streamlines the transfer of cPanels from other hosting providers.
+# https://stash.endurance.com/projects/HGADMIN/repos/gofetch/browse
+# https://confluence.endurance.com/display/HGS/Migrations%3A+Gofetch
+# Please submit all bug reports at jira.endurance.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+# -------------------------------------------------------------------------
+# ------------------------- Initialization --------------------------------
+# -------------------------------------------------------------------------
+
+#--------------- Module includes -----------------
+use Term::ANSIColor qw(:constants);
+use Getopt::Long    qw(:config bundling); #Allow bundling of single options.  But all long options require --.  i.e.
+                                          # -ab will set options a and b, but not option ab.  --ab will set option ab but not a and b.
+                                          # Long story short: use a single dash with single letter options and two dashes with long options.
+use Data::Dumper;
+use DBI;
+use strict;
+use Time::Local;
+use Cwd;
+$|++;
+
+#-------------- Global Variable declarations ------------
+my @logins;         # Array of logindetails objects.
+my @acct_list;      # Array representing a list of logins that is built from @logins.
+my $sleeptime;      # sleeptime (Pause time between tasks to keep us from getting locked out of the old host).
+my %statuses;       # Hash of statuses where a given status is the key and the number of accounts at that status is the value.
+my $download_bytes;  # Bytes downloaded so far.  Used by the progress bar.
+my $download_counter = 0; #Used in progress_callback to cut down on the number of times we have to process curses events during a download.
+my $download_path    = getcwd();
+my $download_handle;
+my $user_exist_flag  = 0; #Indicates whether or not the %userexists hash array is built (0=no, 1=yes)
+my %userexists;     #Hash array of users on the local server.
+my @domain_conflicts;
+my @username_conflicts;
+
+my $summary_addons;
+my $summary_databases;
+
+my $statdb;                  #Status database object (SQLite3)
+#------------- Command line options ----------------
+my $opt_r       = 0;  # 0=Restore  option not selected.     1=option selected.
+my $opt_d       = 0;  # 0=Download option not selected.     1=option selected.
+my $opt_b       = 0;  # 0=Backup   option not selected.     1=option selected.
+my $skiprecent  = 0;  # 0 = Not selected.                   1=Do $opt_b, but skip backups < 24 hours old.
+my $opt_c       = 0;  # 0=Check    option not selected.     1=option selected.
+my $opt_v       = 0;  # 0=Non-verbose.                      1=Verbose.
+my $opt_s       = 0;  # 0
+my $statfile;         # SQLite3 datbase file with transfer status and log. If empty, generate a new filename.
+my $bindaddress = ""; # 0= default. Don't bind to a specific address.  Nonzero: IP address to bind to.
+my $ssl         = 0;  # 0=Don't use SSL.  Nonzero = Use SSL.
+my $dir         = ""; # Specify a directory to download backups to (default is /home/)
+my $skiplimits  = 0;  # 0=Fail if the backup at the old host is > 4Gb.  1=Download it no matter how big it is.
+my $skiphomedir = 0;  # 0=normal backup.  1=Make the backup a skiphomedir backup at the old host.
+my $skiprecent  = 0;
+my $status      = 0;  # 1 = Send a signal to another process to make it run a status report.
+GetOptions ("b"                => \$opt_b,
+            "B"                => \$skiprecent,
+            "d"                => \$opt_d,
+            "r"                => \$opt_r,
+            "c"                => \$opt_c,
+            "v"                => \$opt_v,
+            "s=s"              => \$opt_s,
+            "sleeptime=s"      => \$sleeptime,
+            "bind-address=s"   => \$bindaddress,
+            "ssl"              => \$ssl,
+            "dir=s"            => \$dir,
+            "skip-limits"      => \$skiplimits,
+            "skiphomedir"      => \$skiphomedir,
+            "status=s"           => \$status
+           );
+
+my $l = logg->new("gofetch", $opt_v);
+
+if ($status) { #If --status given with an arg, then read a .status file.
+     if ($status =~ /\.status/) {
+          print "Show the status from a status file.\n";
+          $statfile = $status;
+          status_init_database();
+          status_load_snapshot();
+          show_status();
+          status_close();
+     }else{
+          print "Status filename does not appear to be valid.\n";
+     }
+     exit(0);
+}
+
+if ($skiphomedir) {
+     $skiplimits = 1;
+}
+
+if ($skiprecent) {
+     $opt_b = 1;      # If user chose -B, then also enable -b because it's the same option but skipping recent backups.
+}
+
+# Process the --dir option if it was given.
+if ($dir) {
+     if ($dir !~ /^\//) {  #If it's not a full path (i.e. doesn't start with a /), then we can't use it.
+          print "The --dir option must be a full path.  (i.e. /home/hgtransfer)\n";
+          exit 1;
+     }
+     if (! -d $dir) {
+          print "The --dir path given ($dir) does not appear to be a path.\n";
+          exit 1;
+     }
+     $download_path = $dir;     
+}
+
+# Make sure the IP given in --bind-address is on this server if --bind-address was used.
+if ($bindaddress && !does_ip_exist($bindaddress)) {
+     print "The IP address given with the --bind-address option ($bindaddress) is not on this server.\n";
+     exit 1;
+}
+
+if ($download_path !~ /\/home[0-9]?\/hgtransfer\/.+/) {
+     print RED . "Please run gofetch in a ticket directory within /home/hgtransfer.\n" . RESET;
+     exit 1;
+}
+
+# Make sure that at lease one of the options -c, -b, or -d was given.
+if ($opt_c==0 && $opt_b==0 && $opt_d==0 && $opt_r ==0) {
+     showusage();
+     print RED . "\nNo options were chosen.  Please add -c to check, -b to back up, -d to download or -r to restore.\n" . RESET;
+     exit 1;
+}
+
+# If --sleeptime wasn't given on the command line, then default the sleep value to 30.
+if ($sleeptime == 0) {
+     if ($opt_s == 0) {
+          $sleeptime = 30;
+     }else {
+          $sleeptime = $opt_s;
+     }
+}
+
+
+#-------- Process command line arguments -----------
+
+if ($#ARGV == -1) { #If no arguments
+     $statfile = find_newest_db();
+     if (-s $statfile) {
+          $l->logg("Loading status file $statfile");
+          status_init_database();
+          status_load_snapshot();
+     }else{
+          showusage();
+          exit 0;
+     }
+}elsif ($#ARGV == 0) {
+     if (-s $ARGV[0]) { # If there's a file with the name of the arg, then if must be a hup file or a .status file.
+          $statfile = $ARGV[0]; #Set $statfile so status_init_database() reads it instead of creating a new database.
+          $statfile =~ s/\.status$//; # Remove .status of it's there to make sure absence of .status at the end is consistent.
+          $statfile .= ".status";     # Add .status to the end.
+          if (-s $statfile) {
+               status_init_database();
+               status_load_snapshot();
+          }else {
+               status_init_database();
+               read_logins_from_file($ARGV[0], \@logins);         #Read the logins from a plain text file.
+          }
+     }else {
+          showusage();
+          print "\nIt looks like a file was specified on the command line, but there's nothing in the file.\n\n";
+          exit 1;
+     }
+}elsif ($#ARGV == 2) { #Grab logins from the command line.
+     status_init_database();
+     my $obj_login                = logindetails->new(); #Create a new logindetails object, then populate it.
+     $obj_login->{host}           = $ARGV[0];
+     $obj_login->{username}       = $ARGV[1];
+     $obj_login->{password}       = $ARGV[2];
+     $obj_login->{webhostaccount} = WebHostAccount->new();
+     push (@logins, $obj_login);
+}else {
+     showusage();
+     exit 0;
+}
+
+#------------------------- Final Initialazation ----------------------------
+iptables_open();
+$SIG{INT}  = \&sigint_handler;
+
+# -------------------------------------------------------------------------
+# ---------------------------- Main loop ----------------------------------
+# -------------------------------------------------------------------------
+
+loop();
+show_status();
+if ($opt_c==1 && $opt_b==0 && $opt_d==0 && $opt_r ==0) { # Prompt for additional options.
+     print "Checks completed.  Start backup/download process?\n";
+     print "Enter additional options to processed (b,d,r)\n";
+     print "Or press <Enter> to quit. ";
+     my $options = <STDIN>;
+     chomp($options);
+     if ($options =~ /b/) {$opt_b = 1;}
+     if ($options =~ /d/) {$opt_d = 1;}
+     if ($options =~ /r/) {$opt_r = 1;}
+     if ($opt_b==1 || $opt_d==1 || $opt_r==1) {
+          loop();
+          show_status();
+     }
+} 
+cleanup();
+exit 0;
+
+#--------------------------------------------------------------------------------
+#---------------------------- Subroutines ---------------------------------------
+#--------------------------------------------------------------------------------
+
+# Loop through the list of accounts, working with each one until there is
+# nothing left to do.
+sub loop {
+     while(status_info_summary("todo")) {
+          work_on_accounts();
+          if (status_info_summary("todo")) {
+               $l->logg("[*] Sleeping $sleeptime seconds...", 1);
+               sleep($sleeptime);
+          }
+     }
+}
+
+# Show the current status.  This is called when ctrl-c is pressed.
+sub sigint_handler {
+     show_status();
+     print "Quit? (y/n)";
+     my $x = <STDIN>;
+     chomp($x);
+     $x = substr(lc($x),0,1);
+     if ($x eq "y") {
+          cleanup();
+          exit(0);
+     }
+}
+
+
+sub show_status {
+     my $summary_table = [];
+     my $total_databases = 0;
+     my $total_addons    = 0;
+     my $total_subs      = 0;
+     my $total_disk      = 0;
+     $l->logg("Printing Status Table");
+     # Headings of table
+     my $row           = [];
+     push (@{$row}, "Username");
+     push (@{$row}, "Status");
+     push (@{$row}, "Primary Domain");
+     push (@{$row}, "DBs");
+     push (@{$row}, "Addons");
+     push (@{$row}, "Subs");
+     push (@{$row}, "Disk");
+     push (@{$row}, "%");
+     push (@{$summary_table}, $row); 
+
+     # Body of table
+     foreach my $login (@logins) {
+          $summary_addons = $login->{addons};
+          $summary_databases = $login->{databases};
+          $row = [];
+          push (@{$row}, $login->{username});
+          push (@{$row}, lookup_status_text($login->{status}));
+          push (@{$row}, substr($login->{primarydomain},0,20));
+          push (@{$row}, $summary_databases);
+          push (@{$row}, $summary_addons);
+          push (@{$row}, $login->{subdomains});
+          push (@{$row}, to_units($login->{diskusage}));
+          push (@{$row}, $login->{percent});
+          push (@{$summary_table}, $row);
+
+          $total_databases += $summary_databases;
+          $total_addons    += $summary_addons;
+          $total_subs      += $login->{subdomains};
+          $total_disk      += $login->{diskusage};
+     }
+
+
+     # ******************* Todo: populate the DBs, Addons, Subs, and Disk totals below ***********
+
+     # Totals for table
+     my $row           = [];
+     push (@{$row}, "");
+     push (@{$row}, "");
+     push (@{$row}, "");
+     push (@{$row}, $total_databases);
+     push (@{$row}, $total_addons);
+     push (@{$row}, $total_subs);
+     push (@{$row}, to_units($total_disk));
+     push (@{$row}, "");
+     push (@{$summary_table}, $row); 
+         
+     print_table($summary_table);
+
+     # List Username conflicts
+     if (scalar(@username_conflicts)) {
+          print RED . "Username conflicts:\n" . RESET;
+          foreach my $user (@username_conflicts) {
+               print $user . "\n";
+          }
+          print "\n";
+     }
+     # List domain conflicts
+     if (scalar(@domain_conflicts)) {
+          print RED . "Domain conflicts:\n" . RESET;
+          foreach my $user (@domain_conflicts) {
+               print $user . "\n";
+          }
+          print "\n";
+     }
+     print "Status file: $statfile\n";
+     print "Log file: $l->{filename}\n";
+}
+
+
+# Go through the array of accounts and do the "next step" on one of them.
+# Input:  Golbal array @logins
+#         Global options that represent the command line switches.
+# Output: 0=No more work left to do.
+#         1= more work to do.
+sub work_on_accounts {
+     foreach my $login (@logins) {
+
+          if ($login->{status} == 110) {      # If this account has already been found to have failed the login, then skip it.
+               next;
+          }
+
+          #---------- Log in and gather account info ----------
+          if ($login->{loginstatus} == 0 && status_info($login) eq "todo") { #If we haven't logged in yet and there's still work to do, then log in now.
+               $l->logg("[*] Logging into $login->{username}", 1);
+               $login->{webhostaccount}->initialize($login->{host}, $login->{username}, $login->{password},
+                                                              $bindaddress, $ssl);#Log in and add new WebHostAccount object
+                                                                                                                      # to the "logindetails" object.
+               if ($login->{webhostaccount}->{errmsg}) {
+                    $l->logg("[!] Login failed for $login->{username}: $login->{webhostaccount}->{errmsg}", 1);
+                    $login->{status} = 110;    # Set status to "Failed login".
+                    last;
+               }else {
+                    $l->logg("[+] Login succeeded for $login->{username}", 1);
+                    $login->{loginstatus} = 1;   # Set the status to "Successful login" 
+               }
+               $l->logg("[*] Checking latest backup for $login->{username} at $login->{host}");
+               my $backupinfo = $login->{webhostaccount}->check_latest_backup();
+               if ($backupinfo->{file}) {
+                    $login->{existingbackup}      = $backupinfo->{file};
+                    $login->{existingbackup_size} = $backupinfo->{size};
+               }else {                            #No previous backups.  Check errmsg to see if there are truly no previous backups or if there's a problem.
+                    if ($login->{webhostaccount}->{errmsg}) {
+                         $l->logg("[!] Backup status check failed for $login->{username} at $login->{host}: $login->{webhostaccount}->{errmsg}", 1);
+                         $login->{status} = 103;       #Status check of the backup failed.
+                    }else {
+                         $l->logg("[*] Setting status to 'No backups' (40) for $login->{username} at $login->{host}");
+                         $login->{status} = 40;        #Set status to "No backups".
+                    }
+               }
+
+               $l->logg("[*] Gathering detailed information for $login->{username} at $login->{host}");
+               if ($login->{webhostaccount}->gather_info()) {
+                    $login->{status} = 30;        #Set the status to "Login OK"
+                    $l->logg("[*] Setting status to 'Login OK' for $login->{username} and setting existingbackup to $backupinfo->{file}");
+               }else{
+                    $l->logg("[!] Failed to gather_info for $login->{username} at $login->{host}", 1);
+                    $login->{status} = 103;
+                    last;
+               }
+               if ($login->{webhostaccount}->{hostname} =~ /(?:.*\.)?hostgator\.com$/ || $login->{webhostaccount}->{hostname} =~ /(?:.*\.)?websitewelcome\.com$/) {
+                    $l->logg("[!] This account appears to be from a HostGator server.  Gofetch should not be used for internal source accounts.",1);
+                    $login->{status} = 140;
+                    next;
+               }
+               if ($opt_r) { # Check for conflicts, but only if the restore option was given.
+                    if (does_user_exist($login->{username}) > 0) {
+                         $l->logg("[!] Username conflict: $login->{username}", 1);
+                         push (@username_conflicts, $login->{username});
+                         $login->{status} = 125         # Username Conflict
+                    }
+                    if (does_domain_exist($login->{webhostaccount}->{primarydomain}) == 1) {
+                         $l->logg("[!] Domain conflict: $login->{webhostaccount}->{primarydomain}", 1);
+                         push (@domain_conflicts, $login->{webhostaccount}->{primarydomain});
+                         $login->{status} = 130         # Domain Conflict
+                    }
+                    foreach my $addon (@{$login->{webhostaccount}->{addons}}) {
+                         if (does_domain_exist($addon->{domain}) == 1) {
+                              $l->logg("[!] Domain conflict: $addon->{domain}", 1);
+                              push (@domain_conflicts, $addon->{domain});
+                              $login->{status} = 130    # Domain Conflict
+                         }
+                    }
+                    foreach my $subdomain (@{$login->{webhostaccount}->{subdomains}}) {
+                         $l->logg("[*] Subdomain for $login->{username} at $login->{host}: $subdomain->{domain}");
+                         if (does_domain_exist($subdomain->{domain}) == 1) {
+                              $l->logg("[!] Domain conflict: $subdomain->{domain}", 1);
+                              push (@domain_conflicts, $subdomain->{domain});
+                              $login->{status} = 130    # Domain Conflict
+                         }
+                    }
+                    foreach my $parked (@{$login->{webhostaccount}->{parkeddomains}}) {
+                         $l->logg("[*] Parked domain for $login->{username} at $login->{host}: $parked->{domain}");
+                         if (does_domain_exist($parked->{domain}) == 1) {
+                              $l->logg("[!] Domain conflict: $parked->{domain}", 1);
+                              push (@domain_conflicts, $parked->{domain});
+                              $login->{status} = 130    # Domain Conflict
+                         }
+                    }
+               }
+               # Gather some stats from webhostaccount to keep directly in the logindetails object so we can save it.
+               $login->{primarydomain} = $login->{webhostaccount}->{primarydomain};
+               $login->{diskusage}     = $login->{webhostaccount}->get_disk_space();
+               $login->{addons}        = $login->{webhostaccount}->get_num_addon_domains();
+               $login->{subdomains}    = $login->{webhostaccount}->get_num_subdomains();
+               $login->{databases}     = $login->{webhostaccount}->get_num_databases();
+               $login->{percent}       = $login->{webhostaccount}->{diskpercent};
+
+               # Check to see if the account is too big.
+               if ($login->{diskusage} > 4096000000 && !$skiplimits) {
+                    $l->logg("[!] Account size > 4Gb for $login->{username} at $login->{host}: $login->{diskusage}", 1);
+                    $login->{status} = 135;
+               }
+               last;
+          }
+
+          #---------- Backup option ----------
+          if ($opt_b && $login->{status} < 70) {  # If backup option selected and the backup is not yet done, then start it or update its status.
+              if ($login->{webhostaccount}->{hostname} =~ /(?:.*\.)?hostgator\.com$/ || $login->{webhostaccount}->{hostname} =~ /(?:.*\.)?websitewelcome\.com$/) {
+                   $l->logg("[!] This account appears to be from a HostGator server.  Gofetch should not be used for internal source accounts.",1);
+                   $login->{status} = 140;
+                   next;
+              }
+              if (is_recent_backup($login->{existingbackup}) == 1 && $skiprecent == 1) { #If we're skipping recent backups and this is a recent backup, then skip this one.
+                   $login->{status} = 72;
+                   next;
+              }
+              if ($login->{status} < 50) {        # If backup is not started, then start it.
+                   $l->logg("[*] Starting backup for $login->{username} at $login->{host}", 1);
+                   if (!$login->{webhostaccount}->start_backup($skiphomedir)) {
+                        $l->logg("[!] Backup Failed for $login->{username} at $login->{host}: $login->{webhostaccount}->{errmsg}", 1);
+                        $login->{status} = 100;
+                   }else {
+                        $l->logg("[*] Setting backup status to 'Backup Started' for $login->{username} at $login->{host}");
+                        $login->{status} = 50;
+                        $login->{newbackup} = $login->{webhostaccount}->{backup_file};
+                        last;
+                   }
+              }else {                             # If status is 50-69, then update the status.
+                   $l->logg("[*] Checking backup status for $login->{username} at $login->{host}");
+                   my $backupinfo = $login->{webhostaccount}->check_latest_backup();
+                   if ($backupinfo->{status} eq "inprogress") {
+                        $login->{status} = 60;
+                   }elsif ($backupinfo->{status} eq "complete") {
+                        $login->{status} = 70;
+                        $login->{newbackup_size} = $backupinfo->{size};  #Fill in the size of the backup now that we know it. 
+                   }elsif ($backupinfo->{status} eq "timeout") {
+                        $login->{status} = 105;
+                   }else {
+                        $login->{status} = 107;   # Unknown status of backup.  This should never happen.
+                   }
+              }
+              last;
+          }
+
+          #---------- Download option ----------
+          if ($opt_d && $login->{status} < 80) {  # If download option chosen and we're at the appropriate status, then download the backup.
+              if ($login->{webhostaccount}->{hostname} =~ /(?:.*\.)?hostgator\.com$/ || $login->{webhostaccount}->{hostname} =~ /(?:.*\.)?websitewelcome\.com$/) {
+                   $l->logg("[!] This account appears to be from a HostGator server.  Gofetch should not be used for internal source accounts.",1);
+                   $login->{status} = 140;
+                   next;
+              }
+              if ($login->{status} <= 75) {
+                   my $backup;                                                                                    # Find out which backup to download.
+                   if ($login->{newbackup}) {
+                        $l->logg("[*] Setting newbackup size: " . $login->{newbackup_size});
+                        $backup = $login->{newbackup};
+                        $login->{webhostaccount}->{backup_size} = $login->{newbackup_size}; 
+                   }elsif ($login->{existingbackup}) {
+                        $l->logg("[*] Setting existing backup size: " . $login->{existingbackup_size});
+                        $backup = $login->{existingbackup};
+                        $login->{webhostaccount}->{backup_size} = $login->{existingbackup_size};
+                   }else {
+                        $l->logg("[!] Error: There are no backups to download for $login->{username} at $login->{host}", 1);
+                        $login->{status} = 115;
+                        last;
+                   }
+                   if (-s "$download_path/$backup") {                                                              # If backup exists, don't overwrite.
+                        $l->logg("[!] Error: Backup already exists: $download_path/$backup", 1);
+                        $login->{status} = 108;
+                        last;
+                   }
+                   $l->logg("[*] Starting download of $backup for $login->{username} at $login->{host}");
+                   $login->{status} = 75;
+                   my $result = $login->{webhostaccount}->download($download_path, $backup); # Perform the download.
+                   if (!$result) {
+                        $l->logg("\n[!] Download failed for $login->{username} at $login->{host}: $login->{errmsg}", 1);
+                        $login->{status} = 115;   # Download Failure
+                   }else {
+                        $l->logg("[+] Download finished for $login->{username} at $login->{host}");
+                        $login->{status} = 80;    # Backup Downloaded
+                   }
+                   last;
+              }else {
+                   $l->logg("[!] Error: Status is 'Backup Downloading' for $login->{username} at $login->{host}.  This is probably a script bug.");
+              }
+              last;
+          }
+
+          #---------- Restore option ----------
+          if ($opt_r && $login->{status} < 90) {
+               if ($login->{webhostaccount}->{hostname} =~ /(?:.*\.)?hostgator\.com$/ || $login->{webhostaccount}->{hostname} =~ /(?:.*\.)?websitewelcome\.com$/) {
+                    $l->logg("[!] This account appears to be from a HostGator server.  Gofetch should not be used for internal source accounts.",1);
+                    $login->{status} = 140;
+                    next;
+               }
+               #Restore the account.
+               my $backup;                                                                                    # Find out which backup to download.
+               if ($login->{newbackup}) {
+                    $backup = $login->{newbackup};
+               }elsif ($login->{existingbackup}) {
+                    $backup = $login->{existingbackup};
+               }else {
+                    $l->logg("[!] Error: There are no backups to restore for $login->{username} at $login->{host}", 1);
+                    $login->{status} = 145;
+                    next;
+               }
+               $l->logg("[*] Restoring the backup $backup for $login->{username} at $login->{host}");
+               $login->{status} = 85;
+               $l->logg("[*] /scripts/restorepkg --skipres $download_path/$backup 2>&1 > /var/log/hgtransfer/$backup.log");
+               `/scripts/restorepkg --skipres $download_path/$backup 2>&1 > /var/log/hgtransfer/$backup.log`; #restorepkg doesn't return success of failure,
+               if (check_restore("/var/log/hgtransfer/$backup.log")) {                              # so we check the log for success or failure.
+                    $l->logg("[*] Backup restored.");
+                    $login->{status} = 90;  # Backup Restored
+               }else {
+                    $l->logg("[!] Restore failed.  Please see the log at /var/log/hgtransfer/$backup.log", 1);
+                    $login->{status} = 117; # Restore Failure
+               }
+          }
+     }
+     #update_fields_fromlistbox();
+}
+
+# Find out how many accounts are at a given status.
+# The answer is determined based on this table of statuses and command line options.
+#
+# $login->{status}          $opt_c      $opt_b      $opt_d      $opt_r
+# ----------------------------------------------------------------------
+# 10  New                     1           1           1           1
+# 30  Login OK            0           1           1           1
+# 40  No backups              0           1           1           1
+# 50  Backup started          0           1           1           1
+# 60  Backup In Progress      0           1           1           1
+# 70  Backup complete         0           0           1           1
+# 72  Recent Backup           0           0           1           1
+# 75  Backup Downloading      0           0           1           1
+# 80  Backup Downloaded       0           0           0           1
+# 85  Backup Restoring        0           0           0           1
+# 90  Backup Restored         0           0           0           0
+# 100 Backup Failed           0           0           0           0
+# 103 Status check failed     0           0           0           0
+# 105 Backup Timeout          0           0           0           0
+# 107 Unknown Backup Failure  0           0           0           0
+# 108 Backup Already Exists   0           0           0           0
+# 110 Login Failure           0           0           0           0
+# 115 Download Failure        0           0           0           0
+# 117 Restore Failure         0           0           0           0
+# 120 Unknown Failure         0           0           0           0
+# 125 Username Conflict       0           0           0           0
+# 130 Domain Conflict         0           0           0           0
+# 135 Large Account           0           0           0           0
+# 140 HostGator Account       0           0           0           0
+# 145 Nothing To Restore      0           0           0           0
+#
+# Input:  Golbal array @logins
+#         Requested info (i.e. what info is the caller asking for?)
+#           "todo"
+#           "done"
+#           "success"
+#           "fail" 
+#           A status code such as 10, 20, 30, etc.
+# Output: Number of accounts that are at the inquired status.
+sub status_info_summary {
+     my $requested_info = $_[0];
+     %statuses   = ();   #Clear the hash table of statuses so we can get a fresh count.
+     foreach my $login (@logins) {
+          $statuses{$login->{status}}++;          # Keep track of the count of this status (i.e. status 10, 20, 30, etc.)
+          my $status_info = status_info($login);
+          $statuses{$status_info}++;
+     }
+     $statuses{done} = $statuses{success} + $statuses{fail};
+     if ($statuses{todo} eq "") {
+          $statuses{todo} = "0";
+     }
+     if ($statuses{done} eq "") {
+          $statuses{done} = "0";
+     }
+     if ($statuses{success} eq "") {
+          $statuses{success} = "0";
+     }
+     if ($statuses{fail} eq "") {
+          $statuses{fail} = "0";
+     }
+     return $statuses{$requested_info};
+}
+
+# Find out the todo/success/fail status of a single account.
+# Input:  Reference to a $login object
+#         Global option variables $opt_c, $opt_b, $opt_d, $opt_r
+# Output: "todo", "success", or "fail"
+sub status_info {
+     my $login = $_[0];
+     if ($login->{status} >= 100) {  # Any regular status >= 100 is a failure.
+          return "fail";
+     }
+     # If we've made it here, we know it's not a failure, so all we have to figure out is whether it's todo or success.
+     if ($opt_r) {
+          if ($login->{status} < 90) {
+               return "todo";
+          }else {
+               return "success"
+          }
+     }
+     if ($opt_d) {
+          if ($login->{status} < 80) {
+               return "todo"
+          }else {
+               return "success"
+          }
+     }
+     if ($opt_b) {
+          if ($login->{status} < 70) {
+               return "todo"
+          }else {
+               return "success"
+          }
+     }
+     if ($login->{status} < 30) {       #Default to processing for $opt_c
+          return "todo"
+     }else {
+          return "success"
+     }
+}
+
+
+# Look up the status text from the account status code (Not to be confused with the global script $status).
+# Input:  Status code    i.e. "50", etc
+# Output: Status text.   i.e. "Backup started", etc.
+sub lookup_status_text {
+     my $status_code  = $_[0];
+     my $status_text = "Unknown Failure"; #This status indicates a possible script bug because one of the conditions below should always change the status.
+     
+     if ($status_code == 10)  { $status_text = "New";                    }
+     if ($status_code == 30)  { $status_text = "Login OK";           }
+     if ($status_code == 40)  { $status_text = "No backups";             }
+     if ($status_code == 50)  { $status_text = "Backup started";         }
+     if ($status_code == 60)  { $status_text = "Backup In Progress";     }
+     if ($status_code == 70)  { $status_text = "Backup complete";        }#Can only be set after status 50 or 60 and only if backup doesn't match old backup.
+     if ($status_code == 72)  { $status_text = "Recent Backup";          }
+     if ($status_code == 75)  { $status_text = "Backup Downloading";     }
+     if ($status_code == 80)  { $status_text = "Backup Downloaded";      }
+     if ($status_code == 85)  { $status_text = "Backup Restoring";       }
+     if ($status_code == 90)  { $status_text = "Backup Restored";        }
+     if ($status_code == 100) { $status_text = "Backup Failed";          }
+     if ($status_code == 103) { $status_text = "Status Check Failed";    }
+     if ($status_code == 105) { $status_text = "Backup Timeout";         }
+     if ($status_code == 107) { $status_text = "Unknown Backup Failure"; }
+     if ($status_code == 108) { $status_text = "Backup Already Exists";  }
+     if ($status_code == 110) { $status_text = "Login Failure";          }
+     if ($status_code == 115) { $status_text = "Download Failure";       }
+     if ($status_code == 117) { $status_text = "Restore Failure";        }
+     if ($status_code == 120) { $status_text = "Unknown Failure";        }
+     if ($status_code == 125) { $status_text = "Username Conflict";      }
+     if ($status_code == 130) { $status_text = "Domain Conflict";        }
+     if ($status_code == 135) { $status_text = "Large Account";          }
+     if ($status_code == 140) { $status_text = "HostGator Account";      }
+     if ($status_code == 145) { $status_text = "Nothing To Restore";     }
+     return $status_text;
+}
+
+
+# Look up the status code from the account status text (Not to be confused with the global script $status).
+# Input:  Status text.   i.e. "Backup started", etc.
+# Output: Status code.   i.e. "50", etc
+sub lookup_status_code {
+     my $status_text  = $_[0];
+     my $status_code  = 120;     #This should never remain "Script Bug".
+     if ($status_text eq "New")                    { $status_code = 10;  }
+     if ($status_text eq "Login OK")           { $status_code = 30;  }
+     if ($status_text eq "No backups")             { $status_code = 40;  }
+     if ($status_text eq "Backup started")         { $status_code = 50;  }
+     if ($status_text eq "Backup In Progress")     { $status_code = 60;  }
+     if ($status_text eq "Backup complete")        { $status_code = 70;  }
+     if ($status_text eq "Recent Backup")          { $status_code = 72;  }
+     if ($status_text eq "Backup Downloading")     { $status_code = 75;  }
+     if ($status_text eq "Backup Downloaded")      { $status_code = 80;  }
+     if ($status_text eq "Backup Restoring")       { $status_code = 85;  }
+     if ($status_text eq "Backup Restored")        { $status_code = 90;  }
+     if ($status_text eq "Backup Failed")          { $status_code = 100; }
+     if ($status_text eq "Status Check Failed")    { $status_code = 103; }
+     if ($status_text eq "Backup Timeout")         { $status_code = 105; }
+     if ($status_text eq "Unknown Backup Failure") { $status_code = 107; }
+     if ($status_text eq "Backup Already Exists")  { $status_code = 108; }
+     if ($status_text eq "Login Failure")          { $status_code = 110; }
+     if ($status_text eq "Download Failure")       { $status_code = 115; }
+     if ($status_text eq "Restore Failure")        { $status_code = 117; }
+     if ($status_text eq "Unknown Failure")        { $status_code = 120; }
+     if ($status_text eq "Username Conflict")      { $status_code = 125; }
+     if ($status_text eq "Domain Conflict")        { $status_code = 130; }
+     if ($status_text eq "Large Account")          { $status_code = 135; }
+     if ($status_text eq "HostGator Account")      { $status_code = 140; }
+     if ($status_text eq "Nothing To Restore")     { $status_code = 145; }
+     return $status_code;
+}
+
+# Update the progress bar.  This is passed to the get method of Mechanize and called throughout the process of a file download.
+# Input:  Total bytes downloaded so far.
+# Output: Progress bar is updated.
+#         Also while we have control, we use the opportunity to process curses events so the screen is responsive during the download.
+sub progress_callback {
+     my $download_bytes = $_[0];
+          if ($download_counter > 100) {
+               $download_counter = 0;
+               print ".";
+          }else {
+               $download_counter++;
+          }
+}
+
+#--------------------------------------------------------------------------------------------------
+#---------------------------------- Status database Subroutines -----------------------------------
+#--------------------------------------------------------------------------------------------------
+
+
+# Setup logging to an SQLite status file
+# Input:  Global variable $statfile
+# Output: 0=Fail
+#         1=Successfully initialized.
+#         $statfile is populated with a reference to the DBI object.
+sub status_init_database {
+     my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime(time);
+     if (!$statfile) {
+          $statfile = "gofetch-" . sprintf("%04d%02d%02d%02d%02d%02d", $year+1900, $mon+1, $mday, $hour, $min, $sec) . ".status";
+     }
+     eval {
+          $statdb = DBI->connect("dbi:SQLite:dbname=$statfile", "", "");
+          $statdb->do("CREATE TABLE IF NOT EXISTS status (host TEXT, username TEXT, password TEXT, status TEXT, primarydomain TEXT, existingbackup TEXT, existingbackupsize INTEGER, newbackup TEXT, newbackupsize INTEGER, addons INTEGER, subdomains INTEGER, databases INTEGER, diskusage INTEGER, percent INTEGER)");
+     } or do { 
+          $l->logg("[!] Error opening the status database: $statfile", 1);
+          return 0;
+     };
+}
+
+## Log a message to the log table of the status database.
+## Input:  Message to log
+## Output: 1=Success, 0=Fail
+#sub status_log {
+#     my $message    = shift;
+#     my $print_flag = shift; #1 = Print the message whether the verbose option is selected or not.
+#     if ($opt_v || $print_flag) {  
+#          print $message . "\n";
+#     }
+#}
+
+# Load the transfer state from the database.
+# Output: 1=Success, 0=Fail
+sub status_load_snapshot {
+     my $sql  = "select host, username, password, status, primarydomain, existingbackup, existingbackupsize, newbackup, newbackupsize, ";
+        $sql .= "addons, subdomains, databases, diskusage, percent from status";
+     @logins = (); #Clear the logins array so we can populate it from the database.
+     my $sth = $statdb->prepare($sql); 
+     if (! $sth) {
+          print STDERR "Failed to prepare the select statement while loading the transfer state from the database.\n";
+          return 0; #Could not execute the statement.
+     }
+     if (! $sth->execute()) {
+          print STDERR "Failed to execute the select statement while loading the transfer state from the database.\n";
+          return 0; #Could not execute the statement.
+     }
+     while (my @row = $sth->fetchrow_array()) {
+          if (scalar(@row) != 14) {
+               print STDERR "There are more or less rows in the status table than expected when loading the transfer state from the database.\n";
+               return 0;
+          }
+          my $login = logindetails->new();        # Populate a logindetails object from the elements of the @row array and push onto the @logins array.
+          $login->{host}                = $row[0];
+          $login->{username}            = $row[1];
+          $login->{password}            = $row[2];
+          $login->{status}              = lookup_status_code($row[3]);
+          $login->{primarydomain}       = $row[4];
+          $login->{existingbackup}      = $row[5];
+          $login->{existingbackup_size} = $row[6];
+          $login->{newbackup}           = $row[7];
+          $login->{newbackup_size}      = $row[8];
+          $login->{addons}              = $row[9];
+          $login->{subdomains}          = $row[10];
+          $login->{databases}           = $row[11];
+          $login->{diskusage}           = $row[12];
+          $login->{percent}             = $row[13];
+          $login->{webhostaccount}      = WebHostAccount->new();
+          push (@logins, $login);
+     }
+     return 1;
+}
+
+
+sub status_save_snapshot {
+     my $sql;
+     my $sth;
+     $sth = $statdb->prepare("DELETE FROM 'status'");
+     if (!$sth->execute()) {
+          print STDERR "Error clearing the status table while saving transfer state.  $DBI::errstr\n";
+          return 0;
+     }
+     foreach my $login (@logins) {
+          my $status_text = lookup_status_text($login->{status});
+          $sql  = "INSERT INTO 'status' values('$login->{host}', '$login->{username}', '$login->{password}', ";
+          $sql .= "'$status_text', '$login->{primarydomain}', '$login->{existingbackup}', $login->{existingbackup_size}, '$login->{newbackup}', $login->{newbackup_size}, ";
+          $sql .= "$login->{addons}, $login->{subdomains}, $login->{databases}, $login->{diskusage}, $login->{percent})";
+          $sth = $statdb->prepare($sql);
+          if (!$sth->execute()) {
+               print STDERR "Error saving transfer state: $DBI::errstr\n";
+               return 0;
+          }
+     }
+     return 1;  #No problems detected.
+}
+
+# Return the filename of the newest file in the specified directory.
+# Input:  Nothing
+# Output: Filename (including path) of the newest SQLite3 database file in the /var/log/hgtransfer directory.
+#         "" if there are no database files in /var/log/hgtransfer.
+sub find_newest_db {
+     my $dir     = $_[0];
+     my $file    = "";
+     my @dirlist = `ls -t`;
+     foreach my $direntry (@dirlist) {
+          if ($direntry =~ /\.status/) {
+               $file = $direntry;
+               chomp($file);
+               last;
+          }
+     }
+     return $file;
+}
+
+# Close the log/status database.
+sub status_close {
+     $statdb->disconnect();
+}
+
+#--------------------------------------------------------------------------------------------------
+#---------------------------------- Miscellaneous Subroutines -------------------------------------
+#--------------------------------------------------------------------------------------------------
+
+# Convert a number from bytes into a more readable format with units.
+# Input:  bytes
+# Output example: "23.45 MB"
+sub to_units {
+     my $value = shift;
+     if ($value =~ /NA/) {
+          return "NA";
+     }
+     if (!$value =~ /[0-9]/) {
+          return "0";
+     }
+     if ($value > 1073741824) {
+          $value = sprintf("%.2f", $value / 1073741824);
+          $value = $value . " GB";
+     }elsif ($value > 1048576){
+          $value = sprintf("%.2f", $value / 1048576);
+          $value = $value . " MB";
+     }elsif ($value > 1024) {
+          $value = sprintf("%.2f", $value / 1024);
+          $value = $value . " KB";
+     }else {
+          $value = $value . " Bytes";
+     }
+     return $value;
+}
+
+# Determine whether or not a backup filename was generated within the last 24 hours.
+# Input:  The name of a backup file.  i.e. backup-1.30.2014_15-05-41_mss001.tar.gz
+# Output: 1 = Yes
+#         0 = No
+#        -1 = Error
+sub is_recent_backup {
+     my $backup = $_[0];
+     my $backupdate = $backup;
+     my $backuptime = $backup;
+     my $backup_unix_time;
+
+     # Parse the date.
+     $backupdate =~ s/^backup-//;
+     $backupdate =~ s/_.*//;
+     my ($mon, $mday, $year) = split ("\\.", $backupdate);
+     $mon = $mon - 1;                             # The first month in the filename is 1, but for timelocal, it needs to be 0. 
+ 
+     # Parse the time.
+     $backuptime =~ s/.*?_//;
+     $backuptime =~ s/_.*//;
+     my ($hour, $min, $sec) = split ("-", $backuptime);
+
+     # Sanity checking
+     if ($mon  < 0 || $mon  > 11)   { return -1; }
+     if ($mday < 1 || $mday > 31)   { return -1; }
+     if ($year < 5 || $year > 2100) { return -1; }
+     if ($hour < 0 || $hour > 23)   { return -1; }
+     if ($min  < 0 || $min  > 59)   { return -1; }
+     if ($sec  < 0 || $sec  > 59)   { return -1; }
+
+     # Now put it together as unix time.
+     $backup_unix_time = timelocal($sec, $min, $hour, $mday, $mon, $year);
+
+     if (time - $backup_unix_time < 86400) {      #Now see if the difference between then and now is < 24 hours.
+          return 1;                               # It is a recent backup.
+     }else {
+          return 0;                               # Not a recent backup.
+     }
+}
+
+# Find out if the given IP address is on this server.
+sub does_ip_exist {
+     my $testip = $_[0];
+     my $result = 0;
+     my @ips = `ifconfig`; #List the users in /var/cpanel/users.
+     if (($? >> 8) > 0) {                #Check the return code, and exit if the external call failed.
+          return 0;
+     }
+     foreach my $line (@ips) {         #Go through the list, remove "." and ".." entries, and add the rest to the array.
+          chomp($line);
+          if ($line =~ /inet addr:$testip/) {
+               $result = 1;
+               last;
+          }
+     }
+     return $result;
+}
+
+#Find out if a username exists on the server.
+#Input: username
+#Output: 0 = User does not exist.
+#        Any other value = User does exist.
+sub does_user_exist {
+     my $user = $_[0];
+     if (!$user_exist_flag) {                              # If the user hash array hasn't been built yet, then build it.
+          opendir my $dirhandle, "/var/cpanel/users";      #List /var/cpanel/users
+          my @userlist = readdir $dirhandle;
+          close $dirhandle;
+          foreach my $cur_user (@userlist) {               #Go through each user and add a hash key to allow for quick checking later.
+               if ($cur_user ne "root" && $cur_user ne "rvadmin" && $cur_user ne "." && $cur_user ne "..") {
+                    $userexists{$cur_user} = "y";
+               }
+          }
+     }
+     if ($userexists{$user} eq "y") {                  #If there's a hash entry for the given username, then return a 1 (yes)
+          return 1;
+     }else {
+          return 0;                                        #If not, return a 0 to indicate that the user doesn't exist.
+     }
+}
+
+#Find out if a domain name exists on the server.
+#Input:  Domain name (i.e. mydomain.com)
+#Output: 0 = Domain does not exist.
+#        1 = Domain does exist.
+#        2 = Error
+sub does_domain_exist {
+     my $domain = $_[0];
+     my @file;
+     eval { #Read /etc/userdomains file from the archive into @file.
+          open (my $INFILE, "/etc/userdomains");
+          @file = <$INFILE>;
+          close $INFILE;
+     } or do {
+          print "Error opening /etc/userdomains\n";
+          return 2;
+     };
+     foreach my $line (@file) { 
+          chomp($line);
+          $line =~ s/:.*//;            #$line has "domain.com: user".  So let's chop off the ": user"
+          if ($line eq $domain) {
+               return 1;               #Found a match return a 1 to indicate that the domain is on this server.
+          }
+     }
+     return 0;                         #No match found.  Return a 0.
+}
+
+# Use iptables to ensure that the firewall will allow connections using port 2082 and 2083.
+# Input:  Nothing
+# Output: 1=OK, 0=Error.  Log will show further detail.
+sub iptables_open {
+     my $result;
+     $l->logg("[*] Opening up firewall ports for cPanel connections.");
+     $result = run_cmd("iptables -I OUTPUT -p tcp --dport 2082 -j ACCEPT");              # Port 2082 Outgoing
+     if ($result) { return 0; }
+     $result = run_cmd("iptables -I INPUT -p tcp --sport 2082 -j ACCEPT");               # Port 2082 Incoming
+     if ($result) { return 0; }
+     $result = run_cmd("iptables -I OUTPUT -p tcp --dport 2083 -j ACCEPT");              # Port 2083 Outgoing
+     if ($result) { return 0; }
+     $result = run_cmd("iptables -I INPUT -p tcp --sport 2083 -j ACCEPT");               # Port 2083 Incoming
+     if ($result) { return 0; }
+     return 1;
+}
+
+# Use iptables to close the ports opened by iptables_open.
+# Input:  Nothing
+# Output: 1=OK, 0=Error.  Log will show further detail.
+sub iptables_close {
+     my $result;
+     $l->logg("[*] Closing the firewall ports for cPanel connections that were opened earlier.");
+     $result = run_cmd("iptables -D OUTPUT -p tcp --dport 2082 -j ACCEPT");              # Port 2082 Outgoing
+     if ($result) { return 0; }
+     $result = run_cmd("iptables -D INPUT -p tcp --sport 2082 -j ACCEPT");               # Port 2082 Incoming
+     if ($result) { return 0; }
+     $result = run_cmd("iptables -D OUTPUT -p tcp --dport 2083 -j ACCEPT");              # Port 2083 Outgoing
+     if ($result) { return 0; }
+     $result = run_cmd("iptables -D INPUT -p tcp --sport 2083 -j ACCEPT");               # Port 2083 Incoming
+     if ($result) { return 0; }
+     return 1;
+}
+
+# Run a command.
+# Input:  A command line to run.
+# Output: Output of the command is printed.
+#         Return value from the command is returned.
+sub run_cmd {
+     my $command = $_[0];
+     my @output;
+     if ($opt_v) {
+          $l->logg("[*] Running: $command");
+     }
+     @output = `$command`;
+     foreach my $line (@output) { #Show the output from the failed command.
+          $l->logg("[!] Error running: $command", 1);
+          $l->logg("[!] $line", 1);
+     }
+     return ($? >> 8);
+}
+
+sub cleanup {
+     status_save_snapshot();
+     iptables_close();
+     status_close();
+}
+
+# Read the file with login details into an array.
+# Input:  Filename of the file that contains the logins.
+#         Array reference to populate.
+# Output: The passed array populated with logindetails objects.
+#         Return value: 0=OK, 1=Error.
+sub read_logins_from_file {
+     my $filename    = $_[0];
+     my $login_array = $_[1];
+     my @logins;
+
+     eval {
+          open (my $INFILE, $filename);
+          @logins = <$INFILE>;                     #Sluuuuurp
+          close $INFILE;
+     } or do {
+          print "Error reading the file $filename with logins.\n";
+          return 1;
+     };
+
+     foreach my $login (@logins) {
+          chomp($login);
+          if ($login !~ /[A-Za-z0-9]/) {
+               $l->logg("[!] A line in the file of usernames appears to be blank.  Skipping.");
+               next;
+          }
+          my @login_details = split(" ", $login); #Split the "host user pass" line into a 3 element array for easy access.
+          if (scalar(@login_details) != 3) {
+               $l->logg("[!] Warning: Line found in logins file with the wrong number of columns.  Each line should have \"host user password\" separated by spaces.  Skipping.", 1);
+               next;
+          }
+          my $obj_login          = logindetails->new(); #Create a new logindetails object, then populate it.
+          $obj_login->{host}     = $login_details[0];
+          $obj_login->{username} = $login_details[1];
+          $obj_login->{password} = $login_details[2];
+          $obj_login->{webhostaccount} = WebHostAccount->new();
+          push (@{$login_array}, $obj_login);
+     }
+     return 0;
+}
+
+# Read the host, user, ass from the command line or from a file.  Put it into an array of objects.
+sub showusage {
+     $l->logg("Showing usage help text.");
+     my $usage = <<END;
+gofetch 2.0
+
+Gofetch is a cPanel backup management script which streamlines the transfer of cPanels from other hosting providers.
+
+Usage: gofetch <host> <user> <password> [options]
+
+gofetch <listfile> [options]
+         listfile is the name of a file that contains 3 colums: host user password
+
+Options:
+       -c                          Check for connectivity and conflicts.
+       -b                          Start a backup at the old host.
+       -B                          Start a backup at the old host if the most recent backup is more than 1 day or so old.
+       -d                          Download the latest backup from the old host.  If used with -b, then download the newly created backup.
+       -r                          Restore the latest backup.
+       -v                          Verbose output.
+       -s <seconds> or             --sleeptime=<seconds> - Number of seconds to sleep between steps.
+       --bind-address=<ip address> Bind to a specific local IP address for network connections.  Useful if old host blocks the default IP.
+       --ssl                       Connect using SSL on port 2083.  (Timeouts are very long with this option if a connection has to time out).
+       --dir=<full/path>           Download backups to the specified directory.  Must be a full directory path.
+       --skip-limits               Continue working even if the old account is over 4Gb.
+       --skiphomedir               Make the equivalent of a --skiphomedir backup.  Temporarily modifies cpbackup-exclude.conf at the old host.
+                                    --skiphomedir Also enables --skip-limits.
+       --status=file.status        Print a human readable status from a status file.
+
+Example: Create a new backup and download it.  Bind to the local IP 75.23.233.2:
+       gofetch -bd --bind-address=75.23.233.2 oldhost.com myolduser myoldpass
+
+Press Control-c to show a status report.  An option will then be given to continue or quit..
+
+END
+     print $usage;
+}
+
+#Check to see if the restore worked.  Looks for the phrase "Restore Complete" in the file.
+# Input:  Full path and filename of the restore log
+# Output: 0=Fail 1=Success
+sub check_restore {
+     my $logfile = $_[0];
+     my @lines;
+     eval {
+          open (my $INFILE, $logfile);
+          @lines = <$INFILE>;                     #Sluuuuurp
+          close $INFILE;
+     } or do {
+          $l->logg("[!] Error checking the restore status.  Cannot read the log file $logfile.\n", 1);
+          return 0;
+     };
+     foreach my $line (@lines) {
+          if ($line =~ /Restore Complete/ || $line =~ /Account Restored/) {
+               return 1;
+          }
+     }
+     return 0;
+}
+
+# Print the contents of a two-dimensional array as a table.
+# Input:  Ref to a 2-dimensional array.  The array has 8 columns.
+#           The last row only has columns 3-6 populated with totals.
+# Output will be formatted like this:
+#+----------+----------+----------------------+-----+--------+------+-----------+----+
+#| Username | Status   | Primary Domain       | DBs | Addons | Subs | Disk      | %  |
+#+----------+----------+----------------------+-----+--------+------+-----------+----+
+#| mss009   | Login OK | mssdom7000.org       | 5   | 0      | 2    | 4.05 MB   | 50 |
+#| mstreete | Login OK | mstreeter.staff.host | 7   | 2      | 0    | 891.86 MB | 8  |
+#+----------+----------+----------------------+-----+--------+------+-----------+----+
+#Totals:                                        12    2        2      895.91 MB     
+sub print_table {
+     my $table = shift;
+     my @width = _calc_column_widths($table); #Width of each column.
+
+     # Build the horizontal divider
+     my $hdivider = "";
+     foreach my $fieldwidth (@width) {
+          $hdivider .= "+" . ("-" x ($fieldwidth+2));
+     }
+     $hdivider .= "+";
+
+     # Print the table
+     my $row_counter = 0;
+     foreach my $row (@{$table}) {
+          if ($row_counter == 0) {
+               print $hdivider . "\n";
+               _print_table_row($row, \@width, RESET);
+               print $hdivider . "\n";
+               $row_counter++;
+               next;
+          }
+          if ($row_counter+1 == scalar(@{$table})) { #Don't print the last row because it's summary info.
+               last;
+          }
+          _print_table_row($row, \@width, BLUE);
+          $row_counter++;
+     }
+     print $hdivider . "\n";
+     print_table_summary($table);
+}
+
+# Input:  Ref to a 2-dimensional array (same one that is passed to print_table) with 8 columns.
+#         A 1-dimensional array containing the totals for:
+#           DBs
+#           Addons
+#           Subs
+#           Disk
+# Output: A summary line showing the totals.
+sub print_table_summary {
+     my $table  = shift;
+     my @width  = _calc_column_widths($table); #Width of each column.
+     my $space_count = $width[0] + $width[1] + $width[2] - length("Totals:") + 10;
+     print "Totals:" . " " x $space_count;
+     print BLUE;
+     for my $column_index (3..6) {
+          my $w = $width[$column_index];
+          printf(" %-${w}s  ", ${$table}[scalar(@{$table})-1][$column_index]);
+     }
+     print "\n".RESET;
+}
+
+# Input:  ref to a 2-dimensional array (see print_table)
+# Output: A one-dimensional array with the column withs for each column.
+sub _calc_column_widths {
+     my $table = shift;
+     my @width; #Width of each column.
+     my $column_index;
+
+     # Populate @width with the needed width for each column.
+     foreach my $row (@{$table}) {
+          $column_index = 0;
+          foreach my $column (@{$row}) {
+              if (length($column) > $width[$column_index]) {
+                   $width[$column_index] = length($column);
+              }
+              $column_index++;
+          }
+     }
+     return @width;
+}
+
+# Print one row of a table.
+# Input: $row:   ref to an array with the row values.
+#        $width: ref to an array with the row widths.
+sub _print_table_row {
+     my $row   = shift;
+     my $width = shift;
+     my $color = shift; # Normal color to print row in.
+     my $srow  = ""; #String version of the row (output)
+     my $column_index = 0;
+     foreach my $column (@{$row}) {
+          my $current_color = $color;
+          if ($column eq "Login OK") {
+               $current_color = GREEN; 
+          }
+           if ($column eq "Login Failure") {
+               $current_color = RED; 
+          }
+          my $w = ${$width}[$column_index]; # Set $w to the current column width to be used on the sprintf.
+          $srow .= sprintf("| ".$current_color."%-${w}s ".RESET, $column);
+          $column_index++;
+     }
+     $srow .= "|";
+     print "$srow\n";
+}
+
+# Class to store login details.  Having an array of these keeps the logins nicely organized.
+package logindetails;
+use strict;
+sub new {                     #Constructor
+     my $class                    = shift;
+     my $self                     = {};
+     $self->{host}                = undef;
+     $self->{username}            = undef;
+     $self->{password}            = undef;
+     $self->{primarydomain}       = undef;
+     $self->{webhostaccount}      = undef;
+     $self->{loginstatus}         = 0;                # 0=Not logged in    1=Logged in
+     $self->{status}              = 10;
+     $self->{existingbackup}      = undef;
+     $self->{existingbackup_size} = 0;
+     $self->{newbackup}           = undef;
+     $self->{newbackup_size}      = 0;
+     $self->{addons}              = 0;
+     $self->{subdomains}          = 0;
+     $self->{databases}           = 0;
+     $self->{diskusage}           = 0;
+     $self->{percent}             = 0;
+     bless($self, $class);
+     return $self;
+}
+
+
+
+################################################################################
+#---------------------------- WebHostAccount -----------------------------------
+################################################################################
+
+package WebHostAccount;
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use Carp;
+use Socket;
+
+sub new {
+    my $class = shift;
+    my $self = {};
+    bless ($self, $class);
+    $self->{obj} = WebHostAccount::CPanel->new(); 
+
+    # At this point either we have successfully created a new control panel
+    # specific WebHostAccount object, or not.  If not, then $obj is 0, which the caller can detect and react accordingly.
+
+    return $self->{obj};
+}
+
+# Output: 1=OK, 0=Error
+sub initialize {
+     my $self = shift;
+     my ($host, $user, $pass, $bindaddress, $ssl) = @_;
+     my $ip = resolve_ip($host);
+     if (not defined $ip) {
+          $self->{errmsg} = "Destination host is not a valid IP address or resolvable hostname: $host";
+          return 0;
+     }     
+     $self->{obj}->initialize($ip, $user, $pass, $bindaddress, $ssl);
+     return 1;
+}
+
+# Accept a string containing either an IP address or hostname.
+# Return undef if:
+#       not a valid IP
+#       not a resolvable hostname
+# Return the IP address if
+#       a valid IP
+#       a resolvable hostname
+sub resolve_ip {
+    # So yeah, we have perl 5.8 apparently.  You need 5.13+ to get native
+    # support of IPv6.  :(
+    my $ip = shift;
+    my $packed_ip = gethostbyname($ip);
+    if (defined $packed_ip) {
+        $ip = inet_ntoa($packed_ip);
+    } else {
+        return undef;
+    }
+    return $ip;
+}
+
+1;
+
+
+################################################################################
+#---------------------- WebHostAccount CPanel ----------------------------------
+################################################################################
+
+package WebHostAccount::CPanel;
+
+=pod
+
+=head1 NAME
+
+B<HG::Transfers::WebHostAccount::CPanel> - Concrete class for cPanel control panel accounts.
+
+=head1 DESCRIPTION
+
+Provides methods to access a cPanel control panel for a given user.
+
+=head1 COPYRIGHT
+
+Copyright 2011, Hostgator.com, LLC.  All rights reserved.
+
+=cut
+
+use strict;
+use warnings;
+
+use Carp;
+use Data::Dumper;
+use POSIX qw(ceil);
+use URI::Escape;
+use LWP::UserAgent;
+use HTTP::Request::Common;
+use HTML::Form;
+use MIME::Base64;
+use JSON;
+
+#use HG::Transfers::Server;
+
+# Set to non-zero to debug all instances of the class
+my $Debug = 0;
+
+sub new {                          #Constructor
+     my $class = shift;
+     my $self = {};
+     bless ($self, $class);
+     #return $self->initialize(@_);
+}
+
+sub initialize {
+     my $self = shift;
+     $self->{type} = "cpanel";
+     $self->{server_ip}   = shift; # temporary for testing. Replace with HG::Transfers::Server
+     $self->{username}    = shift;
+     $self->{password}    = shift;
+     $self->{bindaddress} = shift;
+     $self->{ssl}         = shift;
+#     eval { $self->{server} = HG::Transfers::Server->Factory(host => $self->get_server_ip(),
+#							     user => $self->get_username(),
+#							     password => $self->get_password()); };
+     if ($@) {
+	 croak $@;
+     }
+
+     $self->{lwp}                   = LWP::UserAgent->new( autocheck => 0, timeout => 10 );
+     $self->{request}               = undef;   # LWP request object
+     $self->{response}              = undef;   # LWP response object
+     $self->{lwp}->ssl_opts( 'verify_hostname' => 0);
+     $self->{lwp}->cookie_jar( {} );
+     $self->{token}                 = "";      # Security token to be added to the URL.
+     $self->{backup_file}           = undef;
+     $self->{backup_size}           = 0;       #Backup file size in bytes.
+     $self->{download_bytes}        = 0;       # Total bytes downloaded so far
+     $self->{download_handle}       = undef;   # File handle to write to when downloading.
+     $self->{primarydomain}         = undef;   # Primary domain of this cPanel account.
+     $self->{site_ip}               = undef;   # Account IP address
+     $self->{dedicated_ip}          = 0;       # 1 if IP is dedicated.
+     $self->{plan}                  = undef;   # cPanel package
+     $self->{owner}                 = undef;   # Username of the user that owns this 
+                                           #   account. (root, a reseller, or the user)
+     $self->{homedir}               = undef;   # The users home directory.
+     $self->{hostname}              = undef;   #Host name of the old host's server (i.e. gator123.hostgator.com)
+     $self->{addons}		        = [];  # Array of hashes with these fields:
+                                           #   domain - full domain name of the addon.
+                                           #   subdomain - the (unqualified) cPanel 
+                                           #     subdomain of the addon domain.
+                                           #   reldir - the DocumentRoot directory of 
+                                           #     the addon domain relative to the 
+                                           #     users homedir.
+     $self->{subdomains}            = [];  # Array of hashes with these fields:
+                                           #   domain - the domain name of which 
+                                           #     this is a subdomain.
+                                           #   subdomain - the (unqualified) 
+                                           #     subdomain name
+                                           #   reldir - the DocumentRoot directory of 
+                                           #     the subdomain relative to the users 
+                                           #     homedir.
+     $self->{parkeddomains}         = [];  # Array of hashes with these fields:
+                                           #   domain - the domain name of the parked domain.
+                                           #   reldir - the DocumentRoot directory of
+                                           #     the parked domain relative to the users
+                                           #     homedir.
+     $self->{diskusage}             = undef;   # Non-database disk usage in bytes.
+     $self->{diskpercent}           = undef;   # Percentage of disk used.
+     $self->{mysqldatabases}        = 0;   # Total number of Mysql databases.
+     $self->{mysqldiskusage}        = undef;   # MySQL database disk usage in bytes.
+
+     $self->{postgresdatabases}     = 0;   # Total number of Mysql databases.
+     $self->{postgresdiskusage}     = undef;   # Postgres database disk usage in bytes.
+     $self->{databases}             = undef;
+     $self->{emailaccounts}         = undef;
+     $self->{temp_cpbackup_exclude} = undef;
+
+     $self->{errmsg} = "";
+
+     if (!$self->login()) {
+          #print "Unable to log in to ".$self->{server_ip}." as ".  $self->{username}." with password ".$self->{password}.
+	      #      " - The error message was: ".$self->{errmsg}."\n";
+     }
+     return $self;
+}
+
+################################################################################
+# Public methods
+
+#-------------------------------------------------------------------------------
+# Start a cPanel backup.
+# Input:  skiphomedir flag: 0=normal, 1=make a skiphomedir backup.
+# Output: 1 (true) on success, 0 (false) on failure and sets errmsg.
+
+sub start_backup {
+     my $self        = shift;
+     my $skiphomedir = $_[0];
+     my $sleeptime   = 20;    # Sleep in 60 second intervals when waiting for 
+                              #   backups to start
+     my $timelimit   = 300;	  # Wait up to this many seconds for the backup to start.
+
+     if ($skiphomedir) {      # If the skiphomedir flag was set, then enable it at the old host.
+          my $skresult = $self->enable_skiphomedir();
+          if (!$skresult) {return 0;}
+     }
+
+     # Find out the backup info of the most recent previous backup.
+     my $previous_backup = $self->check_latest_backup();  
+     if (! $previous_backup) {
+	      return 0;
+     }
+
+     my $current_backup;
+     ${$current_backup}{"time"} = 0;
+
+     # Start the backup
+     my $url = "http://$self->{server_ip}:2082$self->{token}/json-api/".
+	           "cpanel?".
+	           "cpanel_jsonapi_apiversion=1".
+	           "&cpanel_jsonapi_module=Fileman".
+	           "&cpanel_jsonapi_func=fullbackup";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval {$data = decode_json($self->{response}->content); };  #Parse the JSON from the cPanel call.
+
+     if (! $data) {
+	     $self->{errmsg} = "Backup failed to start: Unknown error.";
+         return 0;
+     }
+
+     if ($data->{"event"}->{"result"} != 1) {
+	     $self->{errmsg} = "Backup failed to start: API call returned error.";
+	     return 0;
+     }
+
+     # Wait for the backup to start
+     $current_backup = $self->check_latest_backup();
+     my $counter = 0;
+     while (($counter*$sleeptime < $timelimit) && ($current_backup->{time} <= $previous_backup->{time})) { 
+          $counter++;
+          sleep $sleeptime;
+          $current_backup = $self->check_latest_backup();
+          if (! $current_backup) {
+              return 0;
+          }
+     }
+
+     if (${$current_backup}{"time"} == ${$previous_backup}{"time"}) {
+	     $self->{errmsg} = "Backup failed to start in ".$timelimit." seconds.";
+	     return 0;
+     }
+	 
+     $self->{backup_file} = $current_backup->{file};
+     sleep(1);
+     if ($skiphomedir) {      # If the skiphomedir flag was set, then undo any changes at the old host.
+          my $skresult = $self->disable_skiphomedir();
+          if (!$skresult) {return 0;}
+     }
+
+     return 1;
+}
+
+#-------------------------------------------------------------------------------
+# Check the status of the latest cPanel backup.
+# Input:  none
+# Output: On failure, returns undef and sets errmsg.
+#         On success, returns reference to a hash with information on the most 
+#         recent backup.
+#
+#         $latest_backup{time}		Unix timestamp
+#	  $latest_backup{localtime}	Human readable time
+#	  $latest_backup{file}		The filename of the backup
+#	  $latest_backup{status}	The status of the backup: "complete", 
+#                                         "inprogress", "timeout"
+#
+#         If there are no backups available, then an empty backup record is 
+#         returned with:
+#         time = 0, localtime= "", file = "", status = ""
+
+sub check_latest_backup {
+     my $self = shift;
+
+     my $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+	 "cpanel?".
+	 "cpanel_jsonapi_apiversion=2".
+	 "&cpanel_jsonapi_module=Backups".
+	 "&cpanel_jsonapi_func=listfullbackups";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval { $data = decode_json($self->{response}->content); };
+     if ("ARRAY" ne ref($data->{cpanelresult}->{data}) ) {
+	 $self->{errmsg} = "Unable to check backup status: ";
+	 if (defined $data->{data}->{reason}) { 
+	     $self->{errmsg} .= $data->{data}->{reason}
+	 } else {
+	     $self->{errmsg} .= "Unknown error.  Does the old host require SSL?"
+	 }
+	 return undef;
+     }
+
+     my %latest_backup = ( time => 0,
+			   localtime => "",
+			   file      => "",
+			   status    => "",
+               size      => "",
+	 );
+
+     foreach my $backup (@{$data->{cpanelresult}->{data}}) {      #Loop through the backups and set the %latest_backup info to the backup
+          if ($backup->{time} > $latest_backup{time}) {           # with the most recent time.
+               $latest_backup{time}      = $backup->{time};
+               $latest_backup{localtime} = $backup->{localtime};
+               $latest_backup{file}      = $backup->{file};
+               $latest_backup{status}    = $backup->{status};
+          }
+     }
+
+     #Now that we know the filename of the latest backup, let's find out how big it is.
+     if ($latest_backup{status} eq "complete") {
+          $url = "http://".$self->{server_ip}.":2082$self->{token}/download?file=$latest_backup{file}";
+          $url = $self->convert_to_ssl($url);
+          $self->{request} = HTTP::Request->new( HEAD => $url );
+          $self->{request}->authorization_basic($self->{username}, $self->{password});
+          $self->{response} = $self->{lwp}->request($self->{request});
+          $latest_backup{size} = $self->{response}->{_headers}->{"content-length"}
+     }
+     if (!$latest_backup{size}) {
+          $latest_backup{size} = 0;
+     }
+     return \%latest_backup;
+}
+
+
+# Download a backup file.
+# Input:  backup path.
+#         backup filename.
+# Output: 0=Error, 1=OK
+#         $self->{errmsg} is set if there's an error.
+sub download {
+     my $self                   = shift;
+     my $path                   = $_[0];
+     my $file                   = $_[1]; # Filename of the backup.
+     eval {
+          open ($self->{download_handle}, ">$path/$file");
+     } or do {
+          $self->{errmsg} = "Download failed: Cannot open $file";
+          return 0;
+     };
+     #print STDERR "Download handle (in download): " $self->{download_handle} . "\n";
+     $self->{download_bytes} = 0;
+     my $url = "http://$self->{server_ip}:2082$self->{token}/download?file=$file";
+     $url = $self->convert_to_ssl($url);
+     $self->{request} = HTTP::Request->new( GET => $url );
+     $self->{request}->authorization_basic($self->{username}, $self->{password});
+     $self->{response} = $self->{lwp}->request($self->{request}, sub {$self->download_progress_callback(@_)});
+     close $self->{download_handle};
+     return 1;
+}
+
+# Callback for a download.
+# Input:  Standard callback args: data, response, protocol
+#         File handle to save the data to.
+sub download_progress_callback {
+     my $self = shift;
+     my $percent;
+     my ($data, $response, $protocol) = @_;
+     print {$self->{download_handle}} "$data";
+     $self->{download_bytes} = $self->{download_bytes} + length($data);
+     if ($self->{backup_size} > 0) {
+          $percent = int(($self->{download_bytes} / $self->{backup_size})*100);
+     }else{
+          $percent = "unknown";
+     }
+     $self->{progress_counter}++;
+     my @progress_indicator = ("-", "\\", "|", "/");
+     if ($self->{progress_counter} % 20 == 0) {
+          print "\rDownloading...$percent%  " . $progress_indicator[($self->{progress_counter}/20) % 4];
+     }
+     if ($self->{download_bytes} == $self->{backup_size}) {
+          print "\rDownloading...100%   \n";
+     }
+}
+
+
+#-------------------------------------------------------------------------------
+# Make an http connection and retrieve the contents of a url.
+# Input: A url (i.e. http://somedomain.com)
+#        An LWP object in $self->{lwp}
+#        Username in $self->{username}
+#        Password in $self->{password}
+#        $self->{request} is used for the request object.
+# Output: $self->{response} is populated with the result.
+sub get_url {
+     my $self = shift;
+     my $url  = shift;
+     $self->{request} = HTTP::Request->new( GET => $url );
+     $self->{request}->authorization_basic($self->{username}, $self->{password});
+     $self->{response} = $self->{lwp}->request($self->{request});
+}
+
+#-------------------------------------------------------------------------------
+sub gather_info {
+     my $self = shift;
+     if ($self->getprimaryinfo() && $self->getaddons() && $self->getsubdomains() && $self->getparkeddomains()) {
+	      return 1;
+     } else {
+	      return 0;
+     }
+}
+
+#-------------------------------------------------------------------------------
+# Return total number of databases
+sub get_num_databases {
+   my $self = shift;
+   return $self->get_num_mysql_databases() + $self->get_num_postgres_databases();
+}
+
+#-------------------------------------------------------------------------------
+# Return total number of Mysql databases
+sub get_num_mysql_databases {
+   my $self = shift;
+   if ($self->{databases}) {
+        return $self->{databases};
+   }else {
+        return 0;
+   }
+}
+
+#-------------------------------------------------------------------------------
+# Return total number of Postgresdatabases
+sub get_num_postgres_databases {
+   my $self = shift;
+   return $self->{postgresdatabases};
+}
+
+#-------------------------------------------------------------------------------
+# Return number of top level domains
+sub get_num_domains {
+   my $self = shift;
+   return 1 + @{$self->{addons}};
+}
+
+#-------------------------------------------------------------------------------
+#Output: Primary domain name (string)
+sub get_primary_domain {
+   my $self = shift;
+   return $self->{primarydomain};
+}
+
+#-------------------------------------------------------------------------------
+# Return number of addon domains
+sub get_num_addon_domains {
+   my $self = shift;
+   if ($self->{addons}) {
+        return scalar(@{$self->{addons}});
+   }else {
+        return 0;
+   }
+}
+
+#-------------------------------------------------------------------------------
+# Return number of subdomains (excluding the automatic ones)
+sub get_num_subdomains {
+   my $self = shift;
+   if ($self->{subdomains} && $self->{addons}) {
+        return scalar(@{$self->{subdomains}}) - scalar(@{$self->{addons}});
+   }else {
+        return 0;
+   }
+}
+
+#-------------------------------------------------------------------------------
+# Output: Disk usage in bytes
+sub get_disk_space {
+   my $self = shift;
+   return $self->{diskusage};
+}
+
+#-------------------------------------------------------------------------------
+# Output: Disk usage in human readable form (i.e. 4.23 MB)
+sub get_hr_disk_space {
+   my $self = shift;
+   return $self->to_units($self->{diskusage});
+}
+
+#-------------------------------------------------------------------------------
+# Output: Total size in bytes of all databases.
+sub get_database_size {
+   my $self = shift;
+   return $self->{mysqldiskusage} + $self->{postgresdiskusage};
+}
+
+#-------------------------------------------------------------------------------
+# Output: Number of email accounts.
+sub get_num_email_accounts {
+   my $self = shift;
+   return $self->{emailaccounts};
+}
+
+#-------------------------------------------------------------------------------
+# Output: The most recent error message.
+# Error messages are not cleared at any time, so if you plan on checking this,
+# clear_errmsg() first.
+
+sub get_errmsg {
+   my $self = shift;
+   return $self->{errmsg};
+}
+
+sub clear_errmsg {
+   my $self = shift;
+   $self->{errmsg} = "";
+   return 1;
+}
+
+################################################################################
+# Private methods.
+
+#-------------------------------------------------------------------------------
+sub login {
+     my $self = shift;
+     if ($self->{bindaddress}) {               # Bind to a specific IP address if one was given.
+          $self->{lwp}->local_address($self->{bindaddress});
+     }
+     my $url = "http://".$self->{server_ip}.":2082";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     if ($self->{response}->is_success()) { # If basic auth was successful, then we have been redirected to (and followed) a new url
+          $self->cpanel_set_token($self->{response}->request()->uri()); # and we are ready to set the security token.
+          return 1;                                             # and call the login successful.
+     }
+     if ($self->{response}->code() != 401) { # If we have something other than access denied, then something went wrong.
+          $self->{errmsg} = "Login failed.  Web server returned " . $self->{response}->status_line();
+          return undef;
+     }
+     $url = "http://".$self->{server_ip}.":2082/login/"; # Submit the login form.
+     $url = $self->convert_to_ssl($url);
+     $self->{request} = POST($url, [ 'user'=>$self->{username}, 'pass'=>$self->{password}]);
+     $self->{response} = $self->{lwp}->request($self->{request}); # Submit the cPanel login form.
+     if ($self->{response}->is_redirect()) {
+          $self->cpanel_set_token($self->{response}->header('Location'));
+          return 1;
+     }else {
+          $self->{errmsg} = "Login failed..  Web server returned " . $self->{response}->status_line();
+          return undef;
+     }
+}
+
+# Input:  A url (i.e. /cpsess2528778714/frontend/x3/index.html?post_login=14386605437637)
+# Output: $self->{token} is set if there is one in the url.
+sub cpanel_set_token {
+     my $self = shift;
+     my $url  = shift;
+     if ($url =~ m/\/cpsess\d*/) {
+          $self->{token} = $&;
+     }else{
+          $self->{token} = "";
+     }
+}
+
+#-------------------------------------------------------------------------------
+# Gather account summary info. with only cPanel access from a remote server.
+# Forum reference: http://docs.cpanel.net/twiki/bin/view/ApiDocs/Api2/ApiStatsBar
+
+sub getprimaryinfo {
+     my $self = shift;
+     my $data;
+     my $url;
+     ##############################
+     # Find the primary domain name.
+     $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+	 "cpanel?".
+	 "cpanel_jsonapi_user=".$self->{username}.
+	 "&cpanel_jsonapi_apiversion=2".
+	 "&cpanel_jsonapi_module=DomainLookup".
+	 "&cpanel_jsonapi_func=getmaindomain"; 
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     eval {$data = decode_json($self->{response}->content); };
+     if (! $data) {
+          #One cause of this error is if the host requires SSL.  It fails here because the host sends a normal 200 response
+          # asking the user to use SSL, but no http redirect is sent.
+	      $self->{errmsg} = "Unable to retrieve primary domain: Unknown error.  Does the old host require SSL?";
+	      return 0;
+     }
+     if ($data->{error}) {
+          $self->{errmsg} = "Unable to retrieve primary domain: " . $data->{error};
+          return 0;
+     }
+     if ($data->{"cpanelresult"}->{"error"}) {
+          $self->{errmsg} = "Unable to retrieve primary domain: " . $data->{"cpanelresult"}->{error};
+          $self->{primarydomain} = "";
+     }else{
+          $self->{primarydomain} = $data->{"cpanelresult"}->{"data"}[0]->{"main_domain"};
+     }
+#     ################
+#     # Find the owner
+#     $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+#	 "cpanel?".
+#	 "cpanel_jsonapi_apiversion=1".
+#	 "&cpanel_jsonapi_module=print".
+#	 "&arg-0=\$CPDATA{'OWNER'}";
+#     $url = $self->convert_to_ssl($url);
+#     $self->get_url($url);
+#     eval {$data = decode_json($self->{response}->content); };
+#     if (! $data) {
+#	 $self->{errmsg} = "Unable to retrieve owner";
+#	 return 0;
+#     }
+#     if ($data->{error}) {
+#          $self->{errmsg} = "Unable to retrieve owner: " . $data->{error};
+#          return 0;
+#     }
+#
+#     $self->{owner} = $data->{"data"}->{"result"};
+     $self->{owner} = "unsupported";  
+     
+#     #########################
+#     # Find the home directoy.
+#     $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+#	 "cpanel?".
+#	 "cpanel_jsonapi_apiversion=1".
+#	 "&cpanel_jsonapi_module=print".
+#	 "&arg-0=\$homedir";
+#     $url = $self->convert_to_ssl($url);
+#     $self->get_url($url);
+#     eval {$data = decode_json($self->{response}->content); };
+#     if (! $data) {
+#	 $self->{errmsg} = "Unable to retrieve home directory.";
+#	 return 0;
+#     }
+#     if ($data->{error}) {
+#          $self->{errmsg} = "Unable to retrieve home directory: " . $data->{error};
+#          return 0;
+#     }
+#     $self->{homedir} = $data->{"data"}->{"result"};
+     $self->{homedir} = "unsupported";     
+
+#     ###########################
+#     # Number of MySQL databases
+#     $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+#	 "cpanel?user=".$self->{username}.
+#	 "&cpanel_jsonapi_apiversion=1".
+#	 "&cpanel_jsonapi_module=Mysql".
+#	 "&cpanel_jsonapi_func=number_of_dbs";
+#     $url = $self->convert_to_ssl($url);
+#     $self->get_url($url);
+#     eval {$data = decode_json($self->{response}->content); };
+#     if (! $data) {
+#	 $self->{errmsg} = "Unable to retrieve number of MySQL databases.";
+#	 return 0;
+#     }
+#     if ($data->{error}) {
+#          $self->{errmsg} = "Unable to retrieve number of MySQL databases: " . $data->{error};
+#          return 0;
+#     }
+#     $self->{mysqldatabases} = $data->{"data"}->{"result"};
+#     ###########################
+#     # Number of Postgres databases
+#     $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+#	 "cpanel?user=".$self->{username}.
+#	 "&cpanel_jsonapi_apiversion=1".
+#	 "&cpanel_jsonapi_module=Postgres".
+#	 "&cpanel_jsonapi_func=number_of_dbs";
+#     $url = $self->convert_to_ssl($url);
+#     $self->get_url($url);
+#     eval {$data = decode_json($self->{response}->content); };
+#     if (! $data) {
+#	 $self->{errmsg} = "Unable to retrieve number of Postgres databases.";
+#	 return 0;
+#     }
+#     if ($data->{error}) {
+#          $self->{errmsg} = "Unable to retrieve number of Postgres databases: " . $data->{error};
+#          return 0;
+#     }
+#     $self->{postgresdatabases} = $data->{"data"}->{"result"};
+
+     #################
+     # Everything else
+     $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+	 "cpanel?".
+	 "cpanel_jsonapi_module=StatsBar".
+	 "&cpanel_jsonapi_func=stat&".
+	 "cpanel_jsonapi_apiversion=2".
+	 "&display=sharedip|hostname|dedicatedip|hostingpackage|diskusage|mysqldiskusage|postgresdiskusage|sqldatabases|emailaccounts";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     eval {$data = decode_json($self->{response}->content); };
+     if (! $data) {
+	 $self->{errmsg} = "Unable to retrieve account stats: Unknown error";
+	 return 0;
+     }
+     $self->{diskusage} = 0;
+     $self->{mysqldiskusage} = 0;
+     $self->{postgresdiskusage} = 0;
+
+     foreach my $stat (@{$data->{cpanelresult}->{data}}) {
+          if ($stat->{id} eq "sharedip") {
+               $self->{site_ip} = $stat->{value};
+               $self->{dedicated_ip} = 0;
+          }
+          elsif ($stat->{id} eq "dedicatedip") {
+               $self->{site_ip} = $stat->{value};
+               $self->{dedicated_ip} = 1;
+          }
+          elsif ($stat->{id} eq "hostingpackage") {
+               $self->{plan} = $stat->{value};
+          }
+          elsif ($stat->{id} eq "sqldatabases") {
+               $self->{databases} = $stat->{count};
+          }
+          elsif ($stat->{id} eq "hostname") {
+               $self->{hostname} = $stat->{value};
+          }
+          elsif ($stat->{id} eq "emailaccounts") {
+               $self->{emailaccounts} = $stat->{count};
+          }
+          elsif ($stat->{id} eq "diskusage") {
+               $self->{diskusage} = $self->to_bytes($stat->{_count}, $stat->{units});
+               if ($stat->{_count} =~ /NA/) {
+                    $self->{diskusage} = "NA";
+               }else{
+                    $self->{diskusage} = ceil($self->{diskusage});
+               }
+               $self->{diskpercent} = $stat->{percent};
+          }
+          elsif ($stat->{id} eq "mysqldiskusage") {
+               $self->{mysqldiskusage} = $self->to_bytes($stat->{count}, $stat->{units});
+               $self->{mysqldiskusage} = ceil($self->{mysqldiskusage});
+          }
+          elsif ($stat->{id} eq "postgresdiskusage") {
+               $self->{postgresdiskusage} = $self->to_bytes($stat->{count}, $stat->{units});
+               $self->{postgresdiskusage} = ceil($self->{postgresdiskusage});
+          }
+     }
+     return 1;
+}
+
+#-------------------------------------------------------------------------------
+# Input: none
+# Output: On success, returns 1 and sets the $self->{addons} array.
+#         On failure, returns 0 and sets errmsg
+sub getaddons {
+     my $self = shift;
+     my $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+	 "cpanel?".
+	 "cpanel_jsonapi_module=AddonDomain".
+	 "&cpanel_jsonapi_func=listaddondomains".
+	 "&cpanel_jsonapi_apiversion=2";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval { $data = decode_json($self->{response}->content) };
+     if ("ARRAY" ne ref($data->{cpanelresult}->{data}) ) {
+         $self->{errmsg} = "Unable to check for addon domains: ";
+         if (defined $data->{data}->{reason}) {
+             $self->{errmsg} .= $data->{data}->{reason}
+         } else {
+             $self->{errmsg} .= "Unknown error."
+         }
+         return undef;
+     }
+
+    foreach my $addon (@{$data->{cpanelresult}->{data}}) {
+        my $sub = { domain => $addon->{domain},
+                    subdomain => $addon->{subdomain},
+                    reldir => $addon->{reldir},
+        };
+        $sub->{reldir} =~ s/^home://;
+        push ( @{$self->{addons}}, $sub);
+    }
+    return 1;
+}
+
+#-------------------------------------------------------------------------------
+# Input: none
+# Output: On success, returns 1 and sets the $self->{addons} array.
+#         On failure, returns 0 and sets errmsg
+sub getsubdomains {
+     my $self = shift;
+     my $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+	 "cpanel?".
+	 "cpanel_jsonapi_module=SubDomain".
+	 "&cpanel_jsonapi_func=listsubdomains".
+	 "&cpanel_jsonapi_apiversion=2";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval { $data = decode_json($self->{response}->content) };
+     if ("ARRAY" ne ref($data->{cpanelresult}->{data}) ) {
+         $self->{errmsg} = "Unable to check for subdomains: ";
+         if (defined $data->{data}->{reason}) {
+             $self->{errmsg} .= $data->{data}->{reason}
+         } else {
+             $self->{errmsg} .= "Unknown error."
+         }
+         return undef;
+     }
+
+    foreach my $subdomain (@{$data->{cpanelresult}->{data}}) {
+        my $sub = { domain => $subdomain->{domain},
+                    subdomain => $subdomain->{subdomain},
+                    reldir => $subdomain->{reldir},
+        };
+        $sub->{reldir} =~ s/^home://;
+        push ( @{$self->{subdomains}}, $sub);
+    }
+    return 1;
+}
+
+sub getparkeddomains {
+     my $self = shift;
+     my $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+     "cpanel?".
+     "cpanel_jsonapi_module=Park".
+     "&cpanel_jsonapi_func=listparkeddomains".
+     "&cpanel_jsonapi_apiversion=2";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval { $data = decode_json($self->{response}->content) };
+     if ("ARRAY" ne ref($data->{cpanelresult}->{data}) ) {
+         $self->{errmsg} = "Unable to check for subdomains: ";
+         if (defined $data->{data}->{reason}) {
+             $self->{errmsg} .= $data->{data}->{reason}
+         } else {
+             $self->{errmsg} .= "Unknown error."
+         }
+         return undef;
+     }
+     foreach my $parkeddomain (@{$data->{cpanelresult}->{data}}) {
+         my $parked = { domain => $parkeddomain->{domain},
+                     reldir => $parkeddomain->{reldir},
+         };
+         $parked->{reldir} =~ s/^home://;
+         push ( @{$self->{parkeddomains}}, $parked);
+     }
+     return 1;
+}
+
+# Convert a URL to its SSL form if the $ssl option is 1.
+# Input:  $self->{ssl} 0=Don't convert to SSL, 1=Convert to SSL
+#         $url
+# Output: The URL converted if necessary.
+sub convert_to_ssl {
+     my $self = shift;
+     my $url  = shift;
+     if ($self->{ssl}) {
+          $url =~ s/^http:/https:/;
+          $url =~ s/:2082/:2083/;
+     }
+     return $url;
+}
+
+# Enable a skiphomedir backup at the old host by putting an appropriate cpbackup-exclude file in place.
+# Input:  None
+# Output: $self->{temp_cpbackup_exclude} is updated with the renamed cpbackup_exclude.conf file if it had to be moved.
+#         Return value: 0=Error, 1=OK
+sub enable_skiphomedir {
+     my $self = shift;
+     my $filelist = $self->list_remote_files();
+     if ($filelist eq "") {return 0;}  #Exit if we couldn't list the files.
+     if ($filelist =~ /file=cpbackup-exclude\.conf\"/) { # If cpbackup-exclude found
+          $self->{temp_cpbackup_exclude} = $self->find_unique_filename("cpbackup-exclude.conf", $filelist); # Find a unique filename to temporarily rename to.
+          if ($self->{temp_cpbackup_exclude} eq "") {return 0;}
+          my $mvresult = $self->mv_remote_file("cpbackup-exclude.conf", $self->{temp_cpbackup_exclude});
+          if (!$mvresult) {return 0;}
+     }
+     my $create_result = $self->create_remote_file("cpbackup-exclude.conf", "\*");
+     if (!$create_result) {return 0;}
+     return 1;
+}
+
+# Undo any changes that enable_skiphomedir did.
+# Input:  Class member $self->{temp_cpbackup_exclude}
+# Output: 0=Error, 1=OK
+sub disable_skiphomedir {
+     my $self = shift;
+     if ($self->{temp_cpbackup_exclude}) {
+          my $mvresult = $self->mv_remote_file($self->{temp_cpbackup_exclude}, "cpbackup-exclude.conf");
+          if (!$mvresult) {return 0;}      #If the file move call failed, then return a failure now.
+     }else {
+          my $delresult = $self->delete_remote_file("cpbackup-exclude.conf");
+          if (!$delresult) {return 0;}     #If the file delete call failed, then return a failure now.
+     }
+     return 1;
+}
+
+sub delete_remote_file {
+     my $self     = shift;
+     my $filename = $_[0];
+     my $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+               "cpanel?".
+               "cpanel_jsonapi_apiversion=2".
+               "&cpanel_jsonapi_module=Fileman".
+               "&cpanel_jsonapi_func=fileop".
+               "&op=unlink".
+               "&sourcefiles=$filename";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval {$data = decode_json($self->{response}->content); };  #Parse the JSON from the cPanel call.
+     if (! $data) {
+          $self->{errmsg} = "Unknown error while renaming a remote file for --skiphomedir.";
+          return 0;
+     }
+     if (! $data->{cpanelresult}->{event}->{result}) {
+          $self->{errmsg} = "cPanel returned a failure while renaming a remote file for --skiphomedir.";
+          return 0;
+     }
+     return 1;
+}
+
+# Create a file at the remote host using the cPanel API.
+# Input:  Filename
+#         A string containing the content for the file.
+# Output: 1=OK, 0=Error
+sub create_remote_file {
+     my $self     = shift;
+     my $filename = $_[0];
+     my $content  = $_[1];
+     my $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+               "cpanel?".
+               "cpanel_jsonapi_apiversion=2".
+               "&cpanel_jsonapi_module=Fileman".
+               "&cpanel_jsonapi_func=savefile".
+               "&filename=$filename".
+               "&content=$content";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval {$data = decode_json($self->{response}->content); };  #Parse the JSON from the cPanel call.
+     if (! $data) {
+          $self->{errmsg} = "Unknown error while renaming a remote file for --skiphomedir.";
+          return 0;
+     }
+     if (! $data->{cpanelresult}->{event}->{result}) {
+          $self->{errmsg} = "cPanel returned a failure while renaming a remote file for --skiphomedir.";
+          return 0;
+     }
+     return 1;
+}
+
+# Move a file at the remote host using the cPanel API.
+# Input:  Filename to move
+#         Filename to move it to.
+# Output: 1=OK, 0=Error
+sub mv_remote_file {
+     my $self = shift;
+     my $old_filename = $_[0];
+     my $new_filename = $_[1];
+     my $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+               "cpanel?".
+               "cpanel_jsonapi_apiversion=2".
+               "&cpanel_jsonapi_module=Fileman".
+               "&cpanel_jsonapi_func=fileop".
+               "&op=move".
+               "&sourcefiles=$old_filename".
+               "&destfiles=$new_filename";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval {$data = decode_json($self->{response}->content); };  #Parse the JSON from the cPanel call.
+     if (! $data) {
+          $self->{errmsg} = "Unknown error while renaming a remote file for --skiphomedir.";
+          return 0;
+     }
+     if (! $data->{cpanelresult}->{event}->{result}) {
+          $self->{errmsg} = "cPanel returned a failure while renaming a remote file for --skiphomedir.";
+          return 0;
+     }
+     return 1;
+}
+
+# Input:  Global Mechanize object.
+# Output: "Error" if there was a problem.
+#         or the string representing the files (in html format) if OK.
+sub list_remote_files {
+     my $self = shift;
+     my $url = "http://".$self->{server_ip}.":2082$self->{token}/json-api/".
+               "cpanel?".
+               "cpanel_jsonapi_apiversion=1".
+               "&cpanel_jsonapi_module=Fileman".
+               "&cpanel_jsonapi_func=listfiles";
+     $url = $self->convert_to_ssl($url);
+     $self->get_url($url);
+     my $data;
+     eval {$data = decode_json($self->{response}->content); };  #Parse the JSON from the cPanel call.
+     if (! $data) {
+          $self->{errmsg} = "Unknown error while listing remote files for --skiphomedir.";
+          return "";
+     }
+     if (! $data->{event}->{result}) {
+          $self->{errmsg} = "cPanel returned a failure while listing remote files for --skiphomedir.";
+          return "";
+     }
+     return $data->{data}->{result};
+}
+
+# Used to find a unique filename.
+# Input:  Pattern to start with             i.e. cpbackup-exclude.conf
+#         String reference to search        i.e. blah blah cpbackup-exclude.conf blah blah
+# Output: A unique pattern that starts with the first argument.
+sub find_unique_filename {
+     my $self    = shift;
+     my $pattern = $_[0];                         #i.e. cpbackup-exclude.conf
+     my $data    = $_[1];                         #i.e. i.e. blah blah cpbackup-exclude.conf cpbackup-exclude.conf.001 blah blah
+     my $counter = 0;                             #Used to generate $extension.
+     my $flag    = 0;                             #Indicates whether or not a unique filename has been found (0=no, 1=yes)
+     my $extension;                               #Extension (i.e. 000, 001, 002, etc)
+     do {
+          $extension = sprintf("%03d", $counter);
+          if ($data !~ /$pattern\.$extension/) {  #If $data does not contain the test pattern (such as cpbackup-exclude.conf.000)
+               $flag = 1;                         # then set our found flag.
+          }
+          $counter++;
+     }while ($flag == 0 && $counter < 100);
+     if ($flag == 0) {
+          $self->{errmsg} = "Could not find a unique filename to rename $pattern to at old host while enabling skiphomedir.";
+          return "";
+     }
+     return "$pattern.$extension";
+}
+
+# Convert a number from gigabytes, megabytes or kilobytes into bytes.
+# Input:  Number to covert
+#         Units that number is currently represented in.
+# Output: Number of bytes.
+#         undef if either input is undefined.
+sub to_bytes {
+     my $self  = shift;
+     my $value = shift;
+     my $units = shift;
+     if (!$value || !$units) {
+          return 0;
+     }
+     if ($value =~ /NA/) {
+          return 0;
+     }
+     $value =~ s/,//g; # Remove any commas so the calculations work.
+     if ($units eq "GB") {
+          $value = $value * 1073741824;
+     }elsif ($units eq "MB") {
+          $value = $value * 1048576;
+     }elsif ($units eq "KB") {
+          $value = $value * 1024;
+     }
+     return $value;
+}
+
+# Convert a number from bytes into a more readable format with units.
+# Input:  bytes
+# Output example: "23.45 MB"
+sub to_units {
+     my $self  = shift;
+     my $value = shift;
+     if ($value =~ /NA/) {
+          return "NA";
+     }
+     if (!$value =~ /[0-9]/) {
+          return "0";
+     }
+     if ($value > 1073741824) {
+          $value = sprintf("%.2f", $value / 1073741824);
+          $value = $value . " GB";
+     }elsif ($value > 1048576){
+          $value = sprintf("%.2f", $value / 1048576);
+          $value = $value . " MB";
+     }elsif ($value > 1024) {
+          $value = sprintf("%.2f", $value / 1024);
+          $value = $value . " KB";
+     }else {
+          $value = $value . " Bytes";
+     }
+     return $value;
+}
+
+1;
+###########
+# logg Perl module
+# A module that is used to log in /var/log/hgtransfer with optional printing to the screen.
+# Please submit all bug reports at bugs.hostgator.com
+# 
+# Git URL for this module: NA yet.
+# (C) 2011 - HostGator.com, LLC"
+###########
+
+=pod
+
+=head1 Example usage for logg.pm:
+
+ my $l = logg->new();
+ $l->logg("Logging to the log file only.\n", 0);
+ $l->logg("Logging to the log file and screen.\n", 1);
+
+=cut
+
+package logg;
+use strict;
+
+sub new {                          #Constructor
+     my $class = shift;
+     my $self  = {};
+     $self->{class}         = $class;
+     $self->{shortname}     = shift;  #Directory name passed when the object is instantiated.  Will be part of the workdir name.
+     $self->{verbose}       = shift;      # 1=Verbose.  (print to the screen whether print flag is set or not)
+     $self->{filename}      = undef;
+     $self->{sec}           = undef;  #--- Time related members
+     $self->{min}           = undef;  #-
+     $self->{hour}          = undef;  #-
+     $self->{mday}          = undef;  #-
+     $self->{mon}           = undef;  #-
+     $self->{year}          = undef;  #-
+     $self->{wday}          = undef;  #-
+     $self->{yday}          = undef;  #-
+     $self->{error}         = "";
+     $self->{filehandle}    = undef;
+     bless($self, $class);
+
+     ($self->{sec}, $self->{min}, $self->{hour}, $self->{mday}, $self->{mon}, $self->{year},
+      $self->{wday}, $self->{yday}, $self->{isdst}) = localtime(time);
+
+     $self->{filename} = "/var/log/hgtransfer/" . $self->{shortname} . sprintf("%04d%02d%02d%02d%02d%02d", $self->{year}+1900, $self->{mon}+1, $self->{mday}, $self->{hour}, $self->{min}, $self->{sec});
+     eval {
+               unless (-d "/var/log/hgtransfer") {
+                    mkdir "/var/log/hgtransfer";
+               }
+               open ($self->{filehandle}, ">>$self->{filename}");
+          } or do {
+               print "Error opening the log file: $self->{filename}";
+               return 1;
+     };
+     $self->logg ("Logging to $self->{filename}. See this log for more detail.", 1);
+     return $self;
+}
+
+# Print info. to the screen and log if the --logfile option was specified.
+# Input: String of info. to print/log.
+#        Print flag: 0=log only
+#                    1=log and print to screen
+#                    2=log and save to array
+#                    3=log, print to screen and save to array.
+# Output: Info. is printed and, if necessary, logged.
+sub logg {
+     my $self      = shift;
+     my $data      = shift;
+     my $printflag = shift;
+     print {$self->{filehandle}} $data . "\n";       #Send to log file if logging is on.
+     if ($self->{verbose} || $printflag) {
+          print $data . "\n";               #Print to the screen
+     }
+     return 0;
+}
+
+sub DESTROY {                        #Destructor.  Stop logging.
+     my $self = shift;
+     close $self->{filehandle}; #Close the log file if we are logging to a file.
+}
+
+1;
+
+

@@ -1,0 +1,1865 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+###########
+# xferdone
+# Prints a finished reply for a Migrations ticket.
+#   It shows informatin customized for the account it is executed against and adds a key to SWAMP for the customer to use in previewing the site(s).
+# Wiki: http://confluence.endurance.com/display/HGS/Migrations+Script%3A+Xferdone+Finished+Reply
+# Stash: https://stash.endurance.com/projects/HGADMIN/repos/finishedxfer/browse
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+use Socket qw(inet_aton inet_ntoa);
+use LWP::UserAgent;
+use LWP::ConnCache;
+use URI::Escape;
+use Getopt::Long;
+use Cwd;
+use Data::Dumper;
+use strict;
+use Term::ANSIColor qw(:constants);
+use JSON;
+use Cpanel::Version;
+use Sys::Hostname;
+
+my $hostname = hostname;
+my $servertype = servertype_from_hostname(); # Determine if we're on (0) VPS/dedi, (1) shared/reseller, (2) OWP, or (3) JDI
+chomp($hostname);
+my $hascurses = 0; #Curses isn't on the Plesk servers, but we only need it if --select is used, so try to dynamically load it.
+my $control_panel = 0;             #Customer's control panel (passed to Swamp): 0=unknown, 1=cPanel, 2=WHM, 3=Plesk
+my $mysqlpass; #MySQL password on a Plesk box.
+my %hashof_selected_domains;
+my $reseller;
+my $plesk;    # 0 = cPanel, 1 = Plesk
+my $wildcard; # 0 = No wildcard domains.  1= One or more wildcard domains were found.
+my @userlist; # Array of usernames;
+my @users;    # Array of user objects each of which contain all of the account details for that user.
+my $time = time;
+my $hash;     # Hash key from swamp server.
+my $hosts         = 0; #0=Show SWAMP reply.            1=Show hosts reply.
+my $noaddons      = 0; #0=Show addons in hosts reply.  1=Don't show addons in hosts reply.
+my $help          = 0; #0=Don't show help.             1=Show help and exit.
+my $all           = 0; #0=Don't use all users.         1=Show finished reply for all users on the server.
+my $noreseller    = 0; # Has no effect because the $reseller_flag below defaults to 0.  Can be removed as soon as users no longer need the warning.
+my $reseller_flag = 0; #0=Don't look up reseller clients.  1=Look up reseller clients
+my $select        = 0; #0=Don't select domains         1=Let user interactively select the domains.
+my $domlist;        #0=No domain list               1=Domain list specified on the command line.
+my $swamp         = 0; #                               1=Force swamp reply.
+my $http          = 0; #                               1=Force show_pointed_reply
+my $authinfo      = 0;
+my $bad           = 0; #                               1=Only show the domains for which DNS is not pointed to this server.
+my $previewfiles  = 0; # Determines wheter or not to create sample files for the customer to confirm
+                       # that they are previewing the transferred site: 0=Don't create, 1=create.
+my $force         = 0; # For Courtesy Migrations
+my $nossl         = 0;
+
+GetOptions ('hosts'        => \$hosts,   #Grab command line options.
+            'swamp'        => \$swamp,
+            'http'         => \$http,
+            'bad'          => \$bad,
+            'noaddons'     => \$noaddons,
+            'all'          => \$all,
+            'help'         => \$help,
+            'select'       => \$select,
+            'domlist=s'    => \$domlist,
+            'authinfo'     => \$authinfo,
+            'noreseller'   => \$noreseller,
+            'previewfiles' => \$previewfiles,
+            'reseller'     => \$reseller_flag,
+            'nossl'        => \$nossl,
+            'force'        => \$force);
+
+if (!check_caller()) {
+     print "Authorization failure.  If you are in screen, try exiting the screen.\n";
+     exit(1);
+}
+
+if ($help == 1) {
+     showhelp();
+     exit 0;
+}
+
+# Find out if we're on a cPanel server or a Plesk server.
+if (-e "/etc/psa/.psa.shadow") {
+     $plesk = 1;
+     eval {                                           #Read the mysql password.
+          open (my $INFILE, "/etc/psa/.psa.shadow");
+          $mysqlpass = <$INFILE>;                     #Sluuuuurp
+          close $INFILE;
+     } or do {
+          print "Error reading the MySQL password from /etc/psa/.psa.shadow\n";
+          return 1;
+     };
+     chomp($mysqlpass);
+}else { #If the password file doesn't exist, this must be a cPanel server.  Run the cPanel methods.
+     $plesk = 0;
+}
+### TOKEN SUPPORT ###
+my $token_name;
+my $token;
+my $json;
+my $currversion = Cpanel::Version::getversionnumber();
+if ( $currversion >= 11.64 ){
+        $token_name = "hgtool_".time();
+        $json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+        $token = JSON::from_json($json)->{'data'}{'token'};
+        ###Clean up token before end
+        END{
+                if($token_name){
+                        `whmapi1 api_token_revoke token_name=$token_name`
+                }
+        }
+        {
+                my $revoked;
+                $SIG{INT} = sub {
+                        unless ($revoked) {
+                                $revoked = 1;
+                                `whmapi1 api_token_revoke token_name=$token_name`;
+                        }
+                        die "Interrupted";
+                }
+                        
+        }
+        ###Remove stale tokens
+        stale_tokens();
+}
+### END TOKEN SUPPORT ###
+
+if (!dependency_check()) { # If a dependency is out of date or missing, then exit.
+     exit 1;
+}
+my $dnschecker = Dnschecker::helpers->new(0, \&MYPRINT);
+
+if ($select == 1 && $hascurses == 0) {
+     print "Unable to use the interactive --select option because this server doesn't have the Curses module.\n";
+     exit 1;
+}
+
+#---------------- Build the User List ----------------------------
+if ($all == 1 && $servertype == 0) {
+     find_all_usernames(\@userlist);
+}else {
+     # Check for required arguments (-1 means no arguments).
+     if ($#ARGV == 0) {                  #If the user provided an argument, then
+          my $filesize = -s $ARGV[0];    #  check to see if there's a file with that name.
+          if ($filesize > 0 && ! -d $ARGV[0]) { #If our file has size and it is not a directory, then treat it like a user list.
+               eval {
+                    open (INFILE, $ARGV[0]);
+                    @userlist = <INFILE>;
+                    close INFILE;
+               } or do {
+                    print "Error reading file $ARGV[0]\n";
+                    exit 1;
+               };
+               foreach my $tmpline (@userlist) { #Remove extra newlines.
+                    chomp($tmpline);       #Remove newlines.
+                    $tmpline =~ s/\s+//;   #Remove leading spaces.
+                    $tmpline =~ s/\s+$//;  #Remove trailing spaces.
+               }
+          }else {
+               push (@userlist, $ARGV[0]);   #If there's no file with the name of the argument, then assume that the argument is a username.
+          }
+     }else {
+          my $username = findusername();     #Try to find out the username from the current directory.
+          chomp($username);
+          if (length($username) == 0) {
+               showhelp();
+               exit 1;
+          }else {
+               push (@userlist, $username);
+          }
+     }
+}
+
+@userlist = sort(@userlist);
+
+#-------- Create an object for each user, populating each with all of the details ---------
+foreach my $line (@userlist) {
+     if (length($line) > 0 && $line ne "." && $line ne ".." && $line ne "./" && $line ne "../") {
+          print "Gathering information for user $line\n";
+          my $ud = Userdata->new("localhost", $line, undef, $token);
+          if ($ud->{'error'} < 10) {
+               $ud->lookup_diskusage();
+               push (@users, $ud);
+          }
+     }
+}
+
+if (scalar(@users) < 1) {
+     print "No valid users found.\n";
+     exit 1;
+}
+
+
+# ----------- If there's one user that owns a bunch of other users, then replace our user list with the entire client userlist -------------
+if (scalar(@users) == 1 && $reseller_flag == 1 && $plesk == 0) {  #If there's one user, then check to see if it owns clients.
+     $reseller = $users[0];  #Empty the @users array and put its 1 element into $reseller.
+     $reseller->cpanel_lookup_clients();
+     if (scalar(@{$reseller->{clients}}) > 0) { #If this is a reseller (i.e. owns clients), then re-populate @userlist and @users with the client list.
+          @userlist = ();                       #Empty the @userlist array and make sure it only containss the single user that is in @users.
+          push(@userlist, $users[0]->{username});
+          foreach my $line (@{$reseller->{clients}}) { #loop through the clients, adding each one to @users and @userlist.
+               chomp ($line);
+               if ($line ne $users[0]->{username}) { #If the current client is the reseller, then skip because it is already in the list.
+                    print "Gathering information for user $line\n";
+                    my $ud = Userdata->new("localhost", $line, undef, $token);
+                    if ($ud->{'error'} < 10) {
+                         $ud->lookup_diskusage();
+                         push (@users, $ud);
+                         push (@userlist, $line);
+                    }
+               }
+          }
+     }
+}
+
+# --------- Determine what control panel the customer has so we can pass it to Swamp -----
+if ($plesk == 1) {
+     $control_panel = 3;        # Plesk control panel
+}else {
+     if (scalar(@users) >1) {
+          $control_panel = 2;   # WHM control panel because it's not Plesk and there is more than one user.
+     }else {
+          $control_panel = 1;   # cPanel control panel because it's not Plesk and there is only one user.
+     }
+}
+
+# --------- Now we have our final array of users.  Time for sanity checks. ---------------
+foreach my $user (@users) {
+     if (check_ip($user) > 0) {
+          exit 1;
+     }
+     if (check_symlink($user) > 0) {
+          exit 1;
+     }
+}
+
+if (is_shared_server() == 1) {  #If we're on a shared server
+     my $cpucount = count_cpus();
+     if ($cpucount < 4 && $cpucount > 0) {
+          print YELLOW . "This server only has $cpucount cpu(s).\n" . RESET;
+     }
+     if (is_gator_server() == 1) {
+          foreach my $user (@users) {
+               if (gator_sanity_check($user) == 1) {
+                    exit 1; #Failed the gator sanity check.
+               }
+          }
+          if (count_resellers(\@users) > 0) {
+               print "Please ensure that no users have reseller privileges since this is a shared server.\n";
+               exit 1;
+          }
+     }
+     if (is_reseller_server() ==1) {
+          if (find_reseller (\@users) == 1) {
+               exit 1;
+          }
+          my $reseller_count = count_resellers(\@users);
+          if ($reseller_count > 1) {
+               print "There appears to be $reseller_count users with reseller privileges.  There should not be more than one.\n";
+               exit 1;
+          }
+          foreach my $user (@users) {
+               if (reseller_sanity_check($user) ==1) {
+                    exit 1; #Failed the reseller sanity check.
+               }
+          }
+          if (check_reseller_bandwidth() > 0) {
+               exit 1;
+          }
+     }
+}else { #If we're not on a shared server, then do the following.
+     if (check_nameserver_ips($users[0])) {
+          exit 1;
+     }
+}
+
+# --------------------- Filter the domain list ---------------------
+my @full_domain_list;     #All domains in included user accounts.
+build_domain_list(\@users, \@full_domain_list);
+my @selected_domains = @full_domain_list; #Start out by selecting all of the domains.
+
+if (length($domlist) > 0) {
+     @full_domain_list = @selected_domains; #Filter out domains not listed in the --domlist file.
+     @selected_domains = ();
+     read_domain_list($domlist, \@full_domain_list, \@selected_domains);
+     @full_domain_list = @selected_domains;
+}
+if ($bad == 1) {
+     @full_domain_list = @selected_domains; #Filter domains by what the user selects.
+     @selected_domains = ();
+     select_unpointed_domains(\@full_domain_list, \@selected_domains);
+}
+if ($select == 1) {
+     @full_domain_list = @selected_domains; #Filter domains by what the user selects.
+     @selected_domains = ();
+     select_domains(\@full_domain_list, \@selected_domains);
+}
+# If a filtering option was selected, but no domains survived the filters, then error out.
+if (scalar(@selected_domains) == 0 && ($select == 1 || length($domlist)>0 || $bad == 1)) {
+     print "No domains were selected from the selection list.  Quitting.\n";
+     exit 0;
+}else {
+     #@selected_domains = grep { $_ != "" } @selected_domains;
+     %hashof_selected_domains = map { $_ => 1 } @selected_domains;
+     #Now %hashof_selected_domains is a hash of all of the domains the user selected.  We can now use this to
+     # compare against as we add domain to swamp and add the domains to the hosts reply.
+}
+#-------- Show the finished reply ---------------
+if (domains_pointed(\@full_domain_list, \@selected_domains) && !$swamp && !$hosts) {
+    show_pointed_reply(\@users, \@full_domain_list, \@selected_domains, $servertype);
+}
+elsif ($servertype == 3) {
+    # We do not want JDI to be able to use SWAMP. It's either show pointed or show hosts.
+    show_hosts_reply(\@users, \%hashof_selected_domains, $servertype);
+    if ($swamp) { print YELLOW . "****** NOTICE ******\nWe don't allow SWAMP use on JDI servers, so the hosts reply was shown.\n" . RESET; }
+}
+elsif ($servertype == 2 && !$swamp && !$hosts) {
+    # Force OWP to show hosts reply if --swamp and --hosts was not explicitly defined on the command line.
+    show_hosts_reply(\@users, \%hashof_selected_domains, $servertype);
+}
+elsif ($hosts) {
+    show_hosts_reply(\@users, \%hashof_selected_domains, $servertype);
+}
+else {
+    $hash = update_swamp(\@users, \%hashof_selected_domains);
+    if ($hash !~ /^[0-9a-fA-F]{40}$/) { #If update_swamp didn't return a hash key, then something went wrong.
+        print "Error: $hash\n";
+        exit 1;
+    }
+    show_swamp_reply(\@users, $hash, $servertype);
+}
+
+# Allow the creation of previewfiles if --swamp was not set and --previewfiles was specified.
+if ($previewfiles && !$swamp) {
+    print "Creating HostGator preview files.\n";
+    create_preview_files(\@users, \%hashof_selected_domains);
+}
+exit 0;
+
+#-----------------------------------------------------------------
+#------------------------ Subroutines ----------------------------
+#-----------------------------------------------------------------
+
+# Check to see what the hostname is and return a value accordingly, which we will use to reference the different groups of servers we manage.
+sub servertype_from_hostname {
+    if ($hostname =~ /(websitewelcome|gator\d+\.hostgator)\.com/) { return 1; }
+    elsif ($hostname =~ /wp\d+\.hostgator\.com/) { return 2; }
+    elsif ($hostname =~ /(ehosts|hostclear|ideahost)\.com/) { return 3; }
+    return 0;
+}
+
+# Input:  ref to an array of domains.
+#         ref to an array to output the domains to.
+# Output: Second array is populated with all of the domains from the first array that are not pointed to this server.
+sub select_unpointed_domains {
+     my $domains          = $_[0];
+     my $selected_domains = $_[1];
+     foreach my $domain (@{$domains}) {
+          if (!$dnschecker->processdomain($domain)) {
+               push (@{$selected_domains}, $domain)
+          }
+     }
+}
+
+# See if the caller of this script is allowed to run it.  We check the IP from the SSH_CLIENT environment variable.
+# Input:  SSH_CLIENT environment variable.
+# Output:
+sub check_caller {
+     my %allowed_ips;
+     $allowed_ips{'50.23.47.206'} = 1; # <-- Add more lines like this as needed for additonal IPs.
+     $allowed_ips{'111.118.212.170'} = 1;
+     $allowed_ips{'216.12.194.44'} = 1;
+     # Gather info. from the SSH_CLIENT env variable.
+     my $match =  $ENV{'SSH_CLIENT'};
+     $match =~ m/([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\s([0-9]+).*/;
+     my $env_ip   = $1;
+     my $env_port = $2;
+
+     if ($authinfo) {
+          print "\n";
+          foreach my $ip (keys %allowed_ips) {
+               print "Allowed IP: $ip\n";
+          }
+          print "SSH_CLIENT: $match\n";
+          print "ENV IP: $env_ip\n";
+          print "ENV PORT: $env_port\n";
+     }
+
+     if (!$allowed_ips{$env_ip}) { # First make sure the IP from the env variable is allowed.
+          return 0;
+     }
+
+     # Then gather info. from /proc/net/tcp to make sure the IP from the env variable is connected.
+     my @tcp;
+     eval {
+          open (my $INFILE, "/proc/net/tcp");
+          @tcp = <$INFILE>;                     #Sluuuuurp
+          chomp @tcp;
+          close $INFILE;
+          shift @tcp; # discard first line
+
+          open (my $INFILE, "/proc/net/tcp6");
+          my @tcp6 = <$INFILE>;
+          chomp @tcp6;
+          close $INFILE;
+          shift @tcp6; # discard first line
+
+          push @tcp, @tcp6;
+     } or do {
+          return 0;
+     };
+
+     foreach my $line (@tcp) {
+          if ($line =~ m/^\s*[0-9]+:\s+[0-9A-F]{8}:[0-9A-F]{4}\s+([0-9A-F]{8}):([0-9A-F]{4})\s+([0-9A-F]{2}).*/ or
+              $line =~ m/^\s*[0-9]+:\s+[0-9A-F]{32}:[0-9A-F]{4}\s+([0-9A-F]{32}):([0-9A-F]{4})\s+([0-9A-F]{2}).*/) {
+
+                  my $proc_ip     =  hexip_to_ip($1);
+                  my $proc_port   =  hex($2);
+                  my $proc_status =  $3; #Connection status.  01 = ESTABLISHED.
+
+                  my $ipv4_mapped_ipv6_address_pattern = qr/:ffff:(\p{IsXDigit}{1,4}):(\p{IsXDigit}{1,4})/i;
+
+	          if ($proc_ip =~ $ipv4_mapped_ipv6_address_pattern) {
+			$proc_ip = join('.', unpack('C4', pack('H8', sprintf('%04s%04s', $1, $2))));
+		  }
+	          if ($authinfo && $proc_status eq "01") {print "proc_ip: $proc_ip - proc_port: $proc_port\n";}
+	          if ($proc_ip eq $env_ip) {
+        	       return 1; #Success 
+	          }
+	  }
+     }
+     return 0; #Fail
+}
+
+# Convert a hexidecimal IP to a decimal IP.
+# Input:  Hex IP     (i.e. 0100007F)
+# Output: Decimal IP (i.e. 127.0.0.1)
+sub hexip_to_ip {
+
+        my $bin = pack "C*" => map hex, $_[0] =~ /../g;
+        my @l = unpack "L*", $bin;
+        if (@l == 4) {
+                return join ':', map { sprintf "%x:%x", $_ >> 16, $_ & 0xffff } @l;
+        } elsif (@l == 1) {
+                return join '.', map { $_ >> 24, ($_ >> 16 ) & 0xff, ($_ >> 8) & 0xff, $_ & 0xff } @l;
+        } else {
+                die "internal error: bad hexadecimal encoded IP address '$_[0]'";
+        }
+}
+
+# Find out if all of the domains included in the reply are pointed to this server.
+# Input:  Complete list of domains in an array ref.
+#         List of selected domains in case the user only selected a subset of domains.
+# Output: 1=pointed  0=not pointed
+sub domains_pointed {
+     my $full_domain_list = $_[0];
+     my $selected_domains = $_[1];
+     if (scalar(@{$full_domain_list})==0) {return 0;} #If the full list is empty for some reason, consider nameservers not pointed.
+     if (scalar(@{$selected_domains}) > 0) { #If selected keys are populated, loop throuth that.  Otherwise loop through the $full_domain_list.
+          foreach my $domain (@{$selected_domains}) {
+               if (!$dnschecker->processdomain($domain)) { #If processdomain returns true, then the domain is pointing to this server.
+                    return 0; #This domain is not pointing to this server, so fail the whole test.
+               }
+          }
+     }else{
+          foreach my $domain (@{$full_domain_list}) {
+               if (!$dnschecker->processdomain($domain)) { #If processdomain returns true, then the domain is pointing to this server.
+                    return 0; #This domain is not pointing to this server, so fail the whole test.
+               }
+          }
+     }
+     return 1; #We made it through the list of domains and all are pointing to this server.
+}
+
+# Callback function required by dnschecker.  Uncomment the print statement to show details of what dnschecker is doing.
+sub MYPRINT {
+        #print @_;
+}
+
+# Read a domain list from a file.
+# Input:  Filename
+#         Reference to an array of domains.
+# Output: Array modified to be the union of the input array and the list of domains.
+#         Returns 0=OK, 1=Error
+# Example: @domains    @file <--Read from Filename
+#           a.com
+#           b.com      b.com
+#                      c.com
+sub read_domain_list {
+     my $filename   = $_[0];
+     my $domains    = $_[1];
+     my $outdomains = $_[2];
+     my %hashof_domains;
+     my @file;
+     my $delay      = 0;
+     eval {                                           #Now that we know the file is there, read it.
+          open (my $INFILE, "$filename");
+          @file = <$INFILE>;                          #Slurp the file.
+          close $INFILE;
+          chomp @file;
+     } or do {
+          print "Error reading file $filename\n";
+          return 1;
+     };
+
+     %hashof_domains = map { $_ => 1 } @{$domains};
+     my %count_hash;
+
+     foreach my $dom (@{$domains}, @file) {
+          $count_hash{$dom}++;
+     }
+
+     foreach my $dom (keys %count_hash) {
+          if ($count_hash{$dom} > 1 and $hashof_domains{$dom}) { push @{$outdomains}, $dom; }
+     }
+     sleep $delay;
+     return 0;
+}
+
+#Build a complete domain list to pass to the select_domains subroutine.
+#Input:  Reference to an array of user accounts.
+#        Reference to an array that will hold the returned domains.
+#Output: A complete list of domains from the user accounts.
+sub build_domain_list {
+     my $userarray = $_[0];
+     my $domains   = $_[1];
+     foreach my $user (@{$userarray}) {
+          push (@{$domains}, $user->{primarydomain});               #Push the primary domain onto the output array.
+          if ($noaddons == 0) {                                     #Only go through the addons and subdomains if the --noaddons switch wasn't used.
+               if (scalar(@{$user->{addons}}) > 0) {                # If there are any addons, then
+                    foreach my $addon (@{$user->{addons}}) {        # Put all of the addon domains into the array.
+                         my $workstr = $addon;
+                         $workstr =~ s/:.*//;
+                         push (@{$domains}, $workstr);
+                    }
+               }
+               if (scalar(@{$user->{subdomains}}) > 0) {            # If there are any subdomains, then
+                    foreach my $sub (@{$user->{subdomains}}) {      # Put all of the subdomains into the array.
+                         push (@{$domains}, $sub);
+                    }
+               }
+               if (scalar(keys %{$user->{parked_parkeddir}}) > 0) { #Looping through hash keys instead of an array because I'm slowly moving away
+                    foreach my $parked (keys %{$user->{parked_parkeddir}}) { # from arrays in favor of hash arrays.
+                         push (@{$domains}, $parked);
+                    }
+               }
+          }
+     }
+     @{$domains} = sort(@{$domains});
+}
+
+
+# Allow the user to select which domains they wish to include in the finished reply.
+# Even though this was written for domains, it should work for other selection lists.
+# Input:  \@domains:          Reference to an array of domains.
+# Output: \@selected_domains: Reference to the returned array, which will be a sorted
+#                             array of the domains that were selected.
+sub select_domains {
+     my $domains          = $_[0];
+     my $selected_domains = $_[1];
+     my $cui = new Curses::UI( -color_support => 1 );
+
+     my $win1 = $cui->add(              #Create and add a window to put our widgets into.
+          'win1', 'Window',
+          -border => 1,
+          -y      => 0,
+          -x      => 0,
+          -width  => 80,
+          -height => 25,
+          -bfg    => 'blue',
+          -fg     => 'white',
+     );
+
+     my $listbox = $win1->add(         #Add the listbox that will have the domains.
+          'mylistbox', 'Listbox',
+          -values    => $domains,
+          -multi     => 1,
+          -y         => 3,
+          -height    => 18
+     );
+
+     my $buttons = $win1->add(         #Add a "Continue" button to the window.
+          'mybuttons', 'Buttonbox',
+          -buttons   => [
+                {
+                     -label => '<Continue>',
+                     -value => 1,
+                     -shortcut => 1,
+                     -onpress  => sub { finish(); }
+                }
+          ],
+          -y =>22
+     );
+
+     my $label = $win1->add(           #Add a label with some usage info.
+          'mylabel1', 'Label',
+          -text    => "<space> to select/deselect a domain.",
+          -x       => 0,
+          -y       => 0,
+     );
+
+     my $label2 = $win1->add(         #Add a label with some more usage info.
+          'mylabel2', 'Label',
+          -text    => "<Ctrl-q> or Enter on <continue> button to continue.",
+          -x       => 0,
+          -y       => 1,
+     );
+
+
+     sub finish {
+          @{$selected_domains} = $listbox->get();
+          @{$selected_domains} = sort(@{$selected_domains});
+          $cui->mainloopExit();
+     }
+
+     $cui->set_binding( \&finish, "\cQ"); #Bind <Control-q> to the finish sub.
+     $listbox->focus();                   #Put the focus onto the listbox by default.
+     $cui->mainloop();                    #Run the curses main loop.
+     Curses::endwin();
+}
+
+# Find out who the reseller is for a list of accounts.
+# Input:  Reference to a Userdata array.
+# Output: 0=OK, 1=Error.
+#         $reseller global variable is set.
+sub find_reseller {
+     my $userarray = $_[0];
+     #If there's no reseller, then look at the owner for an account to find out who it is, then make sure everyone in the list is
+     # owned by that reseller.  If the reseller does exist, then it's because the user ran this script against a reseller, so
+     # there's no need to find out the reseller or confirm that everyone is owned by that reseller.
+     if (!$reseller) {
+          foreach my $user (@{$userarray}) {  # Let's see if the reseller is one of the listed users.
+               if ($user->{username} eq $user->{owner}) {
+                    $reseller = $user;
+                    last;
+               }
+          }
+          if (!$reseller) {              # If the reseller was not one of the users, then create a Userdata object for the reseller.
+               $reseller = Userdata->new("localhost", @{$userarray}[0]->{owner}, undef, $token);
+          }
+          $reseller->cpanel_lookup_clients();
+          foreach my $user (@{$userarray}) {
+               if ($user->{owner} ne $reseller->{username}) {
+                    print "All of the accounts must be owned by the same reseller when using a list on a reseller server.  The reseller appears to be $reseller->{username}, but it does not appear to own $user->{username}.\n";
+                    return 1;
+               }
+          }
+     }
+     return 0;
+}
+
+# Count the number of resellers in the user list.
+# Input:  Reference to the user list.
+# Output: Number of resellers in the list.
+#         -1 if there was an error.
+sub count_resellers {
+     my $userarray      = $_[0];
+     my $reseller_count = 0;
+     if (-e "/var/cpanel/resellers") {
+          my @resellers;
+          eval {
+               open (my $INFILE, "/var/cpanel/resellers");
+               @resellers = <$INFILE>;                     #Sluuuuurp
+               close $INFILE;
+          } or do {
+               print "Error reading /var/cpanel/resellers while counting resellers.\n";
+               return -1;
+          };
+          foreach my $res (@resellers) {
+               chomp ($res);
+               $res =~ s/:.*//;  #Remove unnecessary info, leaving only the reseller. (before this, it's something like: "myresller:blah,blahblah..."
+               foreach my $user (@{$userarray}) {  # Let's see if the reseller is one of the listed users.
+                    if ($user->{username} eq $res) {
+                         print "Reseller: $res\n";
+                         $reseller_count++;
+                    }
+               }
+          }
+     }else{
+          #print "/var/cpanel/resellers does not exist.  Cannot count resellers.\n";
+          return -1;
+     }
+     return $reseller_count;
+}
+
+# Check to see if all of the nameservers in this reseller plan are the same.  If not, print a warning.
+# This is a cursory test intended to catch most problems of this type.  Not a thorough audit of all domains in the account.
+# Input:  Reference to the array of users.
+#         Global reseller account reference.
+# Output: Warning if the nameservers of any client don't match the nameservers of the reseller.
+sub check_reseller_nameservers {
+     my $users = $_[0];
+     foreach my $user (@{$users}) {
+        if ($user->{ownerns1} ne $user->{ns1} || $user->{ownerns2} ne $user->{ns2}) {
+            print RED . "Warning: The nameservers of one or more reseller clients (i.e. $user->{username}) do not match the nameservers of the reseller ($user->{owner}).  Please confirm that the accounts have the correct nameservers.\n" . RESET;
+            last;
+        }
+     }
+}
+
+# Input: global variable $reseller which is a Userdata object.
+sub check_reseller_bandwidth {
+     my $total_client_diskusage       = 0;
+     my $total_client_quota           = 0;
+     my $total_client_bandwidth_usage = 0;
+     my $total_client_bandwidth       = 0;
+     if ($reseller->{clients}) {
+          foreach my $user (@{$reseller->{clients}}) {
+               if (length($reseller->{clients_bandwidthlimit}{$user}) > 0) { #If clients_bandwidthlimit is populated, then process it.
+                    if ($reseller->{clients_bandwidthlimit}{$user} == 0) {   #If it's 0, it means unlimited.
+                         print "Unlimited bandwidth: $user\n";
+                         $total_client_bandwidth = $total_client_bandwidth + 1000000000000; #Add a terabyte
+                    }else {
+                         $total_client_bandwidth       = $total_client_bandwidth       + $reseller->{clients_bandwidthlimit}{$user};
+                    }
+               }
+               if (length($reseller->{clients_diskquota}{$user}) > 0) { #If clients_diskquota is populated, then process it.
+                    if ($reseller->{clients_diskquota}{$user} == 0) {   #If it's 0, it means unlimited.
+                         print "Unlimited disk quota: $user\n";
+                         $total_client_quota = $total_client_quota + 1000000000000; #Add a terabyte
+                    }else {
+                         $total_client_quota       = $total_client_quota       + $reseller->{clients_diskquota}{$user};
+                    }
+               }
+               $total_client_diskusage       = $total_client_diskusage       + $reseller->{clients_diskusage}{$user};
+               $total_client_bandwidth_usage = $total_client_bandwidth_usage + $reseller->{clients_bandwidthusage}{$user};
+          }
+          print "total_client_diskusage: $total_client_diskusage\n";
+          print "total_client_quota:     $total_client_quota\n";
+          print "total_client_bandwidth_usage: $total_client_bandwidth_usage\n";
+          print "total_client_bandwidth: $total_client_bandwidth\n";
+          if (!$force){
+               if ($total_client_quota > $reseller->{resellerquota}) {
+                    print "The reseller quota ($reseller->{resellerquota}) is not high enough to cover its clients ($total_client_quota).\n";
+                    return 1;
+               }
+               if ($total_client_bandwidth > $reseller->{resellerbandwidth}) {
+                    print "The reseller bandwidth ($reseller->{resellerbandwidth}) is not high enough to cover its clients ($total_client_bandwidth).\n";
+                    return 1;
+               }
+          }
+     }
+     return 0;
+}
+
+sub showhelp {
+     print <<END;
+xferdone 2.0
+Usage: xferdone <username/list> [options (see below)]
+
+       **** Options for building a username list:
+            <username/list>  - A file containing a user list.  If the file doesn't exist,
+                               then this argument will be treated as a username.
+            --reseller       - Include reseller clients.
+            --all            - Show the finished reply for all users on the server.
+
+       **** Options for filtering the list of domains:
+            --domlist=file   - Supply a file (where 'file' is a filename) that contains a list
+                               of domains to include in the reply.
+            --bad            - Only show domains for which DNS is not pointed to this server
+                               (not to be confused with the --pointed option which is a finished reply type)
+            --select         - Interactively select which domains to include in the SWAMP key or hosts reply.
+            --noaddons       - Don't show addon domains or subdomains in the finished reply.
+
+       **** Options for various finished replies:
+
+            --swamp          - Force a swamp reply.
+            --http           - Force a finished reply with http links that would normally show
+                               when DNS is pointed for all of the listed domains.
+            --hosts          - Force a finished reply with info. on how to update the hosts file.
+            --previewfiles   - Create a file in the root of each domain for the customer to confirm
+                               that they are looking at the transferred site.
+            --nossl          - Does not check for SSLs on shared IPs.
+END
+}
+
+#Update the SWAMP server
+#Input:  The \@users array of Userdata objects passed by reference.
+#Output: Hash key if all is OK
+#        Error message if there was a problem.
+sub update_swamp {
+     my $users = $_[0];
+     my $hashof_selected_domains = $_[1];
+     my $jsondata;
+     my $browser = LWP::UserAgent->new;
+     $browser->conn_cache(LWP::ConnCache->new()); #Keep a persistent connection so we can send all of our requests
+                                                  # at once and hopefully keep the SWAMP firewall happy.
+     if ($LWP::VERSION >= 6) {
+          $browser->ssl_opts( 'verify_hostname' => 0);
+          $browser->ssl_opts('SSL_verify_mode' => 0);
+     }
+     my $request = HTTP::Request->new( POST => "https://swamp.hostgator.com/add.php" );
+     $request->content_type('application/x-www-form-urlencoded');
+     $jsondata = compilejsoninfo($users, $hashof_selected_domains);
+     if ($jsondata) {
+          $request->content( $jsondata );
+          my $response = $browser->request( $request );
+          return $response->content;
+     }
+     return "No data is available to send to the Swamp server.";
+}
+
+
+sub compilejsoninfo {
+     my $users                   = $_[0];
+     my $hashof_selected_domains = $_[1];
+     my $send_flag            = 0;         #Whether there are any domains to send to the server (user may have unselected all after using --select)
+     my $selecton;                         #Whether or not to filter domains by the $hashof_selected_domains list.
+     if ($select == 1 || length($domlist) > 0 || $bad == 1) {
+          $selecton = 1;
+     }
+     my $jsondata = "jsondata={";
+     $jsondata = $jsondata . "\"control_panel\":\"" . $control_panel     . "\", ";
+     if (is_reseller_server()) {
+         $jsondata = $jsondata . "\"ns1\":\""           . $users[0]->{ownerns1}   . "\", ";
+         $jsondata = $jsondata . "\"ns2\":\""           . $users[0]->{ownerns2}   . "\", ";
+         $jsondata = $jsondata . "\"ns1ip\":\""         . $users[0]->{ownerns1ip} . "\", ";
+         $jsondata = $jsondata . "\"ns2ip\":\""         . $users[0]->{ownerns2ip} . "\", ";
+     } else {
+         $jsondata = $jsondata . "\"ns1\":\""           . $users[0]->{ns1}   . "\", ";
+         $jsondata = $jsondata . "\"ns2\":\""           . $users[0]->{ns2}   . "\", ";
+         $jsondata = $jsondata . "\"ns1ip\":\""         . $users[0]->{ns1ip} . "\", ";
+         $jsondata = $jsondata . "\"ns2ip\":\""         . $users[0]->{ns2ip} . "\", ";
+     }
+
+     $jsondata = $jsondata . "\"domains\":[";
+     foreach my $user (@{$users}) {
+          if ((${$hashof_selected_domains}{$user->{primarydomain}} == 1 && $selecton == 1) || $selecton == 0) {
+               $jsondata = $jsondata . "[\"".$user->{primarydomain}."\",\"".$user->{ip}."\",\"".$user->{username}."\"],";
+               $jsondata = $jsondata . "[\"www.".$user->{primarydomain}."\",\"".$user->{ip}."\",\"".$user->{username}."\"],";
+               $send_flag = 1;
+          }
+          foreach my $addon (keys %{$user->{addon_addondir}}) {        # Put all of the addon domains into the json string.
+               if ((${$hashof_selected_domains}{$addon} == 1 && $selecton == 1) || $selecton == 0) {
+                    $jsondata = $jsondata . "[\"".$addon."\",\"".$user->{ip}."\",\"".$user->{username}."\"],";
+                    $jsondata = $jsondata . "[\"www.".$addon."\",\"".$user->{ip}."\",\"".$user->{username}."\"],";
+                    $send_flag = 1;
+               }
+          }
+          foreach my $parked (keys %{$user->{parked_parkeddir}}) {     # Put all of the parked domains into the json string.
+               if ((${$hashof_selected_domains}{$parked} == 1 && $selecton == 1) || $selecton == 0) {
+                    $jsondata = $jsondata . "[\"".$parked."\",\"".$user->{ip}."\",\"".$user->{username}."\"],";
+                    $jsondata = $jsondata . "[\"www.".$parked."\",\"".$user->{ip}."\",\"".$user->{username}."\"],";
+                    $send_flag = 1;
+               }
+          }
+          foreach my $sub (keys %{$user->{subdomain_subdomaindir}}) {     # Put all of the parked domains into the json string.
+               if ($sub !~ /\*/) { #Only add it if it's not a wildcard subdomain.
+                    if ((${$hashof_selected_domains}{$sub} == 1 && $selecton == 1) || $selecton == 0) {
+                         $jsondata = $jsondata . "[\"".$sub."\",\"".$user->{ip}."\",\"".$user->{username}."\"],";
+                         $send_flag = 1;
+                    }
+               }else{
+                    $wildcard++;
+               }
+          }
+     }
+     $jsondata =~ s/,$//;  #Chop off the last comma.
+     $jsondata = $jsondata . "]}";
+     #$jsondata = "jsondata={\"ns1\":\"ns1.hgmove.com\", \"ns2\":\"ns2.hgmove.com\", \"ns1ip\":\"50.116.81.64\", \"ns2ip\":\"50.116.81.65\", \"domains\":[[\"mstreeter.staff.hostgator.com\",\"50.22.104.139\",\"mstreete\"]]}";
+     #print $jsondata . "\n";
+     if ($send_flag) {
+          return $jsondata;
+     }else {
+          return undef;
+     }
+}
+
+# Find all of the usernames on a server.
+# Input: An array to put the usernames into, passed by reference.
+# Output: Populated array.
+sub find_all_usernames {
+     my $userarray = $_[0]; #User array passed from caller
+     my @users;          #User array populated by the mysql statement
+     #---------------- ToDo: Check for a shared server and don't list all users if we're on one -----------------
+     if (-e "/etc/psa/.psa.shadow") { #If it's a Plesk server, use the Plesk code to find the usernames.
+          @users = `mysql -ss -u'admin' -p'$mysqlpass' -e"select sys_users.login from hosting inner join sys_users on hosting.sys_user_id=sys_users.id inner join domains on domains.id=hosting.dom_id where domains.webspace_id=0;" psa`;
+          if (($? >> 8) > 0) {     #Check the return code, and exit if the external call failed.
+               return ($? >> 8);
+          }
+          foreach my $user (@users) {
+               chomp($user);
+               push (@{$userarray}, $user);
+          }
+     }else {
+          #cPanel code to list usernames.
+          if (is_shared_server() == 1) {
+               print "Cannot print a finished reply for all users on a shared server.\n";
+               return 1;
+          }else {
+               eval {
+                    opendir (my $dirhandle, "/var/cpanel/users");
+                    foreach my $user (readdir $dirhandle) {
+                         chomp($user);
+                         if ($user ne "." && $user ne ".." && $user ne "rvadmin" && $user ne "root") {
+                              push (@{$userarray}, $user);
+                         }
+                    }
+                    closedir ($dirhandle);
+               }or do {
+                    print "Error listing the users for the --all option.\n";
+                    return 1;
+               }
+          }
+     }
+}
+
+# Do sanity checks for a gator server
+# Input:  A Userdata object passed by reference. i.e. gator_sanity_check(\$myuserobj);
+# Output: 0=OK, 1=Fail
+sub gator_sanity_check {
+     my $userobj  = $_[0];
+     my $owner    = $userobj->{owner};
+     my $plan     = $userobj->{plan};
+     my $username = $userobj->{username};
+     my $addons   = scalar(@{$userobj->{addons}});
+     my $parked   = scalar(keys %{$userobj->{parked_parkeddir}});
+     if ($plan =~ /^(Cloud )?Hatchling$/ && ($addons > 0 || $parked > 0)) {
+          print "$username is a hatchling plan with addon domains.  Please upgrade the plan or remove the addon domains.\n";
+          return 1;
+     }
+     # Allows:
+     # Cloud Hatchling, Cloud Baby, Cloud Business
+     # Hatchling, Baby Croc, Business
+     # OWP accounts are created via portal, so their plans are always 'default' and don't require checking
+     unless ($plan =~ /^(Cloud )?(Hatchling|Baby( Croc)?|Business)$/) {
+          if ($hostname !~ /^wp\d+\.hostgator\.com$/) {
+              print "The plan for $username ($plan) does not appear to be a valid plan for this server\n";
+              return 1;
+          }
+     }
+     unless ($owner eq "root" || $owner eq "fbf") { #Make sure owner is root or fbf.  fbf is for Free Blog Factory servers such as gator1227.
+          print "The owner for $username is $owner, but it should be root.\n";
+          return 1;
+     }
+     if (length($username) == 0) { #grepping with a blank username will cause the whole script to hang.  Check that before grepping.
+          print "Username is blank while doing a sanity check.\n";
+          return 1;
+     }
+     return 0;
+}
+
+# Do sanity checks for a reseller server
+# Input:  A Userdata object passed by reference. i.e. gator_sanity_check(\$myuserobj);
+# Output: 0=OK, 1=Fail
+sub reseller_sanity_check {
+     my $userobj  = $_[0];
+     my $owner    = $userobj->{owner};
+     my $plan     = $userobj->{plan};
+     my $username = $userobj->{username};
+     my $ownerobj = Userdata->new("localhost", $owner, undef, $token);
+     if ($ownerobj == 1) {
+          print "The user $username is owned by $owner, but $owner does not appear to be on the server\n";
+          return 1;
+     }
+     if ($plan =~ /^Business$/ || $plan =~ /^Baby Croc$/ || $plan =~ /^Hatchling$/) {
+          print "The plan for $username ($plan) should not be used on a reseller server\n";
+          return 1;
+     }
+     if ($owner eq "root") {
+          print "Please make sure $username is not owned by root since it\'s a reseller server.\n";
+          return 1;
+     }
+     return 0;
+}
+
+#Determine whether or not an IP address is local to the server the script is running on.
+# Input:  IP address
+# Output: 0 = Not local
+#         1 = local
+#         2 = error
+sub is_ip_local {
+     my $ip = $_[0];
+     my @results = `ifconfig`;
+     if (($? >> 8) > 0) {     #Check the return code, and exit if the external call failed.
+          return 2;
+     }
+     foreach my $result (@results) {# Loop through the output of ifconfig.
+          chomp($result);
+          if ($result =~ /inet addr:/) {
+               $result =~ s/.*inet addr://;
+               $result =~ s/ .*//;
+               if ($result eq $ip) {
+                    return 1;       #Found a match.  This IP is local.
+               }
+          }
+     }
+     return 0;                      #No match found.  This IP must not be local.
+}
+
+#Determine whether or not this is a shared server.
+# Input: nothing
+# Output: 0=no  1=yes it is a shared server.
+sub is_shared_server {
+     #my $hostname = hostname;
+     #chomp($hostname);
+     if ($hostname =~ /websitewelcome/ || $hostname =~ /hostgator.com/) {
+          return 1;
+     }
+     return 0;
+}
+
+#Check to see if there's a possible certificate in the certificate directory that is not installed.
+#Input:  A Userdata or cpbdata object.
+#Output: ""=OK
+#        "somedomain.tld"=Certificate that is not installed.  The string is the domain.
+#        "Error"=Error
+sub check_ssl {
+     my $userobj = $_[0];
+     my $ssldir;
+     if (scalar(@{$userobj->{sslstatus}}) > 0) { #If a certificate is installed, warn if there is an invalid certificate.
+          my $index = 0;
+          foreach my $certstatus (@{$userobj->{sslstatus}}) {
+               if ($certstatus ne "OK") {
+                   print RED . "****** Warning ****** " . RESET . "The certificate for $userobj->{username} is invalid: $certstatus\n";
+                   print $userobj->{sslcerts}[$index] . "\n";
+                   print $userobj->{sslstart}[$index] . "\n";
+                   print $userobj->{sslend}[$index] . "\n";
+               }
+          }
+          return 0;
+     }
+     #                                             If a certificate is not installed, then warn if there *is* a valid certificate.
+     if (is_gator_server() || is_reseller_server()) { #Figure out which directory to look in for SSL certs.
+          $ssldir = "/usr/share/ssl/certs";
+     }else {
+          $ssldir = "/etc/ssl/certs";
+     }
+     my @certlist;                                   #List the certificate files in the $ssldir.
+     eval {
+          opendir (my $dirhandle, $ssldir);
+          foreach my $line (readdir $dirhandle) {
+               chomp($line);
+               if ($line =~ /\.crt$/) {
+                    push (@certlist, $line);
+               }
+          }
+          closedir ($dirhandle);
+     }or do {
+          return "Error";
+     };
+     foreach my $line (@certlist) {
+          chomp ($line);
+          #print $ssldir . "/" . $line . "\n";
+          if ($line =~ /$userobj->{primarydomain}/) {
+               if ($userobj->check_cert("$ssldir/$line") == 0) {
+                    print RED . "****** Warning ****** " . RESET . "The $userobj->{username} account appears to have an SSL certificate for $userobj->{primarydomain}, but the certificate is not installed.\n";
+                    return 0;
+               }
+          }
+     }
+     foreach my $sub (@{$userobj->{subdomains}}) {
+          $sub =~ s/\*/\\\*/g;
+          foreach my $line (@certlist) {
+               chomp ($line);
+               if ($line =~ /$sub/) {
+                    if ($userobj->check_cert("$ssldir/$line") == 0) {# See if the file appears to match one of the subdomains.
+                         print RED . "****** Warning ****** " . RESET . "The $userobj->{username} account appears to have an SSL certificate for $sub, but the certificate is not installed.\n";
+                         return 0;
+                    }
+               }
+          }
+     }
+     foreach my $addonline (@{$userobj->{addons}}) {
+          my $addon = $addonline;
+          $addon =~ s/:.*//;
+          foreach my $line (@certlist) {
+               chomp ($line);
+               if ($line =~ /$addon/) {
+                    if ($userobj->check_cert("$ssldir/$line") == 0) {# See if the file appears to match one of the addon domains.
+                         print RED . "****** Warning ****** " . RESET . "The $userobj->{username} account appears to have an SSL certificate for $addon, but the certificate is not installed.\n";
+                         return 0;
+                    }
+               }
+          }
+     }
+     return 0;
+}
+
+# Warn if an SSL is installed on a shared IP.
+# Input:  Userdata object
+# Output: Warnings are printed as needed.
+sub check_ssl_sharedip {
+     my $ud_user = shift;
+     if (ref($ud_user) ne "Userdata") {
+          return 0; #If it's a backup, then this check isn't needed.
+     }
+     if ( scalar(@{$ud_user->{sslcerts}}) > 0 && # If there is an SSL cert installed
+                  !$ud_user->{dedicatedip}) {    # but not dedicated IP
+          print YELLOW . "****** Notice ****** There is an SSL on a shared IP for $ud_user->{username}.  Please either:\n";
+          print          "Make sure the customer is OK with Server Name Indication (SNI)\n";
+          print          "or put this account on a dedicated IP address.\n" . RESET;
+     }
+     return 0;
+}
+
+# Warn if an IP address is a private IP address.
+# Input:  A Userdata or cpbdata object.
+# Output: A printed warning if the IP appears to be a private IP.
+#         Return value: 0=OK, 1=Private or invalid IP.
+sub check_ip {
+     my $ud_user = $_[0];
+     if (is_ip_private($ud_user->{"ip"})) {
+          print RED . "****** Warning ****** The IP address for $ud_user->{username} ($ud_user->{ip}) is a private address and therefore probably invalid for a cPanel account.\n" . RESET;
+          return 1;
+     }
+     return 0;
+}
+
+# Warn if a nameserver IP is a private IP or invalid IP.
+# Input:  A Userdata or cpbdata object.
+# Output: # Output: A printed warning if one of the nameserver IPs appear to be a private IP or invalid IP.
+#         Return value: 0=OK, 1=Private or invalid IP.
+sub check_nameserver_ips {
+     my $ud_user = $_[0];
+     if (is_ip_private($ud_user->{"ns1ip"})) {
+          print RED . "****** Warning ****** The nameserver IP address $ud_user->{ns1ip} for the nameserver $ud_user->{ns1} appears to be a private IP address or invalid.\n" . RESET;
+          return 1;
+     }
+     if (is_ip_private($ud_user->{"ns2ip"})) {
+          print RED . "****** Warning ****** The nameserver IP address $ud_user->{ns2ip} for the nameserver $ud_user->{ns2} appears to be a private IP address or invalid.\n" . RESET;
+          return 1;
+     }
+     return 0;
+}
+
+# Input:  An IP address string.
+# Output: 0 = Public (i.e. valid) IP address.
+#         1 = Private (or invalid) IP address.
+sub is_ip_private {
+     my $ip = shift;
+     if ($ip =~ m/^([1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])(\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])){3}$/) {
+          my $testip = inet_aton($ip);
+          my @private = (
+               {network => '127.0.0.0',   mask => inet_aton('255.0.0.0')   },
+               {network => '192.168.0.0', mask => inet_aton('255.255.0.0') },
+               {network => '10.0.0.0',    mask => inet_aton('255.0.0.0') },
+               {network => '172.16.0.0',  mask => inet_aton('255.240.0.0') },
+          );
+          if (grep { inet_ntoa($testip & $_->{mask}) eq $_->{network} } @private) {
+             return 1;
+          } else {
+             return 0;
+          }
+     }else {
+          return 1; # Inalid IP
+     }
+}
+
+# Check to see if the etc or mail folder in the user's home dir is a symlink.
+# Input:  A Userdata or cpbdata object.
+# Output: 0=OK, 1=One or both are symlinks.
+sub check_symlink {
+     my $ud_user = $_[0];
+     my $mail = "/" . $ud_user->{partition} . "/" . $ud_user->{username} . "/mail";
+     my $etc  = "/" . $ud_user->{partition} . "/" . $ud_user->{username} . "/etc";
+     if (-l $etc || -l $mail) { #-l tests to see if a file is a symlink.
+          print RED . "****** One or both of $etc and $mail is a symlink ******\n" . RESET;
+          print "Most likely, the symlink(s) will have to be removed, and regular directories made in their place.  It may also be necessary to connect to the old host and download the contents of these directories.\n";
+          return 1;     #etc or mail is a symlink.
+     }
+     return 0;          #Neither etc nor mail is a symlink.
+}
+
+#Determine whether or not this is a gator server.
+# Input: nothing
+# Output: 0=no  1=yes it is a gator server.
+sub is_gator_server {
+     my $hostname = hostname;
+     chomp($hostname);
+     if ($hostname =~ /hostgator.com/) {
+          return 1;
+     }
+     return 0;
+}
+
+#Determine whether or not this is a reseller server.
+# Input: nothing
+# Output: 0=no  1=yes it is a reseller server.
+sub is_reseller_server {
+     my $hostname = hostname;
+     chomp($hostname);
+     if ($hostname =~ /websitewelcome/ && $hostname ne "asp.websitewelcome.com") {
+          return 1;
+     }
+     return 0;
+}
+
+
+# Find out the cPanel username
+# Input: Nothing.  Info. is obtained from the current directory path.
+# Output: username if the current dir is in a user's home dir.
+#         If not, error is printed and "" is returned.
+sub findusername {
+     my $dir = getcwd();     #Look up the dir which contains the username.
+     if (-e "/etc/psa/.psa.shadow") { #If it's a Plesk server, use the Plesk code to find the username.
+          my $user = `mysql -ss -u'admin' -p'$mysqlpass' -e"select sys_users.login from sys_users inner join hosting on hosting.sys_user_id=sys_users.id where hosting.www_root = '$dir' limit 1;" psa`;
+          if (($? >> 8) > 0) {     #Check the return code, and exit if the external call failed.
+               return ($? >> 8);
+          }
+          chomp($user);
+          if (length($user) == 0) {
+               print "It looks like your current directory is not a document root.\n";
+               print "Please run it from one of the following document root directories:\n";
+               my @output = `mysql -t -u'admin' -p'$mysqlpass' -e"select domains.name as Domain, hosting.www_root as 'Document Root' from domains inner join hosting on domains.id=hosting.dom_id;" psa`; #Look up the A record for NS1
+               foreach my $line (@output) { #Show the output from the failed command.
+                    print $line;
+               }
+          }
+          return $user;
+     }else { #If the password file doesn't exist, this must be a cPanel server.  Run the cPanel methods.
+          if ($dir !~ /\/home\d?\// || length($dir) < 8) {
+               #print "Please run from the user's home directory.\n";
+               return "";
+          }
+          $dir =~ s/\/home\d?\///;   #Remove the part of the dir before and after the username.
+          $dir =~ s/\/.*//;
+          return $dir;
+     }
+}
+
+# Count the number of cpus on the local machine.
+# Input:  Nothing
+# Output: # of cpus or -1 if there's an error.
+sub count_cpus {
+     my $filename = "/proc/cpuinfo";
+     my @cpuinfo;
+     eval {
+          open (my $INFILE, $filename);
+          @cpuinfo = <$INFILE>;                     #Sluuuuurp
+          close $INFILE;
+     } or do {
+          print "Error reading the file $filename while counting processors.\n";
+          return -1;
+     };
+     if (@cpuinfo) {
+          @cpuinfo = grep(/processor/, @cpuinfo);
+          if (scalar(@cpuinfo)<1) {
+               print "Error 1 while extracting the number of cpus out of $filename.\n";
+               return -1;
+          }else {
+               return scalar(@cpuinfo);
+          }
+     }else{
+          print "Error 2 while extracting the number of cpus out of $filename.\n";
+          return -1;
+     }
+}
+
+# Input:  An array of UserData objects passed by reference.
+#              UserData array is passed from the caller using \@array.  Entire array in this subroutine referenced by @{$array}.  A member of the array is referenced by \$array->[index]
+# Output: Prints the hosts finished reply.
+sub show_hosts_reply {
+    my $userarray = $_[0];
+    my $hashof_selected_domains = $_[1];
+    my $servertype = $_[2];
+    my ( $instructions, $hostlines_instr, $working_properly, $kb_host_instr, $kb_dns_change ) = "";
+    my ( @hostlines, @nsarray );
+
+    my $kb_host_instr = "http://support.PROVIDER.com/articles/specialized-help/technical/how-do-i-change-my-hosts-file";
+    my $kb_dns_change = "http://support.PROVIDER.com/articles/hosting-guide/lets-get-started/dns-name-servers/how-do-i-change-my-dns-or-name-servers";
+
+    # We need KB article links, and since JDI is involved here, check what the hostname is and give relevant article links.
+    if ($hostname =~ /ehosts\.com/) { $kb_host_instr =~ s/PROVIDER/ehosts/g; $kb_dns_change =~ s/PROVIDER/ehosts/g; }
+    elsif ($hostname =~ /hostclear\.com/) { $kb_host_instr =~ s/PROVIDER/hostclear/g; $kb_dns_change =~ s/PROVIDER/hostclear/g; }
+    elsif ($hostname =~ /ideahost\.com/) { $kb_host_instr =~ s/PROVIDER/ideahost/g; $kb_dns_change =~ s/PROVIDER/ideahost/g; }
+    else {
+        $kb_host_instr =~ s/PROVIDER/hostgator/g;
+        $kb_dns_change =~ s/PROVIDER/hostgator/g;
+        $kb_dns_change = $kb_dns_change . "\n\nIf we are your registrar we will be happy to take care of this for you. When you are ready to change your DNS and would like assistance, please contact our frontline support, available 24/7 through our US/Canada toll-free number, 1-866-964-2867, our international line, 00+1-713-574-5287, or our live chat, https://helpchat.hostgator.com/";
+    }
+
+    # change the wording based on the number of domains that will be listed.
+    if ((scalar(@{$userarray->[0]->{addons}}) == 0 && scalar(@{$userarray->[0]->{subdomains}}) == 0 && scalar(@{$userarray}) == 1) || $noaddons > 0) { $hostlines_instr = "Here is the line" }
+    else { $hostlines_instr = "Here are the lines"; }
+
+    # This gets an array of the host lines
+    @hostlines = print_hosts_lines($userarray, $hashof_selected_domains);
+
+    # If the previewfiles flag was used, we need to add information about how to access the preview files.
+    if ($previewfiles) {
+        push (@hostlines, "\nWe have added a file called " . generate_preview_filename() . " to the document root of each of your domains that can be used to confirm that your hosts file update has properly taken effect. When visiting the file in your browser, it will display \"Working\" at the top of the page.\n");
+    }
+
+    # Check if the nameservers are either hostgator.com or websitewelcome.com, or the nameservers are pointed and show the nameservers, otherwise print private nameservers.
+    #if ($userarray->[0]->{ownerns1} =~ /hostgator\.com/ || $userarray->[0]->{ownerns1} =~ /websitewelcome\.com/ || nameservers_pointed($userarray)) {
+    if (nameservers_managed($userarray) || nameservers_pointed($userarray)) {
+         $working_properly = "If everything is working properly, then each of your domains will need to be updated at your domain registrar(s) with these nameservers:";
+         @nsarray = print_nameservers($userarray);
+    } else {
+         $working_properly = "If everything is working properly, the following private nameservers will have to be registered at your domain name registrar. Then, each of your domains will need to be updated at your domain registrar(s) with these nameservers:";
+         @nsarray = print_nameservers_with_ips($userarray);
+    }
+
+    # BEGIN compile our hosts finished replies.
+    print "<<<<<<<<<<<<<<<<<<Finished Reply:>>>>>>>>>>>>>>>>>>>>\n\n";
+    print "Hello,\n\n";
+
+    if ($servertype == 2) {
+        #### WP*.hostgator.com
+        print <<EOFWP;
+I'm happy to inform you that we have finished migrating your website content. So far, we have copied your posts, pages, comments, authors, and other metadata to the new server. Now you will need to check your site to ensure everything has been moved correctly. Please keep in mind that some plugins or themes may not have transferred due to the previously mentioned security or resource concerns. If your theme/plugin is a premium (paid) theme that you purchased elsewhere we may be able install it for you if you can provide us with a fresh copy of the files direct from the developer (along with any license key that might be needed to activate it), or you can install them from the WordPress Dashboard on your end. When providing files to us please include them in an attachment reply to this email. Please see the following list of plugins or themes that were not able to be installed by us:
+
+
+
+You can install any premium plugins or themes from your end via the WordPress Dashboard in your HostGator Portal once you have made the hosts file changes to your local computer as described below, or provide them to us. Once everything is working correctly, you will be able to update your DNS to complete the process.
+EOFWP
+    } else {
+        #### Everything else
+        print <<EOF3;
+I'm happy to inform you that we have finished migrating your website content. So far, we have copied your site files and databases, and we've also made the necessary changes so everything is connected. Now you will need to check your sites to ensure everything has been moved correctly. If everything is working correctly, you will be able to update your DNS to complete the process.
+EOF3
+    }
+
+
+    # Now lets display the rest of the reply, based on the information gathered above.
+    print <<EOFEND1;
+
+Please note that because of how certain websites are coded they will require you to access the website using the full domain name. You can edit your computer's hosts file to trick it into loading the website and domain from our server instead of from where the domain is currently pointing.
+
+Here is a tutorial that shows you how to edit your personal computer's hosts file to preview your sites without changing the nameservers:
+$kb_host_instr
+
+$hostlines_instr that you'll want to add to your hosts file, according to the instructions referenced above:
+EOFEND1
+    # This gives us a list of hosts. We can't simply print the array because it will give us weird spacing.
+    foreach my $host (@hostlines) { print $host . "\n"; }
+    # Continue with the reply
+    print <<EOFEND2;
+
+This is only a temporary measure to preview your site, so once your registrar has the updated information and DNS is fully propagated, you will need to remove any lines you added to the hosts file. Once you have modified the host file on your personal computer, you will need to use the full domain name to view the site. When modifying the host file you are telling your computer not to look at the parent DNS servers for information on how to reach your domain name. Instead you are telling your computer that the domain name is located at that specific address and to use that address when you type the domain name into your browser.
+
+IMPORTANT:
+If you make any changes to your website or update any posts on the old server or during DNS propagation, those changes will not be reflected on your new account. It can take 24-48 hours for DNS changes to fully propagate to your new account's server once the NameServer updates are made at your registrar.
+
+$working_properly
+EOFEND2
+    # List the nameservers the customer should be using.
+    foreach my $ns (@nsarray) { print $ns . "\n"; }
+    # And continue with the reply
+    print <<EOFEND3;
+
+You can review detailed information on updating your nameservers at most registrars at the link below:
+$kb_dns_change
+
+Please do NOT cancel your old hosting account until after your nameservers have been updated, and the websites have fully propagated to the new account. We may not be able to retrieve any data from your old hosting account once it has been cancelled.
+
+Let us know if you have any questions or concerns and we'll be happy to assist.
+
+EOFEND3
+
+     print "<<<<<<<<<<<<<<<<<<Finished Reply:>>>>>>>>>>>>>>>>>>>>\n";
+     post_checks($userarray);
+}
+
+
+# Input:  An array of UserData objects passed by reference.
+#              UserData array is passed from the caller using \@array.  Entire array in this subroutine referenced by @{$array}.  A member of the array is referenced by \$array->[index]
+#         Hash key
+# Output: Prints the SWAMP finished reply.
+sub show_swamp_reply {
+     my $userarray   = $_[0];
+     my $key         = $_[1];
+     my $servertype  = $_[2];
+     my @nsarray;
+     my ( $working_properly, $start ) = "";
+
+     # We don't use SWAMP for JDI boxes, so we shouldn't be generating any SWAMP details.
+     if ($servertype == 3) { print "You should not be using SWAMP on JDI hosts."; exit 1; }
+
+     # Check if the nameservers are either hostgator.com or websitewelcome.com, or the nameservers are pointed and show the nameservers, otherwise print private nameservers.
+     if (nameservers_managed($userarray) || nameservers_pointed($userarray)) {
+          $working_properly = "If everything is working properly, then each of your domains will need to be updated at your domain registrar(s) with these nameservers:";
+          @nsarray = print_nameservers($userarray);
+     } else {
+          $working_properly = "If everything is working properly, the following private nameservers will have to be registered at your domain name registrar. Then, each of your domains will need to be updated at your domain registrar(s) with these nameservers:";
+          @nsarray = print_nameservers_with_ips($userarray);
+     }
+
+     # This is our actual reply, compiled from the information above.
+     print "<<<<<<<<<<<<<<<<<<Finished Reply:>>>>>>>>>>>>>>>>>>>>\n";
+     print "Hello,\n\n";
+
+     # Different starting paragraph for OWP boxes.
+     if ($servertype == 2) {
+        print <<EOFSTART;
+I'm happy to inform you that we have finished migrating your website content. So far, we have copied your posts, pages, comments, authors, and other metadata to the new server. Now you will need to check your site to ensure everything has been moved correctly. Please keep in mind that some plugins or themes may not have transferred due to the previously mentioned security or resource concerns. If your theme/plugin is a premium (paid) theme that you purchased elsewhere we may be able install it for you if you can provide us with a fresh copy of the files direct from the developer (along with any license key that might be needed to activate it), or you can install them from the WordPress Dashboard on your end. When providing files to us please include them in an attachment reply to this email. Please see the following list of plugins or themes that were not able to be installed by us:
+
+
+
+You can install any premium plugins or themes from your end via the WordPress Dashboard in your HostGator Portal once your DNS changes have been made, or provide them to us.
+
+Now you will need to check your sites to ensure everything has been moved correctly. To make this easy, I've added the site to our SWAMP (the System for Website Assessment Managed by Proxy), which will let you view how the sites look here. If everything is working correctly, you will be able to update your DNS to complete the process.
+EOFSTART
+     } else {
+         print <<EOFSTART;
+I'm happy to inform you that we have finished migrating your website content. So far, we have copied your site files and databases, and we've also made the necessary changes so everything is connected. Now you will need to check your sites to ensure everything has been moved correctly. To make this easy, I've added the site to our SWAMP (the System for Website Assessment Managed by Proxy), which will let you view how the sites look here. If everything is working correctly, you will be able to update your DNS to complete the process.
+EOFSTART
+     }
+
+     # Rest of the reply
+     print <<EOFEND1;
+
+Please do be aware that the SWAMP is just a temporary viewing solution, and some scripts/websites may not work perfectly at this time. More complex sites will require editing your hosts file.
+
+To view your site on the SWAMP you'll need to go to the website below:
+https://swamp.hostgator.com
+
+Once you reach the SWAMP, you can input your access key provided below. Please be aware that this key is only valid for 10 days. If you require longer to view your website, you will need to request a new key.
+$key
+
+IMPORTANT:
+If you make any changes to your website or update any posts on the old server or during DNS propagation, those changes will not be reflected on your new HostGator account. It can take 24-48 hours for DNS changes to fully propagate to your new HostGator account's server once the NameServer updates are made at your registrar.
+
+$working_properly
+EOFEND1
+    # Give us a list of nameservers
+    foreach my $ns (@nsarray) { print $ns . "\n"; }
+    # Continue with the reply.
+    print <<EOFEND2;
+
+You can review detailed information on updating your NameServers at most registrars at the link below:
+http://support.hostgator.com/articles/hosting-guide/lets-get-started/dns-name-servers/how-do-i-change-my-dns-or-name-servers
+
+If we are your registrar we will be happy to take care of this for you. When you are ready to change your DNS and would like assistance, please contact our frontline support, available 24/7 through our US/Canada toll-free number, 1-866-964-2867, our international line, 00+1-713-574-5287, or our live chat, https://helpchat.hostgator.com/
+
+Please do NOT cancel your old hosting account until after your NameServers have been updated, and the websites have fully propagated to your new account. We may not be able to retrieve any data from your old hosting account once it has been cancelled.
+
+Let us know if you have any questions or concerns and we'll be happy to assist.
+
+EOFEND2
+
+     print "<<<<<<<<<<<<<<<<<<Finished Reply:>>>>>>>>>>>>>>>>>>>>\n";
+     print "Hash key for this run is: $key\n";
+     post_checks($userarray);
+}
+
+sub show_pointed_reply {
+     my $userarray        = $_[0];
+     my $full_domain_list = $_[1];
+     my $selected_domains = $_[2];
+     my $servertype       = $_[3];
+     my @domains;
+     my $start = "";
+
+     if ($servertype == 2) {
+         # OWP reply
+         $start = "I'm happy to inform you that we have finished migrating your website content. So far, we have copied your posts, pages, comments, authors, and other metadata to the new server. Now you will need to check your site to ensure everything has been moved correctly. Please keep in mind that some plugins or themes may not have transferred due to the previously mentioned security or resource concerns. If your theme/plugin is a premium (paid) theme that you purchased elsewhere we may be able install it for you if you can provide us with a fresh copy of the files direct from the developer (along with any license key that might be needed to activate it), or you can install them from the WordPress Dashboard on your end. When providing files to us please include them in an attachment reply to this email. Please see the following list of plugins or themes that were not able to be installed by us:\n\n\n\nPlease review your newly transferred site to confirm it is functioning as expected.";
+     } else {
+         # All others
+         $start = "I'm happy to inform you that we have finished migrating your website content. Please review your newly transferred sites to confirm that they are functioning as expected.";
+     }
+
+     # This is the actual reply, compiled based on the information above.
+     print "<<<<<<<<<<<<<<<<<<Finished Reply:>>>>>>>>>>>>>>>>>>>>\n";
+     print <<EOF;
+Hello,
+
+$start
+
+EOF
+     # If selected keys are populated, loop through that.  Otherwise loop through the $full_domain_list.
+     if (scalar(@{$selected_domains}) > 0) {
+          foreach my $domain (@{$selected_domains}) {
+               print "http://$domain\n";
+          }
+     } else {
+          foreach my $domain (@{$full_domain_list}) {
+               print "http://$domain\n";
+          }
+     }
+     print <<EOF;
+
+Please do NOT cancel your old hosting account until you have had a chance to confirm that the transferred sites are functioning properly. We may not be able to retrieve any data from your old hosting account once it has been cancelled.
+
+Let us know if you have any questions or concerns, and we'll be happy to assist.
+EOF
+     print "<<<<<<<<<<<<<<<<<<Finished Reply:>>>>>>>>>>>>>>>>>>>>\n";
+     post_checks($userarray);
+}
+
+
+# Print the hosts lines for a finished reply.
+# Input:  Reference to an array of users.
+#         Reference to a hash array indicating what domains were selected.
+#         Global variable $select (--select flag)
+#         Global variable $domlist
+# Output: Hosts lines are printed.
+#         The first hosts line is returned in a variable.
+sub print_hosts_lines {
+     my $userarray = $_[0];
+     my $hashof_selected_domains = $_[1];
+     my $selecton;                         #Whether or not to filter domains by the $hashof_selected_domains list.
+     my @hostlines;
+     if ($select == 1 || length($domlist) > 0 || $bad == 1) {
+          $selecton = 1;
+     }
+     # Show addons and subdomains for each user.
+     foreach my $user (@{$userarray}) {
+          if ((${$hashof_selected_domains}{$user->{primarydomain}} == 1 && $selecton == 1) || $selecton == 0) {#If primary domain fits selection criteria,
+               push (@hostlines, $user->{ip} . " " . $user->{primarydomain} . " www." . $user->{primarydomain}); # then add a hosts line for it.
+          }
+          if ($noaddons == 0) {                                         # Only print addons and subdomains if the --noaddons switch wasn't used.
+               if (scalar(@{$user->{addons}}) > 0) {                # If there are any addons, then
+                    foreach my $addon (@{$user->{addons}}) {        # Put all of the addon domains into the json string.
+                         my $workstr = $addon;
+                         $workstr =~ s/:.*//;
+                         if ((${$hashof_selected_domains}{$workstr} == 1 && $selecton == 1) || $selecton == 0) {#If they fit the selection criteria.
+                              push (@hostlines, $user->{ip} . " " . $workstr . " www." . $workstr);
+                         }
+                    }
+               }
+               if (scalar(@{$user->{subdomains}}) > 0) {            # If there are any subdomains, then
+                    foreach my $sub (@{$user->{subdomains}}) {      # include them too,
+                         if ($sub !~ /\*/) { #Only show if it's not a wildcard subdomain.
+                              if ((${$hashof_selected_domains}{$sub} == 1 && $selecton == 1) || $selecton == 0) {#and if they fit the selection criteria.
+                                   push (@hostlines, $user->{ip} . " " . $sub);
+                              }
+                         }else{
+                              $wildcard++;   #Otherwise tabulate it as a wildcard domain.
+                         }
+                    }
+               }
+               if (scalar(keys %{$user->{parked_parkeddir}}) > 0) { # If there are any parked domains, then
+                    foreach my $parked (keys %{$user->{parked_parkeddir}}) { # include them too,
+                         if ((${$hashof_selected_domains}{$parked} == 1 && $selecton == 1) || $selecton == 0) {#If they fit the selection criteria.
+                              push (@hostlines,$user->{ip} . " " . $parked . " www." . $parked);
+                         }
+                    }
+               }
+          }
+     }
+     return @hostlines;
+}
+
+# Create test files that the customer can look for to confirm that they are looking at the transferred site.
+# Input:  Reference to an array of users.
+#         Reference to a hash array indicating what domains were selected.
+#         Global variable $select (--select flag)
+#         Global variable $domlist
+# Output: A file called
+sub create_preview_files {
+     my $userarray = $_[0];
+     my $hashof_selected_domains = $_[1];
+     my $selecton;                         #Whether or not to filter domains by the $hashof_selected_domains list.
+     if ($select == 1 || length($domlist) > 0 || $bad == 1) {
+          $selecton = 1;
+     }
+     # Show addons and subdomains for each user.
+     foreach my $user (@{$userarray}) {
+          if ((${$hashof_selected_domains}{$user->{primarydomain}} == 1 && $selecton == 1) || $selecton == 0) {#If primary domain fits selection criteria,
+               create_preview_file("/$user->{partition}/$user->{username}/public_html", $user->{username}); # then add a file to its docroot.
+          }
+          if ($noaddons == 0) {                                         # Only print addons and subdomains if the --noaddons switch wasn't used.
+               if (scalar(@{$user->{addons}}) > 0) {                # If there are any addons, then
+                    foreach my $addon (@{$user->{addons}}) {        # add a file to their docroots.
+                         my $workstr = $addon;
+                         $workstr =~ s/:.*//;
+                         if ((${$hashof_selected_domains}{$workstr} == 1 && $selecton == 1) || $selecton == 0) {#If they fit the selection criteria.
+                              create_preview_file("$user->{addon_addondir}{$workstr}", $user->{username});
+                         }
+                    }
+               }
+               if (scalar(@{$user->{subdomains}}) > 0) {            # If there are any subdomains, then
+                    foreach my $sub (@{$user->{subdomains}}) {      # include them too,
+                         if ((${$hashof_selected_domains}{$sub} == 1 && $selecton == 1) || $selecton == 0) {#and if they fit the selection criteria.
+                              if ($sub !~ /\*/) {
+                                   create_preview_file("$user->{subdomain_subdomaindir}{$sub}", $user->{username});
+                              }
+                         }
+                    }
+               }
+          }
+     }
+}
+
+# Create one test file that the customer can look for to confirm that they are looking at the transferred site.
+# Input: Directory to put it in
+#        Username
+#        A file of the form hostgator-yyyy-mm-dd.html is created in the specified directory
+#         and the owner is set to the given username.
+sub create_preview_file {
+     my $directory = shift;
+     my $user      = shift;
+     my $handle;
+
+     my $filename = generate_preview_filename();
+
+     print YELLOW . "$directory/$filename\n" . RESET;
+     if (!-s "$directory/$filename") {
+          eval {
+               open ($handle, ">$directory/$filename");
+               print $handle "Working\n";
+               close ($handle);
+
+          } or do {
+               print "Error writing $directory/$filename\n";
+               return 0;
+          };
+
+          my ($login, $pass, $uid, $gid) = getpwnam($user) or die "$user not in passwd file";
+          chown $uid, $gid, "$directory/$filename";
+     }
+     return 1;
+}
+
+# Return a date based filename to use as the filename for test files we add to document roots.
+sub generate_preview_filename {
+     my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime(time);
+     my $filename = sprintf("preview-%04d-%02d-%02d.html", $year+1900, $mon+1, $mday); # This filename needs to be brand-independent
+     return $filename;
+}
+
+# Determine whether or not DNS for the nameservers points to this server.
+sub nameservers_pointed {
+     my $userarray = $_[0];
+     my ($ns1, $ns2);
+     if ($reseller->{clients}) { #First set the appropriate nameserver vars.
+          $ns1 = $userarray->[0]->{ownerns1};
+          $ns2 = $userarray->[0]->{ownerns2};
+     } else {
+          $ns1 = $userarray->[0]->{ns1};
+          $ns2 = $userarray->[0]->{ns2}
+     }
+     if ($dnschecker->processdomain($ns1)      #If processdomain returns true, then the domain is pointing to this server.
+        && $dnschecker->processdomain($ns2)) {
+          return 1; #Nameservers are pointed.
+     }else{
+          return 0; #Nameservers are not pointed.
+     }
+}
+
+# Determine whether this is a managed box
+sub nameservers_managed {
+     my $userarray = $_[0];
+     my ($ns1, $ns2);
+     if ($userarray->[0]->{ownerns1} =~ /(websitewelcome|ehosts|ideahost|clearhost|hostgator)\.com/ && $userarray->[0]->{ownerns2} =~ /(websitewelcome|ehosts|ideahost|clearhost|hostgator)\.com/) {
+         # Success, this is a managed box.
+         return 1;
+     }
+     return 0;
+}
+
+# Print the nameservers for a finished reply.
+# Input:  Reference to an array of users
+# Output: Appropriate nameservers are printed.
+sub print_nameservers {
+     my $userarray = $_[0];
+     my @nsarray;
+     if ($reseller->{clients}) {
+        push (@nsarray, $userarray->[0]->{ownerns1});
+        push (@nsarray, $userarray->[0]->{ownerns2});
+     } else {
+        push (@nsarray, $userarray->[0]->{ns1});
+        push (@nsarray, $userarray->[0]->{ns2});
+     }
+     return @nsarray;
+}
+
+
+# Print the nameserver IPs for a finished reply.
+# Input:  Reference to an array of users
+# Output: Appropriate nameservers are printed.
+sub print_nameservers_with_ips {
+     my $userarray = $_[0];
+     my @nsarray;
+     if ($reseller->{clients}) {
+          push (@nsarray, $userarray->[0]->{ownerns1} . " with IP address " . $userarray->[0]->{ownerns1ip});
+          push (@nsarray, $userarray->[0]->{ownerns2} . " with IP address " . $userarray->[0]->{ownerns2ip});
+     } else {
+          push (@nsarray, $userarray->[0]->{ns1} . " with IP address " . $userarray->[0]->{ns1ip});
+          push (@nsarray, $userarray->[0]->{ns2} . " with IP address " . $userarray->[0]->{ns2ip});
+     }
+     return @nsarray;
+}
+
+# Run checks after the finished reply is printed to show any warnings the admin should be aware of.
+# Input:  Reference to an array of users
+# Outpue: Any warnings are printed to the screen.
+sub post_checks {
+     my $userarray = $_[0];
+     if (!is_shared_server()) {
+          #Check for remote nameservers
+          if (! is_ip_local($userarray->[0]->{ns1ip}) || ! is_ip_local($userarray->[0]->{ns2ip})) {
+               print RED "\n****** Warning ******" . RESET . " One or both of the nameserver IP addresses appear to be remote.  It is possible that the customer wants this, but usually it is due to a misconfigured server.\n";
+          }
+     }
+     #Check for clients with nameservers that don't match the reseller.
+     if ($reseller->{clients}) {
+          check_reseller_nameservers($userarray);
+     }
+     #Check for SSL certificates that aren't installed and for invalid SSL certificates.
+     if (!$force && !$nossl){
+          foreach my $user (@{$userarray}) {
+               check_ssl($user);
+               check_ssl_sharedip($user);
+          }
+     }
+     if ($wildcard) { # If any wildcard domains were found, then warn about them.
+          print YELLOW . "\n****** Note ****** " . RESET . " One or more wildcard domains were found.\n";
+          print "Wildcard domains are excluded because neither SWAMP nor the hosts file method can emulate a wildcard DNS entry.\n";
+          print "Individual subdomains would need to be added to the hosts file or added through the SWAMP admin interface.\n";
+     }
+
+     # Check for the deprecated --noreseller flag.
+     if ($noreseller) {
+          print YELLOW . "Notice: --noreseller is deprecated and has no effect.  Default behavior is now to not include reseller clients.  If you want to include reseller clients, use --reseller.\n" . RESET;
+     }
+
+     # Warn if a cPanel has reseller clients but --reseller wasn't used.
+     if (scalar(@{$users[0]->{clients}}) > 1 && scalar(@users) == 1 && $reseller_flag == 0) {
+          print YELLOW . "Notice: This account has reseller clients.  To include them, use the --reseller switch.\n" . RESET;
+     }
+     check_user_inodes($userarray);
+     check_user_quotas($userarray);
+     check_user_bandwidth($userarray);
+     check_branding($userarray);
+}
+
+sub check_branding {
+     my $userarray = shift;
+     if (!is_gator_server()) {
+          return; # No brand checking needed if it's not a gator server.
+     }
+     foreach my $user (@{$userarray}) {
+          if ($user->{branding} ne "HG" && $hostname !~ /^(cloud|wp)\d+\.hostgator\.com$/) {
+               print YELLOW . "****** Notice ****** " . RESET . "cPanel branding for " . $user->{username} . " is '" . $user->{branding} . "'.  By default it should be 'HG'\n";
+          }
+     }
+}
+
+# Check the users` inodes and print a warning if any accounts have exceeded the inode limits.
+# Input:  Array of users.
+# Output: A warning if any users have exceeded their quota.
+sub check_user_inodes {
+     my $userarray = shift;
+     my @oqarray   = (); # Over Quota array of users.
+     foreach my $user (@{$userarray}) { # Loop through users checking for accounts that are over their disk limit.
+         my $formatted_inodes = $user->{inodes};
+         $formatted_inodes =~ s/(^[-+]?\d+?(?=(?>(?:\d{3})+)(?!\d))|\G\d{3}(?=\d))/$1,/g;
+         if ($user->{inodes} > 300000) { # Build an array of users who are over their disk quota.
+              print RED . "****** Warning ****** " . RESET . $user->{username} . " has " . RED . $formatted_inodes . RESET . " inodes.\n";
+         }elsif ($user->{inodes} > 100000) {
+              print YELLOW . "****** Notice ****** " . RESET . $user->{username} . " has " . YELLOW . $formatted_inodes . RESET . " inodes.\n";
+         }
+     }
+}
+
+# Check the users` disk quotas and print a warning if any accounts have exceeded their quotas.
+# Input:  Array of users.
+# Output: A warning if any users have exceeded their quota.
+sub check_user_quotas {
+     my $userarray = shift;
+     my @oqarray   = (); # Over Quota array of users.
+
+     foreach my $user (@{$userarray}) { # Loop through users checking for accounts that are over their disk limit.
+         if ($user->{diskpercent} eq "100") { # Build an array of users who are over their disk quota.
+              print RED "****** Warning ******" . RESET . " " . $user->{username} . " is over its disk limit.\n";
+         }
+     }
+}
+
+# Check the users` bandwidth and print a warning if any accounts have exceeded their bandwidth limits.
+# Input:  Array of users.
+# Output: A warning if any users have exceeded their bandwidth.
+sub check_user_bandwidth {
+     my $userarray = shift;
+     my @oqarray   = (); # Over Quota array of users.
+
+     foreach my $user (@{$userarray}) { # Loop through users checking for accounts that are over their bandwidth limit.
+         if ($user->{bandwidthpercent} eq "100") { # Build an array of users who are over their bandwidth quota.
+              print RED "****** Warning ******" . RESET . " " . $user->{username} . " is over its bandwidth limit.\n";
+         }
+     }
+}
+
+##Remove stale tokens
+sub stale_tokens {
+        my $token_list = `whmapi1 api_token_list --output=json`;
+        my $listjson = from_json($token_list);
+        my $current_time = time();
+        if ($currversion >= 11.68){
+                foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+                        if( $token_name =~ /hgtool_/ ){
+                                my $token_time = $token_name;
+                                $token_time =~ s/\D//g;
+                                if ( ($token_time + 432000) < $current_time ){
+                                        print "Revoking token";
+                                        #Token is 5 days older than now, removing.
+                                        `whmapi1 api_token_revoke token_name=$token_name`;
+                                }
+                        }
+                }
+        } else {
+                foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+                        if( $token_data->{'name'} =~ /hgtool_/ ){
+                                my $token_time = $token_data->{'name'};
+                                $token_time =~ s/\D//g;
+                                if ( ($token_time + 432000) < $current_time ){
+                                        #Token is 5 days older than now, removing.
+                                        `whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+                                }
+                        }
+                }
+        }
+}
+
+# Check for dependencies.
+# Input:  $plesk global variable
+# Output: 1=Success, 0=Fail
+sub dependency_check {
+     #***************** Check for Curses ******************
+     if (eval {require Curses::UI;}) {  #Is the Curses module available?
+          require Curses::UI;           #Yes, load it and
+          $hascurses = 1;               # Set the flag.
+     }else {
+          $hascurses = 0;               #No, clear the hascurses flag.
+     }
+
+     #************** Check for xfermodules ****************
+     if (eval {require "/root/bin/xfermodules.pm";}) {  #Is xfermodules available?
+          require "/root/bin/xfermodules.pm";           #Yes, load it.
+          if ($xfermodules::VERSION lt "1.00") {
+               print "This server appears to have an outdated version of the transfers modules.\n";
+               print "Update with: ".YELLOW."yum update ESO-utils\n".RESET;
+               return 0;
+          }
+     }else{
+          if (! -s "/root/bin/xfermodules.pm") {
+               print "The transfers modules do not appear to be on this server.\n";
+               print "Install with: ".YELLOW."yum install ESO-utils\n".RESET;
+               return 0;
+          }else{
+               $|++;
+               print RED . "Error while trying to load xfermodules.pm\n".RESET;
+               delete $INC{'/root/bin/xfermodules.pm'};
+               require "/root/bin/xfermodules.pm";
+               return 0;
+          }
+     }
+
+     #************** Check for dnschecker ****************
+     if (eval {require "/root/bin/dnschecker";}) {  #Is dnschecker available?
+          require "/root/bin/dnschecker";           #Yes, load it.
+          if ($Dnschecker::helpers::VERSION lt "3.3.2") {
+               print RED . "This server appears to have an outdated version of dnschecker.\n" . RESET;
+               print "Install with: yum update ESO-utils\n";
+               return 0;
+          }
+     }else{
+          print RED . "Dnschecker does not appear to be on this server.\n" . RESET;
+          print "Install with: yum install ESO-utils\n";
+          return 0;
+     }
+
+     #************** Check for JSON ****************
+     if (!eval {require JSON;} && $plesk == 0) { #JSON is needed by the Userdata module within xfermodules.pm.
+          print "The JSON perl module does not appear to be on this server.\n";
+          print "Please install it or have a level 2 admin install it if this is a shared/reseller server.\n";
+          print "Install with: ".YELLOW."/scripts/perlinstaller JSON\n".RESET;
+          return 0;
+     }
+     return 1;
+}

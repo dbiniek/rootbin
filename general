@@ -1,0 +1,317 @@
+#!/usr/bin/env perl  
+
+  
+#####################################################  
+#                                                   #  
+#      Written by Jean L                            #  
+#        Credits:                                   #  
+#        Sean Jenkins for Cscanner                  #  
+#            Learned a lot from it                  #  
+#        ToS: for future managing of the script.    #  
+#                                                   #  
+# $Id: general,v 1.1 2014/01/31 18:40:14 cade Exp $
+#####################################################  
+#http://perldoc.perl.org/PerlIO.html  
+use strict;  
+use warnings;  
+use POSIX;  
+use Fcntl qw( :flock :mode O_CREAT);  
+use fadvise;  
+use IO::Dirent qw(readdirent DT_DIR DT_REG DT_LNK);  
+use Digest::MD5 qw(md5 md5_hex md5_base64);  
+use File::HomeDir;  
+use File::Path qw(make_path remove_tree);  
+use Data::Dumper;  
+use Getopt::Long;  
+use Time::HiRes;  
+use TOSconfig;
+
+my (@files, @files_type_txt, @modify_find_results, @directories, $stats) = ();
+my $skipped_file_count = 0;  
+
+my $HOME = File::HomeDir->my_home;  
+#my $HOME = _my_home();
+#my $path = $HOME."/public_html";
+
+my $time = 0;  
+our $config = TOSconfig::config_general();
+  
+my $unresolved = 0;    
+my ($verbose, $debug, $write_data_to_malware, $empty, $display_line,$depth) = (0,0,0,0,0,-1);    
+my $self;    
+my $path = $HOME."/public_html";
+my $path_to_general = "74.220.215.202/~toshmtes/perl/general";    
+GetOptions ("verbose" => \$verbose,    
+            "bug"=>\$debug,    
+            "malware"=>\$write_data_to_malware,    
+            "empty"=>\$empty,    
+            "help" => \&help,    
+            "line" => \$display_line,
+            "depth=s"   => \$depth,
+            "path=s" => \$path,
+            "<>" => \&help,    
+) || help();    
+sub help {    
+    print "\033[2J";    
+    print "\033[0;0H"; #jump to 0,0    
+    print "    
+general(1)                           User Commands                             
+    
+NAME    
+       General checker for hacked data - This scanning tool is designed to perform a full scan of all local files/folders on a server    
+    
+SYNOPSIS    
+       perl <(curl -s $path_to_general) -[OPTION]    
+    
+DESCRIPTION    
+       This looks for the more common back door hacks. Most of these hackers are so vain that they put their 'signature' in their hack scripts
+              so this file looks for the more prominent hacker names. 
+              Examples: Hackc0re, The Cyber Nuxbie, Scra3zy, PSYCODEZ, Indonesian Underground, and tons of others.
+
+       -h --help    
+              This help page    
+    
+       -m, --malware    
+              Writes data to a ~/malware.txt file via standard output appending the data '>>'    
+    
+       -e, --empty    
+              Empties the ~/malware.txt file, if you don't want to append to ~/malware.txt call both -e -m    
+    
+       -l, --line
+              Prints line number
+
+       -d, --depth
+              Sets a maximum directories it will scan recrusively, default is 15.
+
+       -p, --path
+              Choose a specific path
+    
+    
+    
+    
+    
+    
+";    
+  exit 0;    
+}    
+    
+sub find_readdir {
+    my $dir = shift;
+    my $pattern = shift;
+    my $level = shift || 1;
+    my $exclude_pattern = shift || qr/^Unused$/;
+
+    my $max_depth;
+    if ($depth > -1) {
+        $max_depth = $depth;
+    } else {
+        $max_depth = $config->{max_depth}
+    }
+    if( $level > $max_depth ) { return }
+
+    opendir my $dh, $dir
+    or do {
+        system("chmod 0755 $dir");
+    };
+    opendir $dh, $dir
+    or do {
+        warn "Could not open $dir: $!\n";
+        return;
+    };
+
+    for my $entry ( readdirent($dh) ) {
+        next if $entry->{name} =~ /^\.\.?$/;
+        if( $entry->{type} == DT_DIR ) {
+             if ( $entry->{name} !~ $config->{skip_directories}) {
+                 find_readdir("$dir/" . $entry->{name}, $pattern, $level + 1, $exclude_pattern);
+                 push(@directories, "$dir/".$entry->{name});
+             } else {
+                 $skipped_file_count++;
+                 next;
+             }
+        } elsif ($entry->{type} == DT_REG) {
+            if ($entry->{name} =~ $config->{skip_files}) {
+                $skipped_file_count++;
+                next;
+            } elsif ($entry->{name} =~ $config->{skip_cache}) {
+                $skipped_file_count++;
+                next;
+            }
+
+        }
+        next if $entry->{name} =~ $exclude_pattern;
+        next unless $entry->{name} =~ $pattern;
+        next if $entry->{type} == DT_DIR;
+        next if $entry->{type} == DT_LNK;
+        push(@files, "$dir/" . $entry->{name});
+    }
+    closedir $dh;
+}
+
+    
+    
+my $pkg = bless {}, __PACKAGE__;    
+    
+#Max Run time in seconds    
+$pkg->{'secs'} = 60*60; #60 minutes #temp   
+$pkg->main();    
+    
+sub main {    
+    $self = shift;    
+    local $SIG{ALRM} = sub {     
+        print "Error: Timeout!\n";    
+        exit(1);     
+    };    
+    alarm $self->{'secs'};    
+    #Start Multithreading, Maximum execution time will remain.    
+    $self->start();    
+    alarm 0;    
+    return 0;    
+}    
+    
+sub start {    
+    my $start;    
+    my $finish;    
+    my $minute = 0;    
+    
+    if ($empty eq '1') {    
+        open(MALWARE, ">", $HOME."/malware.txt");    
+        fadvise(*MALWARE);    
+        close(MALWARE);    
+    }    
+    if ($write_data_to_malware eq '1') {    
+        open(MALWARE, ">>", $HOME."/malware.txt");    
+    }    
+    
+    $start = Time::HiRes::time();    
+    # Minor stuff    
+    run_find();    
+    refine_find();    
+    fix_0777_0755_0644();    
+    delete_temp_directories();    
+    # major stuff    
+    file_content_scan();#md5_scan();    
+    Finished();    
+    $finish = Time::HiRes::time();    
+    while (($finish-$start) > 60) {    
+        $minute++;    
+        $finish -= 60;    
+    }    
+    print "Script took: $minute Min ".int($finish - $start)." Sec \n";    
+}    
+sub run_find {    
+    my @files;    
+    find_readdir($path, qr//, 1, $config->{skip_files});    
+}    
+sub fix_0777_0755_0644 {    
+    if ( -e $HOME."/public_html") {    
+        foreach my $file (@files) {    
+            @$stats = stat($file);    
+            my $mode = sprintf "%04o", S_IMODE($stats->[2]);    
+            if (-d $file ) {    
+                chmod(0755,$file);    
+            } elsif (-f $file) {    
+                if ($file =~ $config->{extensions755}) {
+                    if ($mode ne '0755') {    
+                        chmod(0755, $file);    
+                    }    
+                } elsif ($file =~ $config->{extensions644}) {    
+                    if ($mode ne '0644') {    
+                        chmod(0644, $file);    
+                    }    
+                }    
+            }    
+            if ($mode eq '0777') {    
+                if (-f $file) {    
+                    chmod(0644, $file);    
+                } elsif (-d $file) {    
+                    chmod(0755, $file);    
+                }    
+            }    
+    
+        }    
+    } else {    
+        print "~/public_html doesn't exist";    
+    }    
+}    
+sub delete_temp_directories {    
+#find ~/public_html -type d -wholename "*.log*" -o -wholename "*tmp/install_*" -o -wholename "*cache/cache__*" | xargs rm -rf ;     
+    my @directories2;    
+    foreach my $directory (@directories) {    
+        if ($directory =~ qr/\.log|tmp\/install_|cache\/cache__/) {    
+            push(@directories2, $directory);    
+            chmod(0755, $directory);    
+        }    
+    }    
+    foreach my $directory (@directories2) {    
+        if (remove_tree(@directories2, 1, 1)) {    
+            if ($verbose eq '1') {    
+                print "Deleted $directory successfully";    
+            }    
+        }    
+    }    
+}    
+sub file_content_scan {    
+print "\nThese files appear to contain malicious code. You will want to review the files and remove the injected code from important files and/or remove unused or invalid files.\n\n" ;    
+    if ($write_data_to_malware eq '1') {    
+        print MALWARE "\nThese files appear to contain malicious code. You will want to review the files and remove the injected code from important files and/or remove unused or invalid files.\n\n";    
+    }    
+    foreach my $file (@files_type_txt) {    
+        if (open(FH,"<:perlio","$file")){    
+            flock(FH,LOCK_EX);    
+            binmode(FH);    
+            my $line_ = 0;    
+            while (my $line = <FH>) {    
+            $line_++;    
+                chomp($line);    
+                if ($line =~ $config->{file_content_regex}) {
+                    if ($display_line eq '1') {
+                        print "$file : line $line_\n";
+                    } else {
+                        print "$file\n";
+                    }
+                    if ($write_data_to_malware eq '1') {    
+                        if ($display_line eq '1') {
+                            print MALWARE "$file : line $line_\n";
+                        } else {
+                            print MALWARE "$file\n";
+                        }
+                    }    
+                    $unresolved++;    
+                    last;    
+                }    
+            }    
+            flock(FH,LOCK_UN);    
+            fadvise(*FH);    
+            close(FH);    
+        } else {    
+            print "Error:$file $!\n";    
+        }    
+    }    
+}    
+#Seems to take the longest to run.    
+sub refine_find {    
+    foreach my $file (@files) {    
+        if (-T $file) {    
+            @$stats = stat("$file");    
+            #skip files larger then 1 MB    
+            if ($stats->[7] > 1048576) {    
+                $skipped_file_count++;    
+                next;    
+            }    
+            push(@files_type_txt, $file);    
+        }    
+    }    
+    if  ($debug eq '1') {    
+        print "skipped $skipped_file_count\n";    
+    }    
+    
+    # sort by inode to make scan results faster.    
+    sort { $$a{'inode'} <=> $$b{'inode'}} @files_type_txt;    
+}    
+    
+sub Finished {    
+    print "\nTotal number of files scanned: ".(scalar @files+scalar $skipped_file_count)."\n";
+    print "Number of files in need of review: ".$unresolved."\n";    
+}    
+

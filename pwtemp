@@ -1,0 +1,1112 @@
+#!/usr/bin/env perl
+# pwtemp
+# temporarily toggles passwords for many different software suites
+# jlavoy - 3.22.2018 - Endurance International Group
+package Pwtemp;
+push(@INC, '/usr/local/share/perl5', '/usr/share/perl5');
+use strict;
+use warnings;
+use Switch;
+use Module::Load;
+use Sys::Hostname;
+use Fcntl;
+use sigtrap 'handler' => \&sighandler, 'INT';
+use Getopt::Std qw(getopts);
+my %opts;
+getopts('dilu', \%opts);
+
+# load and install our modules
+_loadModules();
+# setup our object
+my $pwtemp = Pwtemp->new(@ARGV);
+
+# run
+$pwtemp->main();
+
+sub main () {
+    my $pwtemp = shift;
+    $pwtemp->_sanitizeInput();
+    $pwtemp->_setupEnvironment();
+    $pwtemp->_checkFullDisk();
+    $pwtemp->_findTarget() unless defined($pwtemp->{'target'});
+    $pwtemp->_findPrefix() if $pwtemp->{'webapp'};
+    $pwtemp->_checkToggle() if $pwtemp->{'toggle'};
+    switch($pwtemp->{'shortaction'}) {
+        case 'user' { $pwtemp->setCpanel() }
+        case 'mail' { $pwtemp->setCpanel() }
+        case 'plesk' { $pwtemp->setPlesk() }
+        case 'ftp' { $pwtemp->setFtp() }
+        case 'wp' { $pwtemp->setWp() }
+        case 'joomla' { $pwtemp->setJoomla() }
+        case 'drupal' { $pwtemp->setDrupal() }
+        case 'magento' { $pwtemp->setMagento() }
+        case 'zencart' { $pwtemp->setZencart() }
+        case 'vb' { $pwtemp->setVb() }
+        case 'whmcs' { $pwtemp->setWhmcs() }
+        case 'phpbb' { $pwtemp->setPhpbb() }
+        case 'smf' { $pwtemp->setSmf() }
+    }
+}
+
+sub new (\@) {
+    my $class = shift;
+    my $self = {
+        opts => \%opts,
+        action => shift,
+        target => shift,
+        protected => _getProtected(),
+        hostname => hostname(),
+        valid_users => _getUsers(),
+    };
+    if (( defined($self->{'action'}) ) && ( $self->{'action'} =~ /^(set|unset)(.*)/ )) {
+        $self->{'toggle'} = $1 eq 'set' ? 1 : 0;
+        $self->{'shortaction'} = $2;
+    }
+    chomp($self->{'ip'} = `hostname -i`) if $self->{'opts'}->{'i'} || ! $self->{'protected'};
+    $self->{'webapp'} = 1 if ( defined($self->{'shortaction'}) && $self->{'shortaction'} =~ /(wp|joomla|drupal|magento|zencart|vb|whmcs|phpbb|smf)/ );
+    $self->{'dbh'} = _getMySQL() if $self->{'webapp'};
+    push(@{$self->{'valid_users'}}, 'root') unless $self->{'protected'};
+    bless($self, $class);
+    return($self);
+}
+
+sub sighandler () {
+    # interrupt SIGINT if we get it so we don't leave the server in a broken or half written state
+    print "[!] SIGINT captured! Continuing for safety!\n";
+    return();
+}
+
+sub _sanitizeInput() {
+    my $self = shift;
+    if (( ! defined($self->{'action'}) ) || ( $self->{'action'} !~ /^(set|unset)(user|ftp|mail|plesk|wp|joomla|drupal|magento|zencart|vb|whmcs|phpbb|smf)$/ )) {
+        $self->_usage();
+    }
+    my $validation;
+    switch($self->{'shortaction'}) {
+        case 'user' { $validation = '^([a-zA-Z0-9\.\-]{1,16})$' }
+        case 'plesk' { $validation = '^([a-zA-Z0-9]+)$' }
+        case /(mail|ftp)/ { $validation = '^([A-Za-z0-9\-\_\.]+)(\@|\+)([A-Za-z0-9\-\.]+)$' }
+        else { $validation = '^([a-zA-Z0-9\_\-]+)$' }
+    }
+
+    if (( defined($self->{'target'}) ) && ( $self->{'target'} !~ /$validation/ )) {
+        print "[!] [$self->{'target'}] is not valid input for $self->{'action'}\n";
+        $self->_usage();
+    }
+    if (( defined($self->{'target'}) ) && ( $self->{'shortaction'} eq 'user' )) {
+        if ( ! grep(/^$self->{'target'}$/, @{$self->{'valid_users'}}) ) {
+            die "[!] $self->{'target'} is not a valid system user\n";
+        }
+    }
+}        
+
+sub setCpanel () {
+    # cpanel and mail
+    my $self = shift;
+    unless ( $self->{'toggle'} ) {
+        print '[!] unset is no longer necessary for this toggle' . "\n";
+        exit();
+    }
+    $self->_checkCpanel();
+    if ( ! $self->{'opts'}->{'d'} ) {
+        if ( ! -x '/usr/sbin/whmapi1' ) {
+            die '[!] WHM API binary is not available. Is this server a cPanel server?';
+        }
+        my ( $cpanel_session_url, $whm_session_url, $webmail_session_url );
+        if ( $self->{'shortaction'} eq 'user' ) {
+            my $pwstatus = `passwd -S $self->{'target'}`;
+            if ( $self->{'opts'}->{'l'} ) {
+                if ( $pwstatus =~ /LK/ ) {
+                    die "[!] This user is already locked!";
+                }
+                my $password = $self->_generatePassword(16);
+                chomp(my $json = `/usr/sbin/whmapi1 --output=json passwd user=$self->{'target'} password='$password' db_pass_update=1`);
+                my $status = JSON::decode_json($json);
+                if ( ! $status->{'metadata'}->{'result'} ) {
+                    die '[!] Password update for ' . $self->{'target'} . ' failed!';
+                }
+                print "[*] Locking password.\n";
+                system("passwd -l $self->{'target'} >/dev/null 2>&1");
+                exit;
+            } elsif ( $self->{'opts'}->{'u'} ) {
+                if ( $pwstatus !~ /LK/ ) {
+                    die "[!] This user is not currently locked!";
+                }
+                my $password = $self->_generatePassword(16);
+                system("passwd -u $self->{'target'} >/dev/null 2>&1");
+                chomp(my $json = `/usr/sbin/whmapi1 --output=json passwd user=$self->{'target'} password='$password' db_pass_update=1`);
+                my $status = JSON::decode_json($json);
+                if ( $status->{'metadata'}->{'result'} ) {
+                    print 'Password unlocked for ' . $self->{'target'} . ' and reset to: ' . $password . "\n";
+                } else {
+                    die '[!] Password update for ' . $self->{'target'} . ' failed!';
+                }
+                exit;
+            }
+            $cpanel_session_url = $self->_makeSession('cpaneld');
+            $whm_session_url = $self->_makeSession('whostmgrd') if $self->_isReseller();
+        } elsif ( $self->{'shortaction'} eq 'mail' ) {
+            my ( $email, $domain ) = split(/(?:\@|\+)/, $self->{'target'});
+            my $user = $self->_getOwner($domain);
+            my (undef, undef, $uid, $gid, undef, undef, undef, $homedir, undef) = getpwnam($user);
+            my $password = $self->_generatePassword(16);
+            if ( ! -s "$homedir/etc/$domain/shadow" ) {
+                    die "[!] ERROR: No e-mail shadow file exists for $domain at $homedir/etc/$domain/shadow !\n";
+            }
+            if ( $self->{'opts'}->{'l'} ) {
+                chomp(my $json = `/usr/bin/uapi --user $user --output=json Email passwd_pop email=$email domain=$domain password='$password'`);
+                my $status = JSON::decode_json($json);
+                if ( $status->{'result'}->{'status'} ) {
+                    print "[*] $domain locked!\n";
+                } else {
+                    die '[!] Password update for ' . $self->{'target'} . ' failed!';
+                }
+                system("chattr +ia $homedir/etc/$domain/shadow");
+                exit;
+            } elsif ( $self->{'opts'}->{'u'} ) {
+                system("chattr -ia $homedir/etc/$domain/shadow");
+                chomp(my $json = `/usr/bin/uapi --user $user --output=json Email passwd_pop email=$email domain=$domain password='$password'`);
+                my $status = JSON::decode_json($json);
+                if ( $status->{'result'}->{'status'} ) {
+                    print "[*] ${domain}'s shadow file unlocked and password for $self->{'target'} reset to $password\n";
+                } else {
+                    die '[!] Password update for ' . $self->{'target'} . ' failed!';
+                }
+               exit;
+            }
+            $webmail_session_url = $self->_makeSession('webmaild');
+        }
+        if (( $self->{'opts'}->{'i'} ) || ( ! $self->{'protected'} )) {
+            $cpanel_session_url =~ s/https:\/\/.*:([0-9]+)\//https:\/\/$self->{'ip'}:$1\//g if defined($cpanel_session_url);
+            $whm_session_url =~ s/https:\/\/.*:([0-9]+)\//https:\/\/$self->{'ip'}:$1\//g if defined($whm_session_url);
+            $webmail_session_url =~ s/https:\/\/.*:([0-9]+)\//https:\/\/$self->{'ip'}:$1\//g if defined($webmail_session_url);
+        }
+
+        print "Temporary login(s) for $self->{'target'}:\n";
+        print "\tcPanel: $cpanel_session_url\n" if defined($cpanel_session_url);
+        print "\tWHM: $whm_session_url\n" if defined($whm_session_url);
+        print "\tWebmail: $webmail_session_url\n" if defined($webmail_session_url);
+    } else {
+        my $password = $self->_generatePassword(16);
+        if ( $self->{'shortaction'} eq 'user' ) {
+            chomp(my $json = `/usr/sbin/whmapi1 --output=json passwd user=$self->{'target'} password='$password' db_pass_update=1`);
+            my $status = JSON::decode_json($json);
+            if ( $status->{'metadata'}->{'result'} ) {
+                print 'Password for ' . $self->{'target'} . ' reset to: ' . $password . "\n";
+            } else {
+                die '[!] Password update for ' . $self->{'target'} . ' failed!';
+            }
+        } elsif ( $self->{'shortaction'} eq 'mail' ) {
+            my ( $email, $domain ) = split(/(?:\@|\+)/, $self->{'target'});
+            my $user = $self->_getOwner($domain);
+            my (undef, undef, $uid, $gid, undef, undef, undef, $homedir, undef) = getpwnam($user);
+            my ($hashtype, $newpassword, $hashed, $shadowfile, @shadowentries);
+            my $backupfile = time; 
+            open(my $DAT, '<', '/etc/libuser.conf');
+            while(<$DAT>) {
+                if ( /^crypt_style = (.*)$/ ) {
+                    $hashtype = $1;
+                    last;
+                }
+            }
+            close($DAT);
+            my $password = $self->_generatePassword(16);
+            if (-f '/usr/bin/doveadm') {
+                if ( $hashtype eq 'md5' ) {
+                    $newpassword = `/usr/bin/doveadm pw -s MD5 -p "$password" -u $email`;
+                    $hashed = substr($newpassword, '5');
+                } elsif ( $hashtype eq 'sha512' ) {
+                    $newpassword = `/usr/bin/doveadm pw -s SHA512-CRYPT -p "$password" -u $email`;
+                    $hashed = substr($newpassword, '14');
+                } else {
+                    print $hashtype . "is not MD5 or SHA512-CRYPT!\n";
+                }
+            } else {
+                print "/usr/bin/doveadm is not present!\n";
+                exit;
+            }
+            chomp($hashed);
+            rename("$homedir/etc/$domain/shadow", "$homedir/etc/$domain/shadow.$backupfile");
+            {
+                open(my $SHADOWIN, '<', "$homedir/etc/$domain/shadow.$backupfile") or die $! . "\n";
+                local $/ = undef;
+                $shadowfile = <$SHADOWIN>;
+                close($SHADOWIN);
+            }
+            my @rows = split(/\n/, $shadowfile);
+            foreach my $row (@rows) {
+                my @columns = split(/:/, $row);
+                if ($columns[0] eq "$email") {
+                    $columns[1] = $hashed;
+                    $row = join(':', @columns);
+                    push(@shadowentries, $row . '::::::');
+                } else {
+                    push(@shadowentries, $row);
+                }
+            }
+            if ( $hashed ) {
+                print 'Password for ' . $self->{'target'} . ' reset to: ' . $password . "\n";
+                open(my $SHADOWOUT, '>', "$homedir/etc/$domain/shadow");
+                foreach my $line (@shadowentries) {
+                    chomp($line);
+                    print $SHADOWOUT $line . "\n";
+                }
+                close($SHADOWOUT);
+                chown($uid, $gid, "$homedir/etc/$domain/shadow");
+                chmod(0640, "$homedir/etc/$domain/shadow");
+            } else {
+                die '[!] Password update for ' . $self->{'target'} . ' failed!';
+            }
+        }
+    }
+}
+
+sub setPlesk () {
+    my $self = shift;
+    if ( $self->{'target'} ne 'admin' ) {
+        die '[!] setplesk only supports the admin user.';
+    }
+    if ( $self->{'toggle'} ) {
+        chomp(my $oldpass = `/usr/local/psa/bin/admin --show-password`);
+        my $password = $self->_generatePassword(16);
+        system('/usr/local/psa/bin/init_conf -u -passwd ' . $password . ' >/dev/null 2>&1');
+        $self->_saveOld($oldpass) unless $self->{'opts'}->{'d'};
+        $self->_createAtJob() unless $self->{'opts'}->{'d'};
+        $self->_generateOutput('Username' => $self->{'target'}, 'Password' => $password);
+    } else {
+        my ( $oldpass ) = $self->_getOld();
+        $self->_removeOld();
+        system("/usr/local/psa/bin/init_conf -u -passwd '$oldpass' >/dev/null 2>&1");
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setFtp () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my ( $user, $domain ) = split(/@|\+/, $self->{'target'});
+        my $owner = $self->_getOwner($domain);
+        my $oldpass;
+        open(my $fh, '<', '/etc/proftpd/' . $owner);
+            while(<$fh>) {
+                my ( $confuser, $confpass ) = split(':', $_);
+                if ( $confuser eq $self->{'target'} ) {
+                    $oldpass = $confpass;
+                    last;
+                }
+            }
+        close($fh);
+        die '[!] Cannot find specified FTP account' unless $oldpass;
+        my $password = $self->_generatePassword(16);
+        if ( -x '/usr/bin/uapi' ) {
+            chomp(my $json = qx{/usr/bin/uapi --user $owner --output=json Ftp passwd user=$user domain=$domain pass='$password'});
+            my $status = JSON::decode_json($json);
+            die '[!] Password update for ' . $self->{'target'} . ' failed!'
+                unless $status->{'result'}->{'status'};
+        } elsif ( -x '/usr/local/cpanel/bin/proftpd_passwd' ) {
+            system('/usr/local/cpanel/bin/proftpd_passwd ' . $owner . ' -p ' . $self->{'target'} . ':' . $password);
+        } else {
+            die '[!] Password update binaries not found!\n';
+        }
+        $self->_saveOld($oldpass) unless $self->{'opts'}->{'d'};
+        $self->_createAtJob() unless $self->{'opts'}->{'d'};
+        $self->_generateOutput('Username' => $self->{'target'}, 'Password' => $password);
+    } else {
+        my ( $user, $domain ) = split(/@|\+/, $self->{'target'});
+        my ( $oldpass ) = $self->_getOld();
+        $self->_removeOld();
+        my $owner = $self->_getOwner($domain);
+        open(my $fh, '<', '/etc/proftpd/' . $owner);
+            my @original = <$fh>;
+        close($fh);
+        open($fh, '>', '/etc/proftpd/' . $owner);
+            foreach my $line ( @original ) {
+                chomp($line);
+                if ( $line =~ /^$self->{'target'}:(.*)$/ ) {
+                    $line =~ s/^$self->{'target'}:.*?:/$self->{'target'}:$oldpass:/g;
+                }
+                print $fh $line . "\n";
+            }
+        close($fh);
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setWp () {
+    my $self = shift;
+    print "[!] Possible multisite install detected.\n" if ( $self->{'prefix'} =~ /^[0-9a-zA-Z\-]+\_[0-9]+\_$/ );
+    if ( $self->{'toggle'} ) {
+        my @ids = $self->_runMySQL('SELECT DISTINCT umeta.user_id,umeta.umeta_id FROM ' . $self->{'prefix'} . 'usermeta AS umeta JOIN ' . $self->{'prefix'} . 'users AS wpusers ON wpusers.ID = umeta.user_id WHERE meta_key LIKE "%capabilities%" AND meta_value LIKE "%admin%" ORDER BY umeta_id');
+        foreach my $id ( @ids ) {
+            my ( $user ) = $self->_runMySQL('SELECT user_login FROM ' . $self->{'prefix'} . 'users WHERE id = ' . $id);
+            my ( $oldpass ) = $self->_runMySQL('SELECT user_pass FROM ' . $self->{'prefix'} . 'users WHERE id = ' . $id);
+            my $password = $self->_generatePassword(16);
+            $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'users SET user_pass=MD5("' . $password . '") WHERE ID = ' . $id);
+            $self->_saveOld($user, $oldpass) unless $self->{'opts'}->{'d'};
+            my ( $siteurl ) = $self->_runMySQL('SELECT option_value FROM ' . $self->{'prefix'} . 'options WHERE option_name = "siteurl"');
+            $self->_createAtJob() unless $self->{'opts'}->{'d'};
+            $self->_generateOutput('AdminURL' => $siteurl . '/wp-admin', 'Username' => $user, 'Password' => $password);
+            last unless $self->{'opts'}->{'d'};
+        }
+    } else {
+        my ( $olduser, $oldpass ) = $self->_getOld();
+        my ( $id ) = $self->_runMySQL('SELECT ID FROM ' . $self->{'prefix'} . 'users WHERE user_login = "' . $olduser . '"');
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'users SET user_pass = "' . $oldpass . '" WHERE ID = ' . $id);
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setJoomla () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my ( $json ) = $self->_runMySQL('SELECT rules FROM ' . $self->{'prefix'} . 'assets WHERE parent_id = 0');
+        my $data = JSON::decode_json($json);
+        my @group_ids;
+        foreach my $id ( keys %{$data->{'core.admin'}} ) {
+            push(@group_ids, $id);
+        }
+        foreach my $id ( keys %{$data->{'core.manage'}} ) {
+            push(@group_ids, $id);
+        }
+        my @admins;
+        foreach my $id ( @group_ids ) {
+            my ( $username ) = $self->_runMySQL('SELECT username FROM ' . $self->{'prefix'} . 'users users INNER JOIN ' . $self->{'prefix'} . 'user_usergroup_map usergroup_map ON usergroup_map.user_id = users.id WHERE usergroup_map.group_id = ' . $id);
+            push(@admins, $username);
+        }
+        die '[!] Could not determine admin user. Must be toggled manually. This may be due to this joomla install being too out of date.' unless @admins;
+        foreach my $admin ( @admins ) {
+            my ( $oldpass ) = $self->_runMySQL('SELECT password FROM ' . $self->{'prefix'} . 'users WHERE username = "' . $admin . '"');
+            my $password = $self->_generatePassword(16);
+            my $salt = $self->_generatePassword(8);
+            my $hashed = Digest::MD5::md5_hex($password . $salt);
+            my $hash = $hashed . ':' . $salt;
+            chomp($hash);
+            $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'users SET password = "' . $hash . '" WHERE username = "' . $admin . '"');
+            $self->_saveOld($admin, $oldpass) unless $self->{'opts'}->{'d'};
+            $self->_createAtJob() unless $self->{'opts'}->{'d'};
+            $self->_generateOutput('Username' => $admin, 'Password' => $password);
+            last unless $self->{'opt'}->{'d'};
+        }
+    } else {
+        my ( $olduser, $oldpass ) = $self->_getOld();
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'users SET password = "' . $oldpass . '" WHERE username = "' . $olduser . '"');
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setDrupal () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my ( $user ) = $self->_runMySQL('SELECT name FROM ' . $self->{'prefix'} . 'users WHERE uid = 1');
+        my ( $oldpass ) = $self->_runMySQL('SELECT pass FROM ' . $self->{'prefix'} . 'users WHERE uid = 1');
+        my ( $siteurl ) = $self->_runMySQL('SELECT location FROM ' . $self->{'prefix'} . 'watchdog LIMIT 1');
+        $siteurl =~ s/^http:\/\///g;
+        $siteurl =~ s/^www\.//g;
+        my @siteurlparts = split('/', $siteurl);
+        my $domain = shift(@siteurlparts);
+        pop(@siteurlparts);
+        my $owner = $self->_getOwner($domain);
+        my $siteroot = $self->_getDocRoot($owner, $domain);
+        my $path = $siteroot . '/' . join('/', @siteurlparts);
+        die '[!] Unable to locate drupal docroot directory.' unless -d $path;
+        my $password = $self->_generatePassword(16);
+        my $hash;
+        open(my $f, '-|', 'cd ' . $path . ' && sudo -u ' . $owner . ' php-cli ./scripts/password-hash.sh "' . $password . '"');
+            while(<$f>) {
+                if ( /hash:\s+(.*)$/ ) {
+                    $hash = $1;
+                    last;
+                }
+            }
+        close($f);
+        die '[!] Unable to generate drupal password hash.' unless defined($hash);
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'users SET pass="' . $hash . '" WHERE uid = 1');
+        $self->_saveOld($user, $oldpass) unless $self->{'opts'}->{'d'};
+        $self->_createAtJob() unless $self->{'opts'}->{'d'};
+        $self->_generateOutput('Username' => $user, 'Password' => $password);
+    } else {
+        my ( $oldpass ) = $self->_getOld();
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'users SET pass="' . $oldpass . '" WHERE uid = 1');
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setMagento () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my ( $user ) = $self->_runMySQL('SELECT username FROM ' . $self->{'prefix'} . 'admin_user WHERE is_active = 1 LIMIT 1');
+        my ( $oldpass ) = $self->_runMySQL('SELECT password FROM ' . $self->{'prefix'} . 'admin_user WHERE username = "' . $user . '" LIMIT 1');
+        die '[!] Unable to find admin user. Must be toggled manually.' unless ( $user && $oldpass );
+        my $password = $self->_generatePassword(16);
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'admin_user SET password = MD5("' . $password . '") WHERE username = "' . $user . '"');
+        $self->_saveOld($user, $oldpass) unless $self->{'opts'}->{'d'};
+        $self->_createAtJob() unless $self->{'opts'}->{'d'};
+        $self->_generateOutput('Username' => $user, 'Password' => $password);
+    } else {
+        my ( $olduser, $oldpass ) = $self->_getOld();
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'admin_user SET password = "' . $oldpass . '" WHERE username = "' . $olduser . '"');
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setZencart () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my @ids = $self->_runMySQL('SELECT admin_id FROM ' . $self->{'prefix'} . 'admin');
+        foreach my $id ( @ids ) {
+            my ( $user ) = $self->_runMySQL('SELECT admin_name FROM ' . $self->{'prefix'} . 'admin WHERE admin_id = ' . $id);
+            my ( $oldpass ) = $self->_runMySQL('SELECT admin_pass FROM ' . $self->{'prefix'} . 'admin WHERE admin_id = ' . $id);
+            die '[!] Unable to find admin user. Mus tbe toggled manually.' unless ( $user && $oldpass );
+            my $password = $self->_generatePassword(16);
+            my $salt = substr(Digest::MD5::md5_hex($password), 0, 2);
+            my $hash = Digest::MD5::md5_hex($salt . $password);
+            $hash = $hash . ':' . $salt;
+            $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'admin SET admin_pass = "' . $hash . '" WHERE admin_id = ' . $id);
+            $self->_saveOld($user, $oldpass) unless $self->{'opts'}->{'d'};
+            $self->_createAtJob() unless $self->{'opts'}->{'d'};
+            $self->_generateOutput('Username' => $user, 'Password' => $password);
+            last unless $self->{'opts'}->{'d'};
+        }
+    } else {
+        my ( $olduser, $oldpass ) = $self->_getOld();
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'admin SET password = "' . $oldpass . '" WHERE admin_name = "' . $olduser . '"');
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setVb () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my ( $group ) = $self->_runMySQL('SELECT usergroupid FROM ' . $self->{'prefix'} . 'usergroup WHERE usertitle = "Administrator"');
+        my ( $adminuser ) = $self->_runMySQL('SELECT username FROM ' . $self->{'prefix'} . 'user WHERE usergroupid = "' . $group . '" LIMIT 1');
+        my ( $adminpass ) = $self->_runMySQL('SELECT password FROM ' . $self->{'prefix'} . 'user WHERE usergroupid = "' . $group . '" AND username = "' . $adminuser . '"');
+        my ( $adminsalt ) = $self->_runMySQL('SELECT salt FROM ' . $self->{'prefix'} . 'user WHERE usergroupid = "' . $group . '" AND username = "' . $adminuser . '"');
+        my $password = $self->_generatePassword(16);
+        my $salt = $self->_generatePassword(16);
+        my $one = Digest::MD5::md5_hex($password);
+        my $hash = Digest::MD5::md5_hex($one, $salt);
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'user SET password = "' . $hash . '", salt = "' . $salt . '" WHERE usergroupid = "' . $group . '" AND username = "' . $adminuser . '"');
+        $self->_saveOld($group, $adminuser, $adminpass, $adminsalt) unless $self->{'opts'}->{'d'};
+        $self->_createAtJob() unless $self->{'opts'}->{'d'};
+        $self->_generateOutput('Username' => $adminuser, 'Password' => $password);
+    } else {
+        my ( $group, $olduser, $oldpass, $oldsalt ) = $self->_getOld();
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'user SET password = "' . $oldpass . '", salt = "' . $oldsalt . '" WHERE usergroupid = "' . $group . '" AND username = "' . $olduser . '"');
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setWhmcs () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my ( $user ) = $self->_runMySQL('SELECT username FROM ' . $self->{'prefix'} . 'admins WHERE roleid = 1 LIMIT 1');
+        my ( $oldpass ) = $self->_runMySQL('SELECT password FROM ' . $self->{'prefix'} . 'admins WHERE roleid = 1 LIMIT 1');
+        my $password = $self->_generatePassword(16);
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'admins SET password = MD5("' . $password . '") WHERE username = "' . $user . '"');
+        $self->_saveOld($user, $oldpass) unless $self->{'opts'}->{'d'};
+        $self->_createAtJob() unless $self->{'opts'}->{'d'};
+        $self->_generateOutput('Username' => $user, 'Password' => $password);
+    } else {
+        my ( $olduser, $oldpass ) = $self->_getOld();
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'admins SET password = "' . $oldpass . '" WHERE username = "' . $olduser . '"');
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setPhpbb () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my ( $group ) = $self->_runMySQL('SELECT group_id FROM ' . $self->{'prefix'} . 'groups WHERE group_name = "ADMINISTRATORS" LIMIT 1');
+        my ( $user ) = $self->_runMySQL('SELECT username FROM ' . $self->{'prefix'} . 'users WHERE group_id = "' . $group . '" LIMIT 1');
+        my ( $oldpass ) = $self->_runMySQL('SELECT user_password FROM ' . $self->{'prefix'} . 'users WHERE group_id = "' . $group . '" AND username = "' . $user . '"');
+        my $password = $self->_generatePassword(16);
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'users SET user_password = MD5("' . $password . '") WHERE group_id = "' . $group . '" AND username = "' . $user . '"');
+        $self->_saveOld($group, $user, $oldpass) unless $self->{'opts'}->{'d'};
+        $self->_createAtJob() unless $self->{'opts'}->{'d'};
+        $self->_generateOutput('Username' => $user, 'Password' => $password);
+    } else {
+        my ( $oldgroup, $olduser, $oldpass ) = $self->_getOld();
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'users SET user_password = "' . $oldpass . '" WHERE group_id = "' . $oldgroup . '" AND username = "' . $olduser . '"');
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub setSmf () {
+    my $self = shift;
+    if ( $self->{'toggle'} ) {
+        my ( $group ) = $self->_runMySQL('SELECT id_group FROM ' . $self->{'prefix'} . 'membergroups WHERE group_name = "Administrator" LIMIT 1');
+        my ( $user ) = $self->_runMySQL('SELECT member_name FROM ' . $self->{'prefix'} . 'members WHERE id_group = "' . $group . '" LIMIT 1');
+        my ( $oldpass ) = $self->_runMySQL('SELECT passwd FROM ' . $self->{'prefix'} . 'members WHERE id_group = "' . $group . '" AND member_name = "' . $user . '"');
+        my ( $oldsalt ) = $self->_runMySQL('SELECT password_salt FROM ' . $self->{'prefix'} . 'members WHERE id_group = "' . $group . '" AND member_name = "' . $user . '"');
+        my $password = $self->_generatePassword(16);
+        my $salt = $self->_generatePassword(16);
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'members SET passwd = SHA1("' . $user . $password . '") WHERE id_group = "' . $group . '" AND member_name = "' . $user . '"');
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'members SET password_salt = "' . $salt . '" WHERE id_group = "' . $group . '" AND member_name = "' . $user . '"');
+        $self->_saveOld($group, $user, $oldpass, $oldsalt) unless $self->{'opts'}->{'d'};
+        $self->_createAtJob() unless $self->{'opts'}->{'d'};
+        $self->_generateOutput('Username' => $user, 'Password' => $password);
+    } else {
+        my ( $oldgroup, $olduser, $oldpass, $oldsalt ) = $self->_getOld();
+        $self->_runMySQL('UPDATE ' . $self->{'prefix'} . 'members SET passwd = "' . $oldpass . '", password_salt = "' . $oldsalt . '" WHERE id_group = "' . $oldgroup . '" AND member_name = "' . $olduser . '"');
+        $self->_removeOld();
+        print "[*] Original password restored.\n";
+    }
+    return 1;
+}
+
+sub _usage () {
+    my $self = shift;
+    print "Usage: $0 <action> <username|email|ftpaccount|database>\n";
+    print qq(
+Options:
+        -d      reset the password instead of toggle it
+        -l      will reset the user password and lock it using passwd.
+        -u      will unlock the user and reset it's password.
+        -i      replaces the hostname in any url's with the IP. This is done automatically on dedi/vps
+Actions:
+        System -
+                setuser|unsetuser <user>
+                setmail|unsetmail <email address>
+                setftp|unsetftp <ftp\@user>
+                setplesk|unsetplesk <user>
+        WebApp -
+                setwp|unsetwp <database>
+                setjoomla|unsetjoomla <database>
+                setdrupal|unsetdrupal <database>
+                setmagento|unsetmagento <database>
+                setzencart|unsetzencart <database>
+                setvb|unsetvb <database>
+                setwhmcs|unsetwhmcs <database>
+                setphpbb|unsetphpbb <database>
+                setsmf|unsetsmf <database>
+
+Examples:
+        pwtemp setuser bob
+                # cpanel user 'bob' is given a temporary password, which is displayed to you.
+                # this user's password will be reverted to the original value after 15min.
+                # (useful to gain temporary access to bob's account)
+
+        pwtemp unsetuser bob
+                # cpanel user 'bob', if he still has a temporary password, will immediately
+                # have his original password restored, skipping the remainder of the 15min.
+                # (useful to allow bob to access his own account without waiting)
+
+        pwtemp setuser -d alice
+        pwtemp setuser -d alice\@ali.ce
+                # give cPanel user 'alice' and email account 'alice\@ali.ce' new passwords,
+                # permanently replacing the old passwords.
+                # (useful if alice\@ali.ce (owned by alice) is currently authing lots of spam)
+);
+    exit(1);
+}
+
+sub _loadModules {
+    my $self = shift;
+    my @modules = qw(
+        Cwd
+        File::Copy
+        Digest::MD5
+        YAML::Tiny
+        Config::Tiny
+        DBI
+        JSON
+    );
+    my @missing_modules;
+    # attempt to load each module we need. Most of which are builtins now, if it can't load them, yum install them then import them into our namespace
+    foreach my $module ( @modules ) {
+        my $modfile = $module;
+        $modfile =~ s/\:\:/\//g;
+        eval { require $modfile . '.pm' };
+        push(@missing_modules, $module) if $@;
+    }
+    if ( @missing_modules ) {
+        print '[!] Missing the following required modules: ' . join(' ', @missing_modules) . " - Attempting to install...\n";
+        _downloadModules(\@missing_modules);
+    }
+    foreach my $module ( @modules ) {
+        Module::Load::load($module);
+    }
+}
+
+sub _setupEnvironment () {
+    # makes sure our toggle dir exists and that at is running
+    my $self = shift;
+    if ( ! -d '/root/.pwtemptoggle' ) {
+        mkdir('/root/.pwtemptoggle');
+        chmod(0700, '/root/.pwtemptoggle');
+    }
+    if (( ! -f '/etc/init.d/atd' ) && ( ! -f '/usr/lib/systemd/system/atd.service' )) {
+        print "[!] at is not installed - Attempting to install...\n";
+        system('yum', 'install', 'at', '-y');
+    }
+    chomp(my @processes = `ps x -ocommand`);
+    if ( ! grep(/^\/usr\/sbin\/atd/, @processes) ) {
+        print "[!] atd not running - Attempting to start...\n";
+        if ( -f '/etc/init.d/atd' ) {
+            system('/etc/init.d/atd', 'start');
+            system('chkconfig', 'atd', 'on');
+        } elsif ( -f '/usr/lib/systemd/system/atd.service' ) {
+            system('systemctl', 'start', 'atd');
+            system('systemctl', 'enable', 'atd');
+        }
+    }
+    return 1;
+}
+
+sub _checkFullDisk () {
+    # we can't save our temporary passwords if we can't write to the disk, so make sure we can
+    my $self = shift;
+    my $epoch = time();
+    open(my $fh, '>', '/root/.pwtemptoggle/test.' . $epoch);
+        print $fh $epoch;
+    close($fh);
+    if ( ! -f '/root/.pwtemptoggle/test.' . $epoch ) {
+        die '[!] Unable to write to disk, check diskspace for /';
+    }
+    open($fh, '<', '/root/.pwtemptoggle/test.' . $epoch);
+        my $check = <$fh>;
+    close($fh);
+    if ( $epoch != $check ) {
+        die '[!] Unable to write to disk, check diskspace for /\n';
+    }
+    unlink('/root/.pwtemptoggle/test.' . $epoch);
+    return 1;
+}
+
+sub _findTarget () {
+    # if the user doesn't specify a target (but does specify an action) we can determine what target they mean
+    my $self = shift;
+    if ( $self->{'shortaction'} eq 'user' ) {
+        if ( Cwd->cwd() =~ /^\/home(?:[0-9]+)?\/([a-zA-Z0-9]{1,16})/ ) {
+            $self->{'target'} = $1;
+        }
+    } elsif ( $self->{'webapp'} ) {
+        my %confs = (
+            'wp' => {
+                config => 'wp-config.php',
+                matches => [
+                    "define\\\('DB_NAME', '([0-9a-zA-Z\-\_]+)'\\\);",
+                ],
+            },
+            'drupal' => {
+                config => 'sites/default/settings.php',
+                matches => [
+                    "'database' => '([0-9a-zA-Z\-\_]+)',",
+                    q(\$db_url = 'mysqli:\/\/\S+:\S+@\s+\/([0-9a-zA-Z\-_]+)';),
+                ],
+            },
+            'joomla' => {
+                config => 'configuration.php',
+                matches => [
+                    "\\\$db\\\ =\\\ '([0-9a-zA-Z\-\_]+)';",
+                ],
+            },
+            'magento' => {
+                config => 'app/etc/local.xml',
+                matches => [
+                    "<dbname><!\\\[CDATA\\\[([0-9a-zA-Z\-\_]+)\\\]\\\]><\\\/dbname>",
+                ],
+            },
+            'zencart' => {
+                config => 'includes/configure.php',
+                matches => [
+                    "define\\\('DB_DATABASE', '([0-9a-zA-Z_]+)'\\\);",
+                ],
+            },
+            'vb' => {
+                config => 'includes/config.php',
+                matches => [
+                    "\\\$config\\\['Database']\\\['dbname'] = '([0-9a-zA-Z\-\_]+)';",
+                ],
+            },
+            'whmcs' => {
+                config => 'configuration.php',
+                matches => [
+                    "\\\$db_name = [\"']([0-9a-zA-Z\-\_]+)[\"'];",
+                ],
+            },
+            'phpbb' => {
+                config => 'config.php',
+                matches => [
+                    "\\\$dbname = '([a-zA-Z0-9\-\_]+)';",
+                ],
+            },
+            'smf' => {
+                config => 'Settings.php',
+                matches => [
+                    "\\\$db_name = '([a-zA-Z0-9\-\_]+)';",
+                ],
+            },
+        );
+        if ( -f $confs{$self->{'shortaction'}}->{'config'} ) {
+            open(my $fh, '<', $confs{$self->{'shortaction'}}->{'config'});
+                foreach my $match ( @{$confs{$self->{'shortaction'}}->{'matches'}} ) {
+                    while(<$fh>) {
+                        next if /^(\s+)?(#|\*)/;
+                        if ( /$match/ ) {
+                            $self->{'target'} = $1;
+                            last;
+                        }
+                    }
+                }
+            close($fh);
+        }
+    }
+    if ( ! defined($self->{'target'}) ) {
+        die '[!] No target specified and no configuration file found for specified action'
+    }
+    return 1;
+}
+
+sub _findPrefix () {
+    # determines the database prefix of a CMS
+    my $self = shift;
+    my $shortaction = $self->{'shortaction'};
+    my %tables = (
+        'wp' => 'usermeta',
+        'drupal' => 'system',
+        'joomla' => 'session',
+        'magento' => 'core_config_data',
+        'zencart' => 'admin',
+        'vb' => 'administrator',
+        'whmcs' => 'admins',
+        'phpbb' => 'smilies',
+        'smf' => 'smileys',
+    );
+    foreach my $table ( $self->_runMySQL('SHOW TABLES') ) {
+        if ($shortaction eq 'wp' && ! Cwd->cwd() =~ /^\/(ramdisk\/)?root$/) {
+            open(my $WPC, '<', 'wp-config.php') or die "Could not open wp-config.php in current directory $!";
+            while (<$WPC>) {
+                $self->{'prefix'} = $1 if ($_ =~ m/\$table_prefix\s+=\s+'([\w\d\-\.]+)'\;/);
+            }
+            close($WPC);
+            last;
+        } elsif ( $table =~ /^([a-zA-Z0-9_]+)$tables{$shortaction}$/ ) {
+            $self->{'prefix'} = $1;
+            last;
+        } elsif ( $table =~ /^$tables{$shortaction}$/ ) {
+            $self->{'prefix'} = '';
+            last;
+        }
+    }
+    unless ( defined($self->{'prefix'}) ) {
+        die '[!] Unable to determine prefix for database.';
+    }
+    return 1;
+}
+
+sub _checkToggle () {
+    # checks to see if the user is already toggled
+    my $self = shift;
+    if ( -s '/root/.pwtemptoggle/' . $self->{'target'} ) {
+        print '[!] User already toggled! Would you like to untoggle them? [y|N]: ';
+        chomp(my $answer = <STDIN>);
+        if ( $answer =~ /^y/i ) {
+            system("$0 unset$self->{'shortaction'} $self->{'target'}");
+        }
+        exit();
+    }
+    return 1;
+}
+
+sub _runMySQL ($) {
+    # runs mysql queries. Takes the query as input, returns the results as an array. Can only return one column worth of data at a time
+    my $self = shift;
+    my $query = shift;
+    $self->{'dbh'}->do('USE ' . $self->{'target'});
+    my $sth = $self->{'dbh'}->prepare($query);
+    $sth->execute();
+    if ( $query =~ /^UPDATE/i ) {
+        return 1;
+    } else { 
+        my @result = @{$sth->fetchall_arrayref()};
+        return(map { $_->[0] } @result);
+    }
+}
+    
+sub _generateOutput (\@) {
+    # our script output including the user, password, and other random data depending on the toggle being used
+    my $self = shift;
+    my @output = @_;
+    print "[*] Generated Password:\n";
+    while ( @output ) {
+        print "\t" . shift(@output) . ': ' . shift(@output) . "\n";
+    }
+    print "[*] This password will expire in 15 minutes.\n" unless $self->{'opts'}->{'d'};
+    return 1;
+}
+
+sub _saveOld (@) {
+    # saves the old login information to our toggle directory. This is what is parsed when we do our password reversal
+    my $self = shift;
+    my $inputs = join('|', @_);
+    open(my $fh, '>', '/root/.pwtemptoggle/' . $self->{'target'});
+        print $fh $inputs;
+    close($fh);
+    chmod(0400, '/root/.pwtemptoggle/' . $self->{'target'});
+    open($fh, '<', '/root/.pwtemptoggle/' . $self->{'target'});
+        my $check = <$fh>;
+    close($fh);
+    if ( $check ne $inputs ) {
+        unlink('/root/.pwtemptoggle/' . $self->{'target'});
+        die '[!] Backing up old password to [/root/.pwtemptoggle/' . $self->{'target'} . '] failed! Not continuing!';
+    }
+    return 1;
+}
+
+sub _getOld () {
+    # returns the old information from the toggle file
+    my $self = shift;
+    die '[!] ' . $self->{'target'} . ' is not currently toggled.' unless -f '/root/.pwtemptoggle/' . $self->{'target'};
+    open(my $fh, '<', '/root/.pwtemptoggle/' . $self->{'target'});
+        my $oldinfo = <$fh>;
+    close($fh);
+    return(split(/\|/, $oldinfo));
+}
+
+sub _removeOld () {
+    # removes our old toggle file after a password has been restored, also handles cleaning up an at job for the toggle if one exists
+    my $self = shift;
+    unlink('/root/.pwtemptoggle/' . $self->{'target'});
+    open(my $f, '-|', '/usr/bin/atq');
+        while(<$f>) {
+            my $job = $1 if /^([0-9]+)\s/;
+            open(my $f, '-|', '/usr/bin/at -c ' . $job);
+                my @jobtasks = <$f>;
+                if ( grep(/^$0\s$self->{'action'}\s$self->{'target'}\s/, @jobtasks) ) {
+                    system('/usr/bin/atrm', $job);
+                    return 1;
+                }
+            close($f);
+        }
+    close($f);
+    return 0;
+} 
+
+sub _createAtJob () {
+    # creates an at job to automatically revert the password after 15 minutes
+    my $self = shift;
+    my $command = "$0 unset$self->{'shortaction'} $self->{'target'} >/dev/null 2>&1";
+    system('echo "' . $command . '" | at now + 15 minute >/dev/null 2>&1');
+    return 1;
+}
+
+sub _makeSession ($) {
+    # generates a cpanel/whm/mail session using the whm API
+    my $self = shift;
+    my $service = shift;
+    my $yaml = `/usr/sbin/whmapi1 create_user_session user=$self->{'target'} service=$service locale=en`;
+    my $data = YAML::Tiny::Load($yaml);
+    my $session_url = $data->{'data'}->{'url'};
+    return($session_url);
+}
+
+sub _isReseller () {
+    # returns true if a user is a reseller
+    my $self = shift;
+    if ( $self->{'target'} eq 'root' ) {
+        return 1;
+    }
+    open(my $fh, '<', '/var/cpanel/resellers');
+        while(<$fh>) {
+            if ( /^$self->{'target'}:/ ) {
+                return 1;
+            }
+        }
+    close($fh);
+    return 0;
+}
+
+sub _getProtected () {
+    # we don't want to let people toggle root on shared/reseller boxes, so we check for that here
+    return 1 if -f '/usr/local/cpanel/Cpanel/Security/Policy/RootRestrict.pm';
+    my @domains = qw(
+        accountservergroup.com
+        apthost.com
+        arvixe.com
+        arvixeshared.com
+        asoshared.com
+        bigrock.com
+        bluehost.com
+        bluehost.in
+        cloudhosted.com
+        digitalcloud.com
+        ehosts.com
+        hostclear.com
+        hostfinity.com
+        hostgator.cl
+        hostgator.co
+        hostgator.com
+        hostgator.com.br
+        hostgator.com.tr
+        hostgator.in
+        hostgator.mx
+        hou.hostgator.com
+        ideahost.com
+        myserverhosts.com
+        mysitehosted.com
+        prodns.cl
+        prodns.com.br
+        prodns.com.co
+        prodns.mx
+        site5.com
+        webhostbox.net
+        webhostsunucusu.com
+        webserversystems.com
+        websitewelcome.com
+    );
+    my $hostname = hostname();
+    if ( grep { $hostname =~ /$_$/ } @domains ) {
+        return 1;
+    } else {
+        return 0;
+    }
+}   
+
+sub _getUsers () {
+    # returns a list of cPanel users
+    my @users;
+    open(my $fh, '<', '/etc/trueuserdomains') or return([]);
+        while(<$fh>) {
+            push(@users, (split(': ', $_))[1]);
+        }
+    close($fh);
+    chomp(@users);
+    return(\@users);
+}
+
+sub _getMySQL () {
+    # we have to load MySQL login information from a special place for Plesk, otherwise we can just use /root/.my.cnf
+    my ( $user, $password );
+    if ( -f '/etc/psa/.psa.shadow' ) {
+        open(my $fh, '<', '/etc/psa/.psa.shadow');
+            $user = 'admin';
+            $password = do { local $/; <$fh> };
+        close($fh);
+    } else {
+        my $config = Config::Tiny->read('/root/.my.cnf');
+        $user = $config->{'client'}->{'user'};
+        if ( defined($config->{'client'}->{'password'}) ) {
+            $password = $config->{'client'}->{'password'};
+        } else {
+            $password = $config->{'client'}->{'pass'};
+        }
+        $user =~ s/(^['"]|['"]$)//g;
+        $password =~ s/(^['"]|['"]$)//g;
+    }
+    my $dbh = DBI->connect('DBI:mysql:;host=localhost', $user, $password) or die '[!] MySQL is not running or unable to connect';
+    return($dbh);
+}
+
+sub _downloadModules (\@) {
+    # installs perl modules
+    my $missing_modules = shift;
+    my $missing_modules_yum = _convertToPackageName($missing_modules);
+    print "[*] Running yum install --disableexcludes=all -y @{$missing_modules_yum} in the background...\n";
+    my @output = `yum install --disableexcludes=all -y @{$missing_modules_yum}`;
+    if (( grep(/Nothing to do/, @output) ) || ( $? )) {
+        print '[!] Yum failed, attempting to install from CPAN...';
+        my $cpanbin = -x '/usr/local/cpanel/scripts/perlinstaller' ? '/usr/local/cpanel/scripts/perlinstaller' : '/usr/bin/cpan';
+        system($cpanbin . " @{$missing_modules} 2>/dev/null 1>/dev/null");
+        if ( $? ) {
+            die "[!] Could not install missing modules [@{$missing_modules}], please notify your supervisor\n";
+        } else {
+            print "\n";
+        }
+    }   
+    return 1;
+}
+
+sub _convertToPackageName (\@) {
+    # at this time, all our non builtin modules are available through yum and hgrepo. So we should just be able to yum install them
+    my $missing_modules = shift;
+    $missing_modules = [ map { 'perl-' . $_ } @{$missing_modules} ];
+    s/\:\:/\-/g for @{$missing_modules};
+    return($missing_modules);
+}
+
+sub _generatePassword ($) {
+    # this generates a random password, it's only input is the length you want. I also use this to generate salts when needed.
+    my $self = shift;
+    my $length = shift;
+    my @chars = ('A'..'Z','a'..'z','0'..'9');
+    my $string;
+    for ( my $i = 1; $i <= $length; $i++ ) {
+        $string .= $chars[rand(scalar(@chars))];
+    }
+    return($string);
+}
+
+sub _checkCpanel () {
+    # returns true if the server is a cpanel server
+    my $self = shift;
+    if ( ! -d '/usr/local/cpanel' ) {
+        die '[!] This functionality is only available on cPanel servers.';
+    }
+    chomp(my @license = `/usr/local/cpanel/cpkeyclt`);
+    if ( grep(/Error/, @license) ) {
+        print '[!] Cpanel license appears to be expired or invalid. Session generation may fail.';
+    }
+    return 1;
+}
+
+sub _getOwner ($) {
+    # returns the posix user that owns a cPanel domain
+    my $self = shift;
+    my $domain = shift;
+    my $user;
+    open(my $fh, '<', '/etc/userdomains');
+        while(<$fh>) {
+            if ( /^$domain:\s([a-zA-Z0-9]+)$/ ) {
+                $user = $1;
+                last;
+            }
+        }
+    close($fh);
+    if ( ! defined($user) ) {
+        die '[!] Unable to determine owner for [' . $self->{'target'} . ']';
+    }
+    return($user);
+}
+
+sub _getDocRoot ($$) {
+    # returns the docroot for a specified users specified domain
+    my $self = shift;
+    my $user = shift;
+    my $domain = shift;
+    if ( ! -f '/var/cpanel/userdata/' . $user . '/' . $domain ) {
+        die '[!] Unable to get userdata for owner of specified site.';
+    }
+    my $docroot;
+    open(my $fh, '<', '/var/cpanel/userdata/' . $user . '/' . $domain);
+        while(<$fh>) {
+            if ( /^documentroot:\s+(.*)$/ ) {
+                $docroot = $1;
+            }
+        }
+    close($fh);
+    unless ( defined($docroot) ) {
+        die '[!] Unable to find docroot for specified site.';
+    }
+    return($docroot);
+}
+
+__END__

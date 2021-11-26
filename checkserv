@@ -1,0 +1,198 @@
+#!/usr/bin/python
+# $Date: 2013-10-03 $
+# $Revision: 2.0 $
+# $Source: /root/bin/checksrv $
+# $Author: Wesley Nugent $
+# Make /var/log/chkservd.log pretty
+# https://gatorwiki.hostgator.com/Admin/RootBin#checkserv
+# http://git.toolbox.hostgator.com/checkserv
+# Please submit all bug reports at projects.hostgator.com
+# https://projects.hostgator.com/projects/script-checkserv/issues/new
+
+#Import regex, sys, and getopt modules from Python
+import re,sys,getopt
+
+#define header
+header = "--------------------------------------\n\tChksrvd Log Parser v2.0\n--------------------------------------\n\n"
+
+#declare lists to store the matched failed services for parsing.
+failedlist = []
+combinedlist = []
+
+#These are the regex checks for getting the beginning and ending of the portion of the log we're checking. 
+#This is to handle multiple lines in the log file.
+finished = re.compile(r"^Service\sCheck\sF")
+started = re.compile(r"^\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s[+,-]\d{4}\]\sDisk\scheck")
+
+#This regex checks for a failure, which is :- 
+failed = re.compile('\:\-')
+
+#Default number of results 5
+numresults = 5
+
+#function to parse the last numresults etries.
+def parse_last():
+
+	#initial variables for this function to track what lines to check and the number of matches.
+	count=0
+	found="No"
+
+	#loop to read /var/log/chkservd.log backwards.
+	for line in reversed(open("/var/log/chkservd.log").readlines()):
+
+		#check to see if we found our regex so we can check the results.
+		if found == "Yes":
+			
+			#second check to see if we've hit the end of our block. 
+			#This is the start because we're reading backwards.
+			check2 = started.search(line.rstrip())
+			
+			#The result of != None means we have matched our regex and ended our block.
+			if check2 != None:
+
+				#Since we're reading backwards, reverse the list then join it in a single string.
+				combinedlist.reverse()
+				combinedlst = ''.join(combinedlist)
+		
+				#set found back to No so we can leave the loop then remove the combinedlist.
+				found = "No"
+				del combinedlist
+
+				#Quick check of entire log entry (single check) to see if we had a failure.
+				if failed.search(combinedlst) != None:
+
+					#Failure found, pass to parse_line for logging.
+                                        parse_line(combinedlst)
+
+					#Since we found a failure, check to see if we want a certain number of results. 
+					if numresults != 0:
+						
+						#We are looking for a certain number of results, increase count.
+						count += 1
+	
+						#Check count and compare it to numresults, if greater or equal, break out of the loop.
+						if count >= numresults:
+							break
+			else:		
+
+				#The result of check2 was None, so we need to append the line to the list.
+				combinedlist.append(line)
+
+		else:
+
+			#Found is no. This means we are checking for the end of the check since we're reading backwards.
+			#Declare a new combinedlist to combine lines of the log, helpful for multiline check.
+			combinedlist = []
+
+			#See if the line we're parsing is "Service Check F". Full line in log is Service Check Finished.
+			check = finished.match(line.rstrip())
+			if check != None:
+			
+				#We matched Service Check Finished. Change found to yes so we can start parsing the log for failure.
+				found = "Yes"
+
+#Function to parse a failure 
+def parse_line(line):
+
+	#Create an empty list of service failures
+	servicefailures = []
+
+	#Split the line into a list called services, based on ...
+	services = line.split("...")
+
+	#The first line is always the date/time, so we need to pull that out for logging.
+        firstline = services[0]
+
+	#Split the first line based on ] since time/date format is [YYYY-MM-DD HH:MM:SS +/-####] where +/-#### is the GMT offset.
+	firstline = firstline.split("]")
+	time = firstline[0].split("[")
+
+	#After splitting on both ] and [ add the time to the servicefailures for logging.
+        servicefailures.append(time[1])
+
+	#Next, parse the rest of the services looking for which one failed.
+	for service in services:
+		check = failed.search(service)
+		if check != None:
+			
+			#Found failed service. Split the servicename based on space. The first entry is always the service named.
+			servicename = service.split()
+
+			#Some services have .... before it instead of ... so we need to remove the first .
+			service = servicename[0].replace(".","")
+
+			#Add the service to the servicefailures. Start with a carriage return then two tabs, note, service, and failure.
+			servicefailures.append("\n\t\t" + "[!] " + service + " failed")
+
+	#We've finished checking services, add a carriage return so we have a blank line, then combine the list into a single entry.
+	servicefailures.append("\n")
+	servicefailed = ''.join(servicefailures)
+
+	#Add the entry to the failed list for printing later.
+	failedlist.append(servicefailed)
+
+#Function to provide usage information, just prints to the screen.
+def usage():
+	print "checkserv [OPTIONS]"
+	print "Tool to find errors in /var/log/chkservd.log, default shows last five times a service has failed.\n"
+	print "  Options:"
+	print "\t-a\tDisplay all errors logged in /var/log/chkservd.log"
+	print "\t-n\tSets the number of errors you want to go back. Can greatly decrease runtime."
+	print "\t-h\tShow this page"
+
+#Function to change the number of results.
+def parse_count(count):
+
+	#global changes the global variable instead of the local variable.
+	global numresults
+	numresults = count
+
+#function to print the results to screen.
+def print_results():
+
+	#Since we're searching backwards, the results are newest to oldest. Reverse this.
+	failedlist.reverse()
+
+	#Print the header to screen, then print each serivce in the failed list.
+	print header
+	for service in failedlist:
+	        print service
+
+#Check for arguments.
+try:
+	myopts, args = getopt.getopt(sys.argv[1:],"ahn:")
+
+#If arguments are not those above, print usage and exit.
+except getopt.GetoptError, e:
+	usage()
+	sys.exit(2)
+
+#We either have no arguments or we have matched a h or n.
+for o, a in myopts:
+
+	#Check arguments to match.
+	if o == '-n':
+
+		#Argument is -n, this requires a numeric value which we pass to parse_count.
+		parse_count(int(a))
+
+		#Run parse_last, print the results, then exit with no error.
+		parse_last()
+		print_results()
+		sys.exit(0)
+	elif o == '-a':
+		
+		#-a received, we need to check entire log and print all results, then exit.
+		parse_count(0)
+		parse_last()
+		print_results()
+		sys.exit(0)
+	elif o == '-h':
+
+		#received -h so print usage and exit.
+		usage()	
+		sys.exit(0)
+
+#We've received no arguments so run parse_last and print the results. This does default 5 results.
+parse_last()
+print_results()

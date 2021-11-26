@@ -1,0 +1,175 @@
+#!/bin/sh
+
+#PRE-CHECK SCRIPT FOR EA3 --> EA4 UPGRADE
+#Script written by Darien Jones, contact me if you have any questions or suggestions.
+#Pre-checks taken from https://confluence.endurance.com/display/HGS/Linux+Dedicated%3A+Upgrading+from+EasyApache+3+to+EasyApache+4
+
+echo
+echo -e "\e[1;36mWelcome to the Easy Apache 3 --> Easy Apache 4 upgrade precheck. If no Warnings are output, then there are no conditions which would need to be addressed prior to starting the upgrade process.\e[0m"
+echo
+
+#Check if cPanel is installed, and if server has already been upgraded to EA4. 
+#If cPanel is not installed or the server has already upgraded to EA4, script will exit.
+
+if test ! -x /etc/init.d/cpanel ; then 
+	{
+		echo -e >&2 "\033[0;31mWarning:\033[0m cPanel is not installed on this server."
+		exit 1
+	}
+	fi 
+
+if test -f /etc/cpanel/ea4/is_ea4 ; then
+	{
+		echo >&2 "This box uses EA4, exiting EA3-->EA4 pre-check."
+		exit 1
+	}
+	fi
+
+#Disk usage check on main drive
+DISK_USAGE_PERCENT=$(df -h | head -2 | tail -1 | awk '{print $5}')
+if test "$DISK_USAGE_PERCENT" = "100%" || test "$DISK_USAGE_PERCENT" = "99%" || test "$DISK_USAGE_PERCENT" = "98%"
+	then echo -e "\033[0;31mWarning:\033[0m server's disk space usage is at ${DISK_USAGE_PERCENT} full."
+	fi
+
+#Inode % usage check on main drive
+INODE_USAGE_PERCENT=$(df -i | head -2 | tail -1 | awk '{print $5}')
+if test "$INODE_USAGE_PERCENT" = "100%" || test "$INODE_USAGE_PERCENT" = "99%" || test "$INODE_USAGE_PERCENT" = "98%"
+	then echo -e "\033[0;31mWarning:\033[0m server's inode usage is at ${INODE_USAGE_PERCENT} full."
+	fi
+
+
+#CentOS version check
+test ! -f /etc/centos-release || test "$(grep -ci "release\ 6\.\|release\ 7\." /etc/centos-release)" -lt 1 && echo -e "\033[0;31mWarning:\033[0m Server is not running Centos 6 or 7."
+
+#cPanel version check
+CPANEL_VERSION=$( /usr/local/cpanel/cpanel -V | awk '{print $1}' )
+
+if test "$(echo $CPANEL_VERSION | cut -c1-1)" -lt 6 ; then
+	{
+		echo -e  "\033[0;31mWarning:\033[0m cPanel version is ${CPANEL_VERSION}, this is significantly out of date. Please update cPanel to a modern release version prior to 
+         upgrading Easy Apache. Check for update blockers in the latest update log file at /var/cpanel/updatelogs/ to determine 
+         why cPanel hasn't auto-updated. " 
+	}
+	fi
+
+#check for custom EA rawopts files
+test -d /var/cpanel/easy/apache/rawopts/ &&
+if test "$(ls -A /var/cpanel/easy/apache/rawopts/)" ; then
+	{
+      echo -e "\033[0;31m\033[0;31mWarning:\033[0m\033[0m There are custom EasyApache rawopts files in /var/cpanel/easy/apache/rawopts/.
+         Run 'mv /var/cpanel/easy/apache/rawopts{,.\$(date +%s).bak} && /usr/local/cpanel/scripts/easyapache --skip-rawopts'
+         to recompile Apache without rawopts prior to EA4 upgrade."
+	}
+	fi
+    
+#Is PHP-FPM installed/running? 
+#There is sometimes a cPanel php-fpm process that runs, displayed as 'php-fpm: master process (/usr/local/cpanel/etc/php-fpm.conf)' in a process list. 
+#This however shouldn't be a problem. The Apache php-fpm if installed/running will always have an uppercase PHP-FPM entry in the running process list.
+if test "$(ps faux |grep [P]HP-FPM )" ; then
+	{
+		echo -e "\033[0;31mWarning:\033[0m PHP-FPM is detected as installed and running. This will need to be un-installed prior to upgrading in order for the 
+         EA3 --> EA4 upgrade to successfully complete."
+	}
+    fi
+    
+#Does the server have nginx installed? This will usually cause Apache to break after an EA4 upgrade due to either additions in the Apache includes files and/or necessitating custom nginx packages installed later (which we don't support).
+if test -x /usr/sbin/nginx ; then 
+	{
+		echo -e >&2 "\033[0;31mWarning:\033[0m Nginx is installed on this server. If this is a Bluehost OHWP package, do not proceed. For other VPS/Dedicated servers, 
+         inform customer that this custom configuration can cause Apache to break post-EA4 upgrade."
+	}
+	fi 
+ 
+#Check if default PHP version installed is pre-PHP 5.4
+PHP_VERSION=$(php -v |  head -1 | awk '{print $1, $2}' )
+if test "$(echo ${PHP_VERSION} | awk '{print $2}' | cut -d. -f 1,2 | grep -c "4\.\|5\.0\|5\.1\|5\.2\|5\.3" )" -ge 1 ; then
+	{
+		echo -e  "\033[0;31mWarning:\033[0m PHP version is ${PHP_VERSION}, please confirm with customer that their websites are coded to be compatible with at least 
+         PHP 5.4 prior to upgrading to EA4." 
+	}
+	fi	
+
+#Check if default PHP version installed is 7.1 (not in the current configuration, but can be installed afterward)
+#[ "$(echo $PHP_VERSION | grep -ci "PHP\ 7\.1")" -gt 1 ] 
+if [[ $PHP_VERSION =~ PHP\ 7\.1 ]] ; then
+	{
+		echo -e  "\033[0;31mWarning:\033[0m PHP version installed is ${PHP_VERSION}, this is not a version available through EA3 and must be removed prior to 
+         upgrading to EA4. PHP 7.1 can be installed again through EA4 after the upgrade." 
+	}
+	fi	
+    
+PHP_MODULES=$(php -m | grep -i "apc|eAccelerator|Imagemagick|memcached|Mongodb|Mssql|new relic|Pagespeed|Passenger|Xcache")
+
+#Conflicting installed PHP modules
+test -z $PHP_MODULES ||
+	echo -e "\033[0;31mWarning:\033[0m The following conflicting PHP modules are installed: $PHP_MODULES"
+
+#Is mod_cloudflare compiled? 
+if test -z $( httpd -M 2>/dev/null | grep -ci cloudflare ) ; then
+	{
+		echo -e "\033[0;31mWarning:\033[0m mod_cloudflare is compiled for use with Apache. Customer should be warned that EA4 can't install mod_cloudflare and it will
+         be removed when upgrading. Check for Cloudflare includes code in Apache configuration's pre_main_global.conf - this 
+         must be removed before upgrading to EA4 or Apache will break."
+	}
+    fi
+
+#Check if Tomcat is installed
+if test -e /etc/init.d/tomcat || test -e /etc/init.d/easy-tomcat7 
+	then echo -e "\033[0;31mWarning:\033[0m Tomcat Java is installed. Customer must stay on Easy Apache 3 if Tomcat Java is intended to remain in use."
+fi
+
+#Check for old MySQL passwords in use on database users. 
+test "$(mysql -BNe "SELECT COUNT(User) FROM mysql.user WHERE length(Password) <= 40")" -eq "0" ||
+	{
+		echo -e "\033[0;31mWarning:\033[0m There are old MySQL passwords in use on the following database users. These database users' passwords will need to be reset
+         in order to update the password encryption hash type: "
+		mysql -sse "select distinct(user) from mysql.user where user not like 'cpses\_%' and length(password) < 40"|sort ;
+	} 
+
+
+#Check for old MySQL passwords in use as a set session variable. Edge case, unlikely to be encountered on its own.
+if test ! -z "$(mysqladmin variables | awk '/old_passwords/{print $4}')"
+	then test "$(mysqladmin variables | awk '/old_passwords/{print $4}')" = "OFF" || test "$(mysqladmin variables | awk '/old_passwords/{print $4}')" = "0" ||
+		{
+			echo -e "\033[0;31mWarning:\033[0m Mysql old_passwords session variable is not set to OFF. ";
+		} 
+	fi
+
+#Check for old MySQL passwords in use in /etc/my.cnf. Edge case, unlikely to be encountered on its own.
+test "$(grep -ci '^old_passwords' /etc/my.cnf)" -eq "0" || 
+	{
+		echo -e "\033[0;31mWarning:\033[0m Mysql old_passwords variable has been set in /etc/my.cnf. Please update /etc/my.cnf to remove the old_passwords directive. ";
+	} 
+
+
+#Check for pre-existing .htaccess phphandler code or php.ini files that could cause problems after the EA4 upgrade. One-liner for this section originally created by Albert Scaria: https://docs.google.com/document/d/1PE0-nATnLqz1hHohshIEMXJH36c33uQCb2Nzgz0E3lg/edit
+docROOTS=("$(awk -F"==" {'print $5'} /etc/userdatadomains | sort | uniq)")
+HTA=("$(echo $docROOTS | sed 's/ /\/.htaccess /g')")
+PHPI=("$(echo $docROOTS | sed 's/ /\/*ini /g')")
+egrep -il '^\s*suPHP_ConfigPath|^\s*AddHandler application/x-httpd-php|^\s*AddType application/x-httpd-php' /usr/local/apache/conf/userdata/*/*/*/{*,*/*} $HTA/.htaccess {/,/home/,/home*/*/}.htaccess 2> /dev/null 1>> /tmp/ea4.bad
+ls -lahtrd $PHPI/*ini {/,/home/,/home*/*/}*ini 2> /dev/null 1>> /tmp/ea4.bad
+if test -s /tmp/ea4.bad ; then
+	{
+		echo -e "\033[0;31mWarning:\033[0m The following files have the potential to break sites post-EA4 upgrade. Consider .bak'ing these files if sites aren't
+         loading normally post-EA4 upgrade: " 
+        cat /tmp/ea4.bad
+	}
+    fi
+
+echo -e "\n\n\e[1;36mA record of the below information retained at /root/EA3toEA4preupgrade.txt for reference if needed post-upgrade:\e[0m"
+##Information recording for any post-EA4 upgrade tuning needed.
+#Current default PHP version
+echo -e "\nDefault PHP version: $(echo ; php -v | head -1 )" | tee -a  /root/EA3toEA4preupgrade.txt
+
+#Currently installed PHP modules 
+echo -e "\n\nInstalled PHP modules: $(echo ; php -r '$arr=get_loaded_extensions();natcasesort($arr);echo implode($arr, ", ");print "\n";print "\n";')" | tee -a /root/EA3toEA4preupgrade.txt
+
+#Current PHP handler configuration: " 
+echo -e "\n\nPHP $(/usr/local/cpanel/bin/rebuild_phpconf --current)" | tee -a /root/EA3toEA4preupgrade.txt
+
+#cPanel version
+echo -e "\n\ncPanel version: $(echo; /usr/local/cpanel/cpanel -V)" | tee -a /root/EA3toEA4preupgrade.txt
+
+#checksites. Useful to record if there are any pre-existing 500 errors. 
+echo -e "\n\nWebsite status codes pre-update: $(echo; /root/bin/checksites -a -v -f)" | tee -a /root/EA3toEA4preupgrade.txt
+

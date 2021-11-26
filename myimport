@@ -1,0 +1,189 @@
+#!/usr/bin/perl
+###########
+# myimport 
+# loader script that will import sql files to a database using the myimport module.
+# https://confluence.endurance.com/display/HGS2/MyImport
+# https://stash.endurance.com/projects/HGADMIN/repos/myimport/browse
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2013 - HostGator.com, LLC
+###########
+
+
+use strict;
+use Term::ANSIColor;
+use Getopt::Long;
+my $fresh;
+my $super;
+my $usecs;
+my $multi;
+my $split;
+
+#Signals
+$SIG{'INT'} = 'INT_Handler';
+
+#Prevent MySQL from launching pico to display large syntax errors
+$ENV{'EDITOR'} = 'cat';
+
+print "[#] myimport Loader version 0.030\n";
+my $help;
+GetOptions ('fresh' => sub { $fresh += 2}, 'nobackup' => sub {$fresh += 3}, 'super' => \$super, 'usecs=s' => \$usecs, 'multi' => \$multi, 'split' => \$split, 'help' => \$help);
+
+if ($help) {
+	print "Usage: myimport <db name> <sqlfile>\n";
+	print "<db name> Name of the database that you are wanting to import into.\n";
+	print "<sqlfile> The database file that needs to be imported.\n\n";
+	print "Options:\n";
+	print "--fresh    - Allows you to recreate (drop/create) the database before importing\n";
+	print "--nobackup - Allows you to skip the backup process/prompts\n\n";
+	print "Advanced options:\n";
+	print "--multi    - Allows you specify a file with the list of .sql files that you wish to import into a single Database.\n";
+	print "             Useful for multi table imports, and the like - where you have to import multiple sql files into the same database.\n";
+	print "             Arguments are: [Database name] [filename of file that contains the list of sql files to import]\n";
+	print "--split    - Allows you specify a sql file, which is to be split into its individual tables, and then imported into the database.\n";
+	print "             Arguments are: [Database name] [filename of the 'large' sql file that needs to be split and imported]\n";
+	print "             Note: The split up tables are saved to the CURRENT working directory, so be sure to check your disk space, etc BEFORE starting (this does not 'unextend' insert statements).\n";
+	exit 1;
+}
+
+if (-e "/root/bin/myimport.pm"){
+	use lib '/root/bin/';
+} else {
+	print "[!] /root/bin/myimport.pm not found on the server. Please contact a Supervisor or Level 2 Administrator for further assistance.'\n";
+	exit 1;
+}
+
+eval "use myimport; 1" or die "[!] myimport modules failed to be loaded. - ";
+
+if ($#ARGV != 1) {
+	print "Please specify the database you are wanting this imported to, and the .sql file related to it.\n";
+	print "Usage: myimport <db name> <sql file>\n";
+	print "See --help for more information.\n";
+	exit 1;
+}
+
+my $sqlimport;
+my $dbname  = shift;
+my $sqlfile = shift;
+if (!-s $sqlfile) {
+	print "[!] The SQL file specified: '$sqlfile', does not exist. Nothing to do...\n";
+	exit 1;
+}
+
+main();
+
+sub main {
+	my @sqlfiles;
+
+	### multi-sql import
+	if ($multi and -s $sqlfile) {
+		open (my $listfile, $sqlfile);
+		while (<$listfile>) {
+			my $sql = $_;
+			chomp $sql;
+
+			if (-s $sql) {
+			    push @sqlfiles, $sql;
+			}
+		}
+		close ($listfile);
+	}
+
+	### split the sql first, then import individual tables.
+	if ($split and -s $sqlfile) {
+		print "[!] Splitting tables from $sqlfile now...\n";
+		@sqlfiles = splitsql($sqlfile);
+		print "\n";
+	}
+
+	if (not $split and not $multi) {
+		push @sqlfiles, $sqlfile;
+	}
+
+	my $exit = importer(@sqlfiles);	
+	exit $exit;
+}
+
+sub INT_Handler {
+	$sqlimport->interrupt();
+	exit(1);
+}
+
+sub importer {
+
+	my @sqlfiles = @_;
+	my $exitcode = 0;
+
+	foreach my $sql (@sqlfiles) {
+		$sqlimport = myimport->new($dbname, $sql, $fresh, $super, $usecs);
+		my $error = $sqlimport->check_and_import();
+		if ($error) {
+			$exitcode = 1;
+		}
+		if ($fresh == 5 or $fresh == 2) {
+			$fresh  = $fresh - 2;
+		}
+		$fresh = 3;
+	}
+	return $exitcode;
+}
+
+sub splitsql {
+
+	use Tie::File; #Slurping large files can be an issue, so using tie instead.
+	use Fcntl 'O_RDONLY';
+	my $header;
+	my $outf;
+	my $table;
+	my $reading_header = 1;
+	my $sqlfile = shift;
+	my @tables;
+
+	tie my @lines, 'Tie::File', "$sqlfile", autochomp => 0, mode => O_RDONLY;
+
+	my $hasdk     = 0;
+	my $putdk     = 0;
+        my $nexttable = 1; #Flag that says whether or not to be on the lookout for the next table.
+	foreach my $line (@lines) {
+		if ($nexttable) {
+			if ($line =~ /(Table structure for table|DROP TABLE IF EXISTS|CREATE TABLE) [`]?(\w+)[`]?/i) {
+				$reading_header = 0;
+				$table = $2;
+
+				open($outf, '>', "${table}.sql") or die "Unable to open output file for table ${table}\n";
+				push @tables, "${table}.sql";
+				print "[+] Splitting '${table}' to '${table}.sql'\n";
+				print $outf $header;
+				print $outf "\n";
+				$nexttable = 0; # Stop looking for new lines that indicate a new table until the next INSERT.
+			}
+		}
+		if ($reading_header) {
+			$header .= $line;
+		} else {
+			if ($line =~ /ALTER TABLE \`$table\`/){
+				$hasdk = 1;
+				$putdk = 0;
+			}
+
+			if (not $hasdk and $line =~ m/INSERT INTO \`$table\`/) {
+				print $outf "/*!40000 ALTER TABLE `$table` DISABLE KEYS */;\n";
+				$putdk = 1;
+				$hasdk = 1;
+			}
+			if ($putdk) {
+				if ($line =~ /^\s*$/ or $line =~ /^UNLOCK TABLES/) {
+					print $outf "/*!40000 ALTER TABLE `$table` ENABLE KEYS */;\n";
+					$putdk = 0;
+					$hasdk = 0;
+				}
+			}
+			if ($line =~ /CREATE TABLE/i) {
+				$nexttable = 1; # Now that we're at an INSERT statement, reset flag to continue looking
+						# for the next table.
+			}
+			print $outf $line;
+		}
+	}
+	return @tables;
+}

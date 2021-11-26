@@ -1,0 +1,357 @@
+#!/usr/bin/env python2.7
+
+###########
+#
+# nclean
+# Tool to manually remove malware injections from files.
+# https://gatorwiki.hostgator.com/Security/NClean
+# http://git.toolbox.hostgator.com/nclean
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostgGator.com, LLC
+###########
+
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+import re, os, gzip, tarfile, sys, pwd
+from string import Template
+from smtplib import SMTP_SSL as SMTP
+from socket import gethostname
+from time import sleep, time
+from optparse import OptionParser
+from threading import Lock, Thread
+from Queue import Queue, Empty
+import stat as check_stat
+from stat import S_IFREG, S_IFDIR
+
+try:
+    import md5
+except ImportError:
+    from hashlib import md5
+
+TIME = time()
+PID = os.getpid()
+
+class Walker(object):
+    def __init__(self, top, maxdepth, file_filter, max_filesize=0):
+        omit_dirs = (
+            re.compile('^/home\d*/\w+/mail(?:$|/.*)'),
+            re.compile('^/home\d*/\w+/.cpanel(?:$|/.*)'),
+            re.compile('^/home\d*/\w+/.security(?:$|/.*)'),
+            re.compile('^/home\d*/virtfs(?:$|/.*)'),
+        )
+        self.dir_queue = Queue()
+        self.omit_dirs = omit_dirs
+        self.dir_queue.put(top)
+        if maxdepth:
+            self.maxdepth = top.count('/') + maxdepth
+        else:
+            self.maxdepth = 0
+        self.file_filter = file_filter
+        self.max_filesize = max_filesize * 1024
+        self.lock = Lock()    
+        
+    def __iter__(self):
+        return self
+        
+    def next(self):
+        self.lock.acquire()
+        try:
+            root = self.dir_queue.get_nowait()
+        except Empty:
+            self.lock.release()
+            raise StopIteration
+        names = os.listdir(root)
+        dirs, nondirs = [], []
+        for name in names:
+            abs_path = root + '/' + name
+            if any((p.match(abs_path) for p in self.omit_dirs)):
+                continue
+            stat = os.lstat(abs_path)
+            if check_stat.S_ISLNK(stat.st_mode):
+                continue
+            mode = stat[0]
+            if mode & S_IFREG and self.file_filter.match(abs_path):
+                if self.max_filesize:
+                    size = stat[6]
+                    if self.max_filesize < size:
+                        continue
+                nondirs.append(name)
+            elif mode & S_IFDIR and (not self.maxdepth or self.maxdepth >= abs_path.count('/')):
+                dirs.append(name)
+                self.dir_queue.put_nowait(abs_path)
+        self.lock.release()
+        return root, dirs, nondirs
+
+def FilenameGenerator(walker):
+    for file_path in (root + '/' + file_name for root, dirs, files in walker for file_name in files):
+        yield file_path
+
+class ListGenerator(object):
+    def __init__(self, list_file):
+        if list_file == 'STDIN':
+            self.list_file = sys.stdin
+        else:
+            self.list_file = open(list_file, 'r')
+        self.lock = Lock()
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        self.lock.acquire()
+        line = self.list_file.readline().strip('\n')
+        if line == '':
+            self.lock.release()
+            raise StopIteration
+        self.lock.release()
+        return line
+    
+class Backup(object):
+    def __init__(self, directory, tarname="/tmp/nclean.%d.%d.tar" % (TIME,PID)):
+        self.finalize = False
+        self.directory = directory
+        self.tarname = tarname
+        f = tarfile.open(tarname,'w')
+        f.close()
+        self.lock = Lock()
+        
+    def commit_file(self, file_path):
+        self.finalize = True
+        self.lock.acquire()
+        tar = tarfile.open(self.tarname, "a:")
+        fileobj = open(file_path,"r")
+        tarinfo = tar.gettarinfo(arcname=file_path[len(self.directory):], fileobj=fileobj)
+        tar.addfile(tarinfo, fileobj)
+        tar.close()
+        fileobj.close()
+        self.lock.release()
+        
+class Reporter(object):
+    def __init__(self, verbosity, logfile, hash_matches, email):
+        self.verbosity = verbosity
+        self.lock = Lock()
+        self.logfile_name = logfile
+        self.logfile = None
+        if logfile:
+            self.logfile = open(logfile,'w');
+        self.hash_matches = hash_matches
+        self.email = None
+        if email:
+            self.email = email
+            self.email_logs = []
+
+    def report(self, file_path, data, matches):
+        self.lock.acquire()
+        stat = os.lstat(file_path)
+        statline = "uid: %d gid: %d mtime: %d ctime: %d mode: %d" % (stat.st_uid, stat.st_gid, stat.st_mtime, stat.st_ctime, stat.st_mode)
+        logline = "%s: %s, (%s)\n" % (file_path, ', '.join(["(%d, %d)" % (match[0], match[1]) for match in matches]), statline)
+        if self.logfile:
+            self.logfile.write(logline)
+        if self.email:
+            self.email_logs.append(logline)
+        if self.verbosity:
+            if self.verbosity >= 1:
+                print(file_path)
+            if self.verbosity == 2:
+                for match in matches:
+                    if self.hash_matches:
+                        print("\t" + ("(%d, %d), %s" % (match[0], match[1], md5.new(data[match[0]:match[1]]).hexdigest())).encode("string_escape"))
+                    else:
+                        print("\t" + ("%s, (%d, %d)" % (data[match[0]:match[1]], match[0], match[1])).encode("string_escape"))
+        self.lock.release()
+
+    def close(self, backup, directory):
+        if backup and not backup.finalize:
+            if self.logfile:
+                self.logfile.close()
+                os.unlink(self.logfile_name)
+            return
+        self.lock.acquire()
+        if self.logfile:
+            self.logfile.close()
+        if self.email:
+            hostname = gethostname()
+            fromaddr = "root@" + hostname
+            subject = "Nclean scan of %s on %s results!" % (directory, hostname.split('.')[0])
+            if backup:
+                backup_name = backup.tarname
+            else:
+                backup_name = "NOT BACKED UP"
+            body = "The backup of the infected files is located at:\r\n%s\r\n\r\nThe following files were modified: %s" % (backup_name, '\r'.join(self.email_logs))
+            message = "From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s" % (fromaddr, ', '.join(self.email), subject, body)
+            server = SMTP('localhost', port=465)
+            server.sendmail(fromaddr, self.email, message)
+            server.quit()
+        self.lock.release()
+
+def scan_file(file_path, pattern, targeted):
+    """Scans a file for the pattern.  Returns a list of matches and the file's data."""
+    matches = []
+    in_file = open(file_path, "r")
+    data = in_file.read()
+    in_file.close()
+    for match in pattern.finditer(data):
+        if targeted:
+            if "target" in match.groupdict():
+                matches.append((match.start("target"), match.end("target")))
+        else:
+            matches.append((match.start(), match.end()))
+    return data, matches
+
+def clean_file(file_path, data, matches, replacement, preserve_mtime):
+    new_data = list(data)
+    if type(replacement) is str:
+        l_replacement = list(replacement)
+    for match in reversed(matches):
+        if type(replacement) is Template:
+            l_replacement = list(replacement.safe_substitute(match.groupdict()))
+        new_data[match[0]:match[1]] = l_replacement
+    if preserve_mtime:
+        stat = os.lstat(file_path)
+        atime = stat[7]
+        mtime = stat[8]
+    out_file = open(file_path,"w")
+    out_file.write(''.join(new_data))
+    out_file.close()
+    if preserve_mtime:
+        os.utime(file_path, (atime, mtime))
+
+class Worker:
+    def __init__(self):
+        self.running = True
+    def __call__(self, filename_generator, pattern, targeted, reporter, backup, cleanup, replacement, preserve_mtime):
+        for file_path in filename_generator():
+            sleep(0)
+            if not self.running:
+                return
+            data, matches = scan_file(file_path, pattern, targeted)
+            if len(matches):
+                reporter.report(file_path, data, matches)
+                if cleanup:
+                    if backup:
+                        backup.commit_file(file_path)
+                    clean_file(file_path, data, matches, replacement, preserve_mtime)
+
+def get_backup_path(directory):
+    tokens = directory.split('/')
+    filename = "nclean.%d.%d.tar.gz" % (PID, TIME)
+    rval = os.path.join(directory, filename)
+    if len(tokens) < 3:
+        return rval
+    if tokens[1] != 'home':
+        return rval
+    user = tokens[2]
+    try:
+        pwd.getpwnam(user)
+    except KeyError:
+        return rval
+    rval = os.path.join("/home", user, ".security", filename)
+    return rval
+                    
+def finalize_backup(backup, backup_path):
+    if not backup.finalize:
+        os.unlink(backup.tarname)
+        return
+    output_file = gzip.open(backup_path, 'wb')
+    input_file = open(backup.tarname,'r')
+    output_file.write(input_file.read())
+    output_file.close()
+    input_file.close()
+    os.unlink(backup.tarname)
+    os.chmod(backup_path, int("600",8)) # This is just to make sure the backup file cannot be downloaded.
+    backup.tarname = backup_path
+    
+if __name__ == "__main__":
+    parser = OptionParser( usage="nclean [options] <expression>", version="nclean 2.1.3 by Patrick Harrison" )
+    parser.add_option( "-B", "--skip-backup", dest="skip_backup", help="Skip the backup process when cleaning.  Will improve performance.  *NOT RECOMMENDED*", action="store_true",  default=False )
+    parser.add_option( "-c", "--clear-matches", dest="clear_matches", help="Clear matched text from files.  Will replace with replacement text if replacement text is provided.", action="store_true", default=False )
+    parser.add_option( "-d", "--directory", dest="directory", help="Base directory that search will be performed from.  If not specified, the current working directory is used.", action="store", type="string", default=os.getcwd() )
+    parser.add_option( "-e", "--preserve-mtime", dest="preserve_mtime", help="Preserve file modification time.  Does NOT preserve ctime.", action="store_true", default=False )
+    parser.add_option( "-E", "--no-email", dest="no_email", help="Do not email results to L2's.", action="store_true", default=False)
+    dfp = r".*\.(php|html|htm|phtml|shtml|tpl|js|txt|xml|css)$" # Default Filename Pattern
+    parser.add_option( "-f", "--filename-regexp", dest="filename_regexp", help="Regular expression to filter filenames that should be scanned.  Default is %s" % dfp, action="store", type="string", default=dfp )
+    parser.add_option( "-F", "--filename-list", dest="filename_list", help="File containing list of file paths to scan.  Set to STDIN to read filenames from stdin.", action="store", type="string", default=None)
+    parser.add_option( "-l", "--logfile", dest="logfile", help="File to log actions to.  Default is nclean.$TIME.$PID.log", action="store", type="string", default="nclean.%d.%d.log" % (TIME, PID) )
+    parser.add_option( "-L", "--disable-logging", dest="nologs", help="Disable logs.  May marginally improve performance.", action="store_true", default=False )
+    parser.add_option( "-H", "--hash-matches", dest="hash_matches", help="Hash matches instead of printing them.", action="store_true", default=False)
+    parser.add_option( "-i", "--ignore-case", dest="ignore_case", help="Perform a case-insensitive search.", action="store_const", default=0, const=re.IGNORECASE )
+    parser.add_option( "-m", "--max-depth", dest="max_depth", help="Maximum directory depth to search.", action="store", type="int", default=0 )
+    parser.add_option( "-n", "--ignore-newline", dest="ignore_newline", help="Treat newline characters as any other character.", action="store_const", default=0, const=re.DOTALL )
+    parser.add_option( "-q", "--quiet", dest="quiet", help="No output.", action="store_true", default=False )
+    parser.add_option( "-r", "--replace-with", dest="replace_with", help="Text to replace matches with.  Default is an empty string.", action="store", type="string", default="" )
+    parser.add_option( "-R", "--replace-with-template", dest="template", help="Use a template string for replacing.  Values used to populate the template come from named groups in the expression.", action="store_true", default=False )
+    parser.add_option( "-s", "--suppress-output", dest="suppress", help="Display files containing matches, not the matches themselves.", action="store_true", default=False )
+    parser.add_option( "-S", "--spit-back", dest="spit_back", help="Spit back the expression received as an argument.  Not immediately useful, but sometimes bash screws up your input string.", action="store_true", default=False )
+    parser.add_option( "-t", "--targeted", dest="targeted", help="Clear only group tagged 'target' from matches, instead of the whole match.", action="store_true", default=False )
+    parser.add_option( "-w", "--workers", dest="workers", help="Number of worker threads to use.  You probably don't want to touch this.", action="store", type="int", default=2 )
+    parser.add_option( "-z", "--max-size", dest="max_size", help="Maximum filesize permitted for scanning, in kilobytes.  Default is no maximum.", action="store", type="int", default=0 )
+    options, args = parser.parse_args()
+
+    if len(args) is not 1:
+        parser.print_version();
+        parser.error("You must specifiy a single expresion.")
+
+    if options.filename_list is not None:
+        list_generator = ListGenerator(options.filename_list)
+        filename_generator = lambda: list_generator
+    else:
+        walker = Walker(options.directory, options.max_depth, re.compile(options.filename_regexp), options.max_size)
+        filename_generator = lambda: FilenameGenerator(walker)
+
+    pattern = re.compile(args[0], options.ignore_case | options.ignore_newline)
+
+    if options.spit_back:
+        print(pattern.pattern)
+        sys.exit(0)
+
+    if options.nologs or not options.clear_matches:
+        log = None
+    else:
+        log = options.logfile
+
+    if options.template:
+        replace_with = Template(options.replace_with)
+    else:
+        replace_with = options.replace_with
+
+    if options.clear_matches and not options.skip_backup:
+        emails = ['dnaraghi@hostgator.com', 'securitymanagers@hostgator.com']
+    else:
+        emails = None
+
+    if options.no_email:
+        emails = None
+
+    verbosity = 2
+    if options.suppress:
+        verbosity = 1
+    if options.quiet:
+        verbosity = 0 
+    reporter = Reporter(verbosity, log, options.hash_matches, emails)
+
+    backup = None
+    if not options.skip_backup and options.clear_matches:
+        backup = Backup(options.directory)
+    worker = Worker()
+    threads = [Thread( target=worker,  args=(filename_generator, pattern, options.targeted, reporter, backup, options.clear_matches, replace_with, options.preserve_mtime)) for i in xrange(options.workers)]
+    for thread in threads:
+        thread.start()
+
+    while True:
+        try:
+            threads_alive = False
+            for thread in threads:
+                thread.join(1)
+                if thread.isAlive():
+                    threads_alive = True
+                    break
+            if not threads_alive:
+                break
+        except KeyboardInterrupt:
+            worker.running = False
+
+    if not options.skip_backup and options.clear_matches:
+        finalize_backup(backup, get_backup_path(options.directory))
+    reporter.close(backup, options.directory)

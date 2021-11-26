@@ -1,0 +1,2164 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife
+#|
+#| Provides a fair amount of tools to work on various software
+#| installations either one-by-one or en-masse.
+#|
+#| @link https://stash.endurance.com/projects/HGADMIN/repos/wptoolbox/browse GIT Repository
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash
+#- @subpackage Main
+
+SAK_VER="0.1.8"
+SAK_TS="20180913"
+
+#@ Display command version.
+sak_version() { printf 'Swiss Army Knife %s (%s)\n' "$SAK_VER" "$SAK_TS"; }
+
+#@ Display simple command usage.
+sak_usage() {
+  exec 1>&3
+  sak_version
+cat << EOF
+Usage: $SAK_BASENAME [OPTION]... [USER|DIR]...
+       $SAK_BASENAME [OPTION]... -c COMMAND [OPTION|SUBCOMMAND]...
+EOF
+}
+
+#@ Display command help.
+sak_help() {
+  local b=$'\e[1m' u=$'\e[4m' e=$'\e[0m'
+  sak_usage
+cat << EOF
+
+If no users or directories are provided, the owner of the current directory is
+used, if possible.
+
+Information:
+  -h, --help      Print this help and exit
+  -v, --version   Show command version
+
+Targets:
+  -D, --directory[=LIST]  Comma-separated list of directories to work on
+  -U, --user[=LIST]       Comma-separated list of users to work on
+  -R, --reseller[=USER]   Reseller to work on
+
+Other:
+  --cache-update
+              Force an update of the available software from the repository
+  --home      Store backups in $HOME/backups/sak/...
+  --no-home   Store backups in the current working directory
+
+  --wget      Use wget to download files
+  --get       Use LWP's "GET" command to download files
+  --curl      Use cURL to download files
+                (NOTE: The last specified takes precedence)
+
+Output:
+  -V, --verbose   Increase verbosity.
+  -q, --quiet     Reduce verbosity. 1st=Warn, 2nd=Err, 3rd=None
+
+For bugs, feature requests, etc., please file a report at:
+  ${b}${u}https://projects.hostgator.com/projects/sak${e}
+
+EOF
+}
+
+##################################################################
+##################################################################
+#
+# Support functions
+#
+
+#+ Emulates basic basename functionality without forking.
+#| @param string $path Path
+#- @return string Filename
+basename() {
+  printf "${1##*/}"
+}
+
+#+ Emulates basic dirname functionality without forking.
+#| @param string $path Path
+#- @return string Directory
+dirname() {
+  local name="${1%/}"
+  printf "${name%/*}"
+}
+
+#+ Displays an message during an operation.
+#| The -v flag is for verbose level (inverse of quiet).
+#|
+#| sak_message [-v LEVEL] TITLE MESSAGE [HEIGHT] [WIDTH]
+#| @param int $level=0 Message verbose level. Optional.
+#| @param string $title   Message title.
+#| @param string $message Message.
+#| @param int $height Window height (lines). Curses only.
+#- @param int $width  Window width (columns). Curses only.
+sak_message() {
+  local m v msg title type nl=$'\n' IFS
+
+  sak_msg_silence && return 1
+
+  [[ -z "$2" ]] && return 0   # Called without a message discards it
+  if [[ "$1" == "-v" ]]; then # Special handling for verbose messages
+    [[ "$SAK_QUIET" -gt "-$2" ]] && return
+    v=1; shift 2
+  fi
+
+  if [[ "$SAK_CLI_MODE" -eq "0" ]]; then
+    [[ -z "$3" || -z "$4" ]] &&
+      sak_infobox "$@" "5" "45" ||
+      sak_infobox "$@"
+  else
+    title="$1"; shift
+    type="$INF"
+    if [[ -z "$v" ]]; then
+      if [[ "$title" == "Error" ]]; then
+        type="$ERR"
+      elif [[ "$title" == "Warning" ]]; then
+        type="$WRN"
+        printf -v title '\e[1mWarning\e[0m'
+      fi
+    else
+      type="$VRB"
+      printf -v title '\e[1m%s\e[0m' "$title"
+    fi
+
+    msg="${1//\\n/$nl}"
+    while IFS=$'\n' read -r m; do
+      printf "%s <%s> %s\e[0m\n" "$type" "$title" "$m"
+    done <<< "$msg"
+  fi
+}
+
+sak_msg_silence() {
+  (( SAK_WP_IMPORTING == 1 || SAK_QUIET > 9000 )) && return 0
+  return 1
+}
+
+#+ Displays a message and waits the specified number of seconds.
+#| In CLI mode, we don't pause (yet).
+#|
+#| sak_wait_message SECONDS TITLE MESSAGE
+#| @todo Make use of {@link sak_wait_message_helper}.
+#| @param int $seconds    Seconds to wait.
+#| @param string $title   Message title.
+#| @param string $message Message.
+#- @return int Status.
+sak_wait_message() {
+  local wait="$1" title="$2" msg PID
+  shift; shift
+
+  if [[ "$SAK_CLI_MODE" -eq "0" ]]; then
+    sak_waitbox "$wait" "$title" "$*"
+  else
+    local type="$INF"
+    if [[ "$title" == "Error" ]]; then
+      type="$ERR"
+    fi
+    printf "%s <%s> %s\e[0m\n" "$type" "$title" "$1"
+
+    return 0
+    # UNUSED FOR NOW:
+    sak_wait_message_helper &
+    PID="$!"
+    read -srn1 -t "$wait"
+
+    kill "$PID"
+    echo -en '\e[K'
+  fi
+}
+
+#+ Message wait helper.
+#| @internal
+#- @param int $wait Seconds to wait.
+sak_wait_message_helper() {
+  local t
+  for ((t="$1"; t > 0; t--)); do
+    echo -en "\e[K\e[sWaiting $t seconds, or press any key.\e[u"
+    sleep 1
+  done
+}
+
+#+ Returns the corresponding cache file for the specified type.
+#| sak_cache_file TYPE
+#| @param string $type Name of cache type. Can be any arbitrary string identifier.
+#- @return string|bool Filename if cache exists. False otherwise.
+sak_cache_file() {
+  local t="$1" type res ret
+
+  # For each element in the TYPE array...
+  for type in ${!SAK_CACHE_TYPE[@]}; do # Check it...
+    if [[ "${SAK_CACHE_TYPE[$type]}x" == "${t}x" ]]; then # Found it!
+      echo "${SAK_CACHE_FILE[$type]}"
+      return 0 # We can stop early...
+    fi
+  done
+
+  return 1  # Else we return an error
+}
+
+#+ Start-up function to cache local users.
+#- UIDs less than 500 and usernames longer than 8 characters are ignored.
+sak_cache_users() {
+  local user x uid gid info home shell IFS
+  while IFS=: read -r user x uid gid info home shell; do
+    [[ -z "$user" || "$uid" -lt "500" || "${#user}" -gt "8" ||
+      "${user:0:1}" == "#" ]] &&
+      continue
+    SAK_UIDS[$uid]="$user"  # UID -> username
+    SAK_GIDS[$uid]="$gid"   # UID -> GID
+    SAK_UHOM[$uid]="$home"  # UID -> $HOME
+  done < "/etc/passwd"
+}
+
+#+ Add targets to the appropriate target array.
+#- @param string $targets Comma separated targets to add.
+sak_add_targets() {
+  local args u_uid tt t p u IFS=$',\n'
+
+  # Allows us to blind-call this function
+  [[ -z "$1" ]] && return
+
+  p="${#SAK_PATHS[@]}"
+  u="${#SAK_USERS[@]}"
+
+  for tt; do for t in $tt; do
+    # We determine targets by slashes or no slashes
+    # We also check by the first character == .
+    if [[ "${t:0:1}" == "." || "$t" =~ / ]]; then
+      [[ -d "$t" ]] && SAK_PATHS[((p++))]="$t" ||
+        sak_fatal $SAK_ERR_ARG "Error: No such directory \`$t'"
+    else
+      [[ "$(sak_user_to_uid $t)" -ge "500" ]] && SAK_USERS[((u++))]="$t" ||
+        sak_fatal $SAK_ERR_ARG "Error: Invalid user \`$t'"
+    fi
+  done; done
+}
+
+#+ Add resellers.
+#- @param string $targets Comma separated targets to add.
+sak_add_rtargets() {
+  local uid tt t IFS=$' ,'
+
+  [[ -z "$1" ]] && return
+  sak_cache_resellers
+
+  for tt; do for t in $tt; do
+    uid="$(sak_user_to_uid "$t")" || continue
+    [[ -z "${SAK_RIDS[$uid]}" ]] && continue
+    sak_add_targets ${SAK_RIDS[$uid]}
+  done; done
+}
+
+#@ Caches resellers on-demand.
+sak_cache_resellers() {
+  local oid reseller uid user
+  [[ "$SAK_RCACHE" == "1" ]] && return 0 || SAK_RCACHE=1
+  [[ ! -f "/etc/trueuserowners" ]] &&
+    sak_fatal $SAK_ERR_ARG "Could not read /etc/trueuserowners for reseller information."
+  while IFS=: read -r user reseller; do
+    [[ "${user:0:1}" == "#"  || "$reseller" == " root" ]] && continue
+    reseller="${reseller# }"
+    oid="$(sak_user_to_uid "$reseller")" || continue
+    SAK_RIDS[$oid]+=" $user"
+  done < "/etc/trueuserowners"
+}
+
+#@ Uses VDetect in CSV mode to find software.
+sak_get_installations() {
+  local i n o p u cfile install new opts paths users IFS
+
+  opts=("${SAK_VDETECT_OPT[@]}")
+  o="${#opts[@]}"
+
+  if [[ "$SAK_CLI_MODE" -eq "0" || "$1" == "full" ]]; then
+    p="${#SAK_PATHS[@]}"
+    u="${#SAK_USERS[@]}"
+
+    # If there's nothing to check, don't bother
+    [[ "$p" -eq "0" && "$u" -eq "0" ]] && return
+
+    paths="${SAK_PATHS[@]}"
+    users="${SAK_USERS[@]}"
+
+    [[ "$p" -gt "0" ]] && opts[((o++))]="--directory=${paths// /,}"
+    [[ "$u" -gt "0" ]] && opts[((o++))]="--user=${users// /,}"
+  else
+    # CLI mode only works in the current directory
+    #[[ "$SAK_QUIET" -lt "1" ]] &&
+    #  sak_message "Scanning" "Scanning for software..." 5 30
+    SAK_SOFTWARE=()
+    if [[ "$1" == "subdirs" ]]; then
+      opts[((o++))]="--directory=."
+    else
+      opts[((o++))]="--directory=."
+      opts[((o++))]="--maxdepth=0"
+    fi
+  fi
+
+  if ! sak_cli_mode; then
+    if [[ -n "$1" ]]; then
+      SAK_SOFTWARE=()
+      sak_message "Scanning" "Scanning for software..." 5 30
+    else
+      sak_message "Starting Up" "Scanning for software..." 5 30
+    fi
+  fi
+
+  cfile="$(sak_cache_file VDETECT)"
+  if [[ "$?" -ne "0" ]]; then
+    cfile="$(sak_mkcache)"
+    new=1
+  fi
+  
+  if [[ ! -x "$SAK_VDETECT_PATH" ]]; then
+    sak_fatal_backtrace $SAK_ERR_SUB_ERR "vdetect binary cannot be executed."
+  fi
+  
+  (( SAK_DEBUG )) && set +x
+  err="$( { $SAK_VDETECT_PATH "${opts[@]}" --csv | \
+    "$SAK_PHP" -q "$SAK_MOD_DIR/php/commands.php" "--natsort"; } 2>&1 > "$cfile")"
+  (( SAK_DEBUG )) && set -x
+
+  if [[ -n "$err" ]]; then
+    echo
+    sak_wait_message 5 "Error" "$err" 5 35
+    sak_fatal_backtrace $SAK_ERR_SUB_ERR "Error scanning for software. See any errors above and correct if possible."
+  fi
+
+  i="${#SAK_SOFTWARE[@]}"
+  while IFS=$'\n' read -r install; do
+    SAK_SOFTWARE[((i++))]="$install"
+  done < "$cfile"
+
+  if [[ "$new" -eq "1" ]]; then
+    n=${#SAK_CACHE_FILE[@]}
+    SAK_CACHE_FILE[$n]="$cfile"
+    SAK_CACHE_TYPE[$n]="VDETECT"
+  fi
+
+  SAK_TARGETS_MOD=0 # Unset modified flag
+}
+
+#+ Menu support function to display a list of installations to the user.
+#- @return string List of installations found.
+sak_list_installations() {
+  local args vuln soft path ver i c user
+
+  for ((i=0; i < "${#SAK_SOFTWARE[@]}"; i++)); do
+    IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+    case "$vuln" in    # For coloring
+     -1) c="\Z8"    ;; # Unknown    = White
+      0) c="\Z2"    ;; # Secure     = Green
+      1) c="\Z0\Zb" ;; # Outdated   = Black
+      2) c="\Z1"    ;; # Vulnerable = Red
+    esac
+
+    # Get user and abbreviate path if possible
+    if [[ "${#path}" -gt "6" && "${path:0:6}" == "/home/" ]]; then
+      user="${path:6}"
+      user="${user%%/*}"
+      path="~$user${path##/home/$user}"
+    else
+      user="$(stat -c %U "$path")"
+    fi
+
+    printf '%d\n%s :: %s%s %s\Zn :: %s\n' \
+      "$((i+1))" "$user" "$c" "$soft" "$ver" "$path"
+  done
+}
+
+#+ Menu callback to list users in a dialog-compatible style.
+#- @return string List of users one per line: $uid $username $toggle
+sak_list_users() {
+  local t i u uu IFS=' ' sortcmd='sort -nk1'
+
+  [[ "$SAK_USER_SORT" -eq "2" ]] && sortcmd='sort -dfk2'
+  for i in "${!SAK_UIDS[@]}"; do
+    [[ "$i" -lt "500" ]] && continue
+    t="off"
+    for uu in "${!SAK_USERS[@]}"; do
+      [[ "${SAK_USERS[$uu]}" == "${SAK_UIDS[$i]}" ]] &&
+        t="on" && break
+    done
+    printf '%s %s %s\n' "$i" "${SAK_UIDS[$i]}" "$t"
+  done | $sortcmd
+}
+
+#+ Menu callback to list paths in a dialog-compatible style.
+#- @return string List of target paths newline delimited: $iter $path "on"
+sak_list_paths() {
+  local i p paths IFS=$' \t\n'
+
+  p="${#SAK_PATHS[@]}"
+  paths="${SAK_PATHS[@]}"
+
+  for (( i=0; i<p; i++ )); do
+    printf '%s\n%s\non\n' $((i+1)) "${SAK_PATHS[$i]}"
+  done
+}
+
+#+ Compare versions.
+#| Compares version for specific installation and give exit status of 0 if
+#| version is greater than, or equal to that of VERSION specified. Extra
+#| beta/RC stuff at the end is removed.
+#|
+#| sak_version_req INDEX VERSION
+#| @param int $index      Target install index to retrieve version.
+#| @param string $version Minimum version required.
+#- @return bool True if version is greater or equal. False otherwise.
+sak_version_req() {
+  local ver i="$1" rver="$2" \
+        re="^[0-9]+\.[0-9]+" re2="^[0-9]+\.[0-9]+\.[0-9]+$" \
+        major minor build \
+        rmajor rminor rbuild
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  # This looks like a mess only because I minified it >_>
+  ver="${ver%%_*}"; ver="${ver%%-*}"
+  major="${ver%%.*}"
+  [[ "$ver" =~ $re ]] && minor="${ver##$major.}" && minor="${minor%%.*}" &&
+  [[ "$ver" =~ $re2 ]] && build="${ver##*.}"
+
+  rver="${rver%%_*}"; rver="${rver%%-*}"
+  rmajor="${rver%%.*}"
+  [[ "$rver" =~ $re ]] && rminor="${rver##$rmajor.}" && rminor="${rminor%%.*}" &&
+  [[ "$rver" =~ $re2 ]] && rbuild="${rver##*.}"
+
+  if [[ ( "$major" -gt "$rmajor" ) ||
+        ( ( -z "$rminor" && -z "$rbuild" &&
+            "$major" -eq "$rmajor" ) ||
+          ( "$major" -eq "$rmajor" &&
+            "$minor" -gt "$rminor" ) ) ||
+        ( ( -z "$rbuild" &&
+            "$major" -eq "$rmajor" &&
+            "$minor" -eq "$rminor" ) ||
+          ( "$major" -eq "$rmajor" &&
+            "$minor" -eq "$rminor" &&
+            "$build" -ge "$rbuild" )
+        ) ]]; then
+    return 0
+  fi
+  return 1
+}
+
+#+ Convert usernames to UIDs.
+#| @param string $user Username.
+#- @return int User ID.
+sak_user_to_uid() {
+  local i user="$1"
+  for i in "${!SAK_UIDS[@]}"; do
+    [[ "${SAK_UIDS[$i]}" == "$user" ]] && printf "$i" && return 0
+  done
+  return 1
+}
+
+#+ Convert a software name to displayable names.
+#| @param string $name Name to convert.
+#- @return string Converted name.
+sak_soft_name() {
+  case "$1" in
+    drupal)     echo "Drupal"     ;;  joomla)     echo "Joomla"    ;;
+    oscommerce) echo "osCommerce" ;;  wordpress)  echo "WordPress" ;;
+    *)          echo "$1" ;;
+  esac
+}
+
+#+ Tails a file depending on display mode.
+#| In CLI mode, simply calls tail. In curses mode, a tailbox dialog is used.
+#| @param string $title Window title. Merely echoed in CLI mode.
+#| @param string $file  File path for log to tail.
+#- @param int $pid      PID to watch. In CLI mode, tail will exit when PID dies.
+sak_tail_file() {
+  local title="$1" file="$2" pid="$3"
+
+  if ! sak_cli_mode; then
+    "${SAK_DIALOG[@]}" \
+      --title "$title" \
+      --tailbox "$file" \
+      30 120
+  else
+    echo "$title"
+    tail --pid=$pid --retry -F "$file" 2>/dev/null
+  fi
+}
+
+#+ Internal logging function.
+#| @param int $level      Log level.
+#| @param string $type    Arbitrary log type identifier.
+#- @param string $message Log message.
+sak_log() {
+  local l="$1" type="$2" msg="$3" date="$(date +"%s | %a, %e %b %Y %H:%M:%S %z")"
+
+  [[ ! -s "$SAK_LOG" ]] &&
+    echo "[  UNIXTIME  | DATE                            ] RUSER         PID LEVEL  :: TYPE         : MESSAGE" \
+      > "$SAK_LOG"
+
+  printf "[ %s ] %-10s %6d %-6s :: %-12s : %s\n" \
+    "$date" \
+    "$RUSER" \
+    "$SAK_PID" \
+    "${SAK_LOG_LEVELS[$l]}" \
+    "$type" \
+    "$msg" >> "$SAK_LOG"
+}
+
+#@ @internal
+sak_log_ifdebug() { [[ "$SAK_DEBUG" -eq "1" ]] && sak_log 4 "DEBUG" "$@"; }
+
+#+ Make a temporary cache file which can be written to.
+#| Creates a cache file.
+#- @return string File path.
+sak_mkcache() {
+  local hash file
+
+  # Let's fake a hash of some sort...
+  hash="$(cat /dev/urandom | tr -d '\000-\060\072-\100\133-\140\173-\377' | head -c 24)"
+  file="$SAK_CACHE_DIR/cache_${SAK_PID}_${hash}"
+
+  touch "$file" &&
+  chmod 600 "$file" || return 1
+  echo "$file"
+}
+
+#+ Make (touch) a temp file which can be written to.
+#| Creates a non-privileged temporary file within /tmp
+#| @param string $owner File owner.
+#- @return string File path.
+sak_mktmp() {
+  local hash file owner="$1"
+  local group="$(id -g $owner)"
+
+  # Let's fake a hash of some sort...
+  hash="$(cat /dev/urandom | tr -d '\000-\060\072-\100\133-\140\173-\377' | head -c 24)"
+  file="/tmp/sak_${SAK_PID}_${hash}"
+
+  touch "$file" &&
+  echo -n > "$file" &&
+  chmod 600 "$file" &&
+  chown "$owner:$group" "$file" || return 1
+
+  printf "%s" "$file"
+  return 0
+}
+
+#+ Download a file to a given location.
+#| sak_download URL TARGET
+#| @uses sak_download_pipe
+#| @param string $url URL to be downloaded
+#| @param string $filename Download will be written to this file
+#- @return bool True on success. False otherwise.
+sak_download() {
+  local url="$1" target="$2" dir
+
+  dir="$(dirname $target)"
+  if [[ ! -e "$dir" ]]; then
+    mkdir -p "$dir" || sak_fatal_backtrace $SAK_ERR_INT_CNF "Could not make download directory. Target: $dir"
+  else
+    if [[ ! -d "$dir" ]]; then
+      sak_fatal_backtrace $SAK_ERR_INT_CNF "Tried to download to a location that was not a directory. Target: $dir"
+    fi
+  fi
+
+  sak_download_pipe "$url" > "$target" || return 1
+  return 0
+}
+
+#+ Downloads a file stdout for various purposes.
+#| File is written to stdout for reading, discarding, or redirecting.
+#|
+#| sak_download_pipe URL
+#| @param string $url URL to be downloaded
+#- @return bool True on success. False otherwise
+sak_download_pipe() {
+  local url="$1" ua="Swiss-Army-Knife/${SAK_VER} T:$SAK_TS E:${SAK_BASENAME} S:${SAK_SID} M:"
+
+  # Prefer wget
+  if [[ "$SAK_USE_WGET" == "1" ]] && which wget &>/dev/null; then
+    wget -q --tries=2 -U "${ua}WGET" -O - "$url" && return 0 || return 1
+  fi
+
+  # Then LWP's GET
+  if [[ "$SAK_USE_GET" == "1" ]] && which GET &>/dev/null; then
+    GET -H "User-agent: ${ua}LWP" "$url" && return 0 || return 1
+  fi
+
+  # Then LWP's lwp-request
+  if [[ "$SAK_USE_GET" == "1" ]] && which lwp-request &>/dev/null; then
+    lwp-request -H "User-agent: ${ua}LWP" "$url" && return 0 || return 1
+  fi
+
+  # And lastly, curl
+  if [[ "$SAK_USE_CURL" == "1" ]] && which wget &>/dev/null; then
+    curl -A "${ua}CURL" -s "$url" && return 0 || return 1
+  fi
+
+  [[ "${SAK_USE_WGET}${SAK_USE_GET}${SAK_USE_CURL}" == "111" ]] &&
+    sak_fatal $SAK_ERR_INT_CMD "Could not find any download programs in \$PATH to request content." ||
+    sak_fatal $SAK_ERR_INT_CMD "Could not find manually specified download program in \$PATH."
+  return 0
+}
+
+#+ Replaces lines from stdin and writes to stdout.
+#| Reads text from stdin and replaces/deletes lines containing specific tags in
+#| the content and returns it to stdout.
+#|
+#| NOTE: Replacement should not be complex or contain regex metachars!
+#| NOTE: Lines that match when DELETE is set will remove the entire line
+#|
+#| sak_edit_tag TAG REPLACEMENT [DELETE]
+#| @param string $tag     Content tag to be replaced
+#| @param string $replace Content to be inserted
+#- @param bool $delete    When true, entire line will be deleted from output
+sak_edit_tag() {
+  local line tag="$1" new="$2" del="$3"
+
+  while read -r line; do
+    if [[ "$line" =~ $tag ]]; then
+      [[ -n "$del" ]] && continue || line="${line/$tag/$new}"
+    fi
+    printf -- '%s\n' "$line"
+  done
+}
+
+#+ Returns CLI mode status.
+#- @return bool True if CLI mode enabled. False otherwise.
+sak_cli_mode() {
+  [[ "$SAK_CLI_MODE" == "1" ]] && return 0
+  return 1
+}
+
+#@ Stores terminal size.
+sak_setwinsize() {
+  local size="$(stty size 2>/dev/null || echo "0 0")"
+
+  LINES="${size% *}"
+  COLUMNS="${size#* }"
+}
+
+#+ Checks if SIGWINCH occurred within the last second.
+#- Updates COLMUNS and ROWS global variables.
+sak_sigwincheck() {
+  local delta
+
+  let "delta = SECONDS - SAK_SIGWINCH"
+  sak_setwinsize
+  SAK_SIGWINCH=0
+
+  [[ "$delta" -lt "2" ]] &&
+    return 0
+  return 1
+}
+
+#@ Prints a backtrace in the event of an unexpected error.
+sak_backtrace() {
+  local attr misc mode line func file L n=0 i=0 IFS
+  exec 1>&3 # We only want to write to stderr within this function
+
+  # Dump backtrace
+  echo "Backtrace:"
+  while L="$(caller $i)"; do
+    let "i++"
+    line="${L%% *}";  L="${L##$line }"
+    func="${L%% *}";  file="${L##* }"
+    [[ "${file:0:7}" == "/dev/fd" ]] && file="<$SAK_BASENAME>"
+    printf '  #%-3d function "%s" at %s:%d\n' "$i" "$func" "$file" "$line"
+  done
+
+  # Dump hostname, IP, path
+  sak_cli_mode && mode="CLI" || mode="ncurses"
+  [[ -r "/proc/$SAK_PID/cmdline" ]] &&
+    cmdline="$(cat /proc/$SAK_PID/cmdline | tr '\0' ' ' | cut -d' ' -f2-)" ||
+    cmdline="${SAK_BASENAME} ${BASH_ARGV[@]}"
+  printf '\nDebugging:\n  %s\n\n  Host: %s (%s)\n  Bash: %s\n  Ver : %s (%s)        SID: %s\n  Mode: %-7s  PID: %6d  Targets: %d\n  CWD : %s\n  Command line: %s\n\n' \
+    "$(uname -a)" "$(hostname 2>/dev/null)" "$(hostname -i 2>/dev/null)" \
+    "${BASH_VERSION} (${BASH_VERSINFO[5]})" "$SAK_VER" "$SAK_TS" "$SAK_SID" \
+    "$mode" "$SAK_PID" "${#SAK_SOFTWARE[@]}" "$PWD" "$cmdline"
+
+  # Dump directory information
+  local IFS=$'\x1E'
+  dir="$PWD"
+  while [[ -n "$dir" ]]; do
+    let "n++"
+    [[ "$n" -gt "10" ]] && echo "[TRUNCATED]" && break
+    attr="$(lsattr -d "$dir" 2>/dev/null)" || continue
+    attr="${attr%% *}"
+    misc="$(stat -c $'%A\x1E%u\x1E%U\x1E%g\x1E%G' "$dir" 2>/dev/null)"
+    printf '%s %s %6d %-9s %6d %-9s %s\n' \
+      "$attr" $misc "$dir"
+    dir="$(dirname "$dir")"
+  done
+
+  printf '\n\e[0;1mPlease try to determine if this error is caused by a broken config, db, or core\nfile before reporting a bug. Most backtraces are caused by one of those 3 issues.\n\nIf you believe this is due to a bug, please include ALL output in a bug report here:\n'
+  printf '\e[4m%s\e[0m\n\n' "https://projects.hostgator.com/projects/sak"
+}
+
+#@ Clean up stale/outdated files.
+sak_cleanup() {
+  sak_log 2 "EXIT" "Script exit. Caller = $(caller 0)"
+  [[ -n "$SAK_DEBUG_LOG" ]] && printf '\nDebug log: %s\n' "$SAK_DEBUG_LOG"
+  [[ -f "$SAK_LOCKFILE" ]] && rm -f "$SAK_LOCKFILE"
+  # Meant to find and clean up stale cache files
+  if [[ -d "$SAK_CACHE_DIR" && ! -f "$SAK_CACHE_DIR/.cleaning.lock" ]]; then
+    touch "$SAK_CACHE_DIR/.cleaning.lock"
+    find "$SAK_CACHE_DIR/" -maxdepth 1 -mindepth 1 -type f \
+      \( -mtime +1 -or -name "cache_${SAK_PID}_*" -or -name ".cleaning.lock" \) \
+      -delete 2>/dev/null &
+  fi
+  # Log files older than 30 days
+  if [[ -d "$SAK_LOG_DIR" && ! -f "$SAK_LOG_DIR/.cleaning.lock" ]]; then
+    touch "$SAK_LOG_DIR/.cleaning.lock"
+    find "$SAK_LOG_DIR/" -maxdepth 1 -mindepth 1 -type f \
+      \( -mtime +30 -or -name ".cleaning.lock" \) -delete 2>/dev/null &
+  fi
+  # Since the above can take a long time, we fork and disown it
+  disown -h 2>/dev/null # Don't care if this fails
+}
+
+#+ Die with an error.
+#- @param int $status Exit status.
+sak_fatal() {
+  sak_log 3 "SAK_FATAL" "sak_fatal called. Caller = $(caller 0)"
+  local status="${1:-127}"
+  shift
+  printf "\n%s %s\e[0m\n\n" "$ERR" "$1" >&3
+  exit $status
+}
+
+#+ Die with an error and print a backtrace
+#- @param int $status Exit status.
+sak_fatal_backtrace() {
+  sak_log 3 "SAK_FATAL" "sak_fatal_backtrace called. Caller = $(caller 0)"
+  local status="${1:-127}"
+  shift
+  printf "\n%s %s\e[0m\n\n" "$ERR" "$1" >&3
+  sak_backtrace
+  exit $status
+}
+
+#@ Callback for when user presses ESC in a menu.
+sak_escaped() {
+  sak_log 3 "ESCAPED" "User pressed ESC. Caller = $(caller 0)"
+  echo "ESC pressed, exiting." >&3
+  exit $SAK_ERR_ESC
+}
+
+#@ Signal trap to clean up properly.
+sak_trap() {
+  sak_log 3 "TRAPPED" "Signal trapped. Caller = $(caller 0)"
+  echo "Signal caught, cleaning up and exiting." >&3
+  exit $SAK_ERR_UNK
+}
+
+##################################################################
+##################################################################
+#
+# Miscellaneous Functions
+#
+
+#+ Generate a random password.
+#| Uses entropy provided by /dev/urandom
+#|
+#| sak_make_password [LENGTH] [SAFER]
+#| @param int $length Requested password length.
+#| @param bool $safe  If set to true, some symbols will not be used.
+#- @return string Pseudo-random password.
+sak_make_password() {
+  local l="${1:-12}" safe="$2"
+  [[ -z "$safe" ]] &&
+    tr -d '\0-\40\47\134\133-\135\140\177-\377' < /dev/urandom | head -c $l ||
+    tr -d '\0-\52\74-\76\133-\135\140\173-\377' < /dev/urandom | head -c $l
+}
+
+#+ Convert data from various types to integer (0 or 1).
+#| @param mixed $input  Input data to convert.
+#- @return int|bool     Returns int representation or False on error.
+sak_to_bool() {
+  local result='' ret=1
+  shopt -s nocasematch
+  case "$1" in 1|enable|enabled|on|true|yes) printf 1; ret=0;;
+  0|disable|disabled|off|false|no) printf 0; ret=0;; esac
+  shopt -u nocasematch
+  return "$ret"
+}
+
+#+ Determine backup location.
+#| Used to store backups in a user's home directory when enabled. If home
+#| backups are disabled, or there is a problem the path given will be returned.
+#| @param string $path     Working directory of the backup to be created.
+#| @param bool   $inhome   Optional. Used to override SAK_BUP_HOME.
+#- @return string Directory path where the backup should be stored.
+sak_get_backup_loc() {
+  local path="$1" inhome="$2" home subdir target re="/home[0-9]?/[^/]+/public_html"
+  local dohome="${inhome:-$SAK_BUP_HOME}"
+
+  [[ "$dohome" != "1" || ! "$path" =~ $re ]] &&
+    echo "$path" && return 0
+  subdir="${path#/home*/*/}"
+  home="${path%%/public_html*}"
+  target="${home}/backups";
+  sak_target="sak/${subdir}"
+
+  umask 022 && mkdir -p "$target" && umask 077 && mkdir -p "${target}/${sak_target}" &&
+    echo "$target" && return 0 ||
+    sak_message "Warning" "Unable to create backup directory. Storing in-tree."
+
+  echo "$path"
+  umask 077
+  return 0
+}
+
+##################################################################
+##################################################################
+#
+# MySQL/PHP Functions
+#
+
+#+ Check for a specific MySQL user.
+#| sak_mysql_check_user USER
+#| @param string $user Username to check.
+#- @return bool|string True if user exists. False with error message otherwise.
+sak_mysql_check_user() {
+  local err user="$1"
+
+  [[ -z "$user" ]] && return 1
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/php/commands.php" --root --check-user "$user" 2>&1 >/dev/null)"
+
+  [[ -n "$err" ]] &&
+    echo "$err" &&
+    return 1
+  return 0
+}
+
+#+ Check for suspension for the specified user.
+#| sak_mysql_check_suspension USER
+#| @param string $user Username to check.
+#- @return bool|string True if user exists. False with error message otherwise.
+sak_mysql_check_suspension() {
+  local err user="$1"
+
+  [[ -z "$user" ]] && return 1
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/php/commands.php" --root --check-suspension "$user" 2>&1)"
+  retval=$?
+
+  [[ -n "$err" || $retval -ne 0 ]] &&
+    echo "$err" &&
+    return 0
+  return 1
+}
+
+
+#+ Tests a MySQL login for access to a database.
+#| sak_mysql_check_auth_db USER PASS DATABASE
+#| @param string $user      Username for login.
+#| @param string $pass      Password for login.
+#| @param string $database  Database name to test for access.
+#- @return bool|string True on success. False with error message otherwise.
+sak_mysql_check_auth_db() {
+  local cfile err user="$1" pass="$2" db="$3"
+
+  cfile="$(sak_mkcache)" || return 1
+
+  # Make a temporary MySQL client ini
+  printf '[client]\nuser="%s"\npass="%s"\n' "$user" "${pass/\"/\\\"}" > "$cfile"
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/php/commands.php" --ini "$cfile" --db "$db" \
+    --check-auth-db 2>&1)"
+
+  [[ -n "$err" ]] &&
+    echo "$err" &&
+    return 1
+  return 0
+}
+
+#+ Creates a new MySQL username and password.
+#| sak_mysql_create_auth VIRTUSER PASSWORD
+#| @param string $user Username.
+#| @param string $pass Password.
+#- @return bool|string True on success. False with error message otherwise.
+sak_mysql_create_auth() {
+  local user="$1" pass="$2"
+
+  [[ -z "$user" || -z "$pass" ]] && return 1
+  cfile="$(sak_mkcache)" || return 1
+
+  printf '%s\t%s' "$user" "$pass" > "$cfile"
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/php/commands.php" --root --create-auth "$cfile" 2>&1)"
+
+  [[ -n "$err" ]] &&
+    echo "$err" &&
+    return 1
+  return 0
+}
+
+#+ Updates a MySQL username and password.
+#| sak_mysql_create_pass VIRTUSER PASSWORD
+#| @param string $user Username.
+#| @param string $pass Password.
+#- @return bool|string True on success. False with error message otherwise.
+sak_mysql_create_pass() {
+  local user="$1" pass="$2"
+
+  [[ -z "$user" || -z "$pass" ]] && return 1
+  cfile="$(sak_mkcache)" || return 1
+
+  printf '%s\t%s' "$user" "$pass" > "$cfile"
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/php/commands.php" --root --create-pass "$cfile" 2>&1)"
+
+  [[ -n "$err" ]] &&
+    echo "$err" &&
+    return 1
+  return 0
+}
+
+#+ Gives full privileges to a virtual user to a database.
+#| sak_mysql_create_grant VIRTUSER DATABASE
+#| @param string $user Username.
+#| @param string $database Database.
+#- @return bool|string True on success. False with error message otherwise.
+sak_mysql_create_grant_manual() {
+  local err user="$1" db="$2"
+
+  [[ -z "$user" || -z "$db" ]] && return 1
+  err="$("$SAK_PHP" -q "$SAK_MOD_DIR/php/commands.php" --root --db "$db" \
+    --create-grant "$user" 2>&1)"
+
+  [[ -n "$err" ]] &&
+    echo "$err" &&
+    return 1
+  return 0
+}
+
+#+ Associate a cPanel user with a MySQL user and database and grant all privileges.
+#| (cPanel only) Grants and maps mysql user privileges and database to a user.
+#|
+#| sak_cpanel_map_privs OWNER VIRTUSER DATABASE
+#| @param string $owner    cPanel username.
+#| @param string $user     Virtual MySQL user.
+#| @param string $database Database.
+#- @return bool|string True on success. False with error message otherwise.
+sak_cpanel_map_privs() {
+  local err input owner="$1" user="$2" db="$3" exe="/usr/local/cpanel/bin/cpmysqladmin"
+
+  [[ ! -x "$exe" ]] &&
+    sak_fatal $SAK_ERR_UNK "Database admin tool does not exist or is not executable. Is this not a cPanel system?"
+
+  printf -v input '%d ADDUSERDB %s %s all' "$owner" "$db" "$user"
+  err="$("$exe" <<< "$input")"
+
+  [[ -n "$err" ]] &&
+    echo "$err" &&
+    return 1
+  return 0
+}
+
+#+ Associate a cPanel user with a MySQL user and database.
+#| (cPanel only) Maps a mysql user and database to a user.
+#|
+#| sak_cpanel_map_dbuser OWNER VIRTUSER DATABASE
+#| @param string $owner    cPanel username.
+#| @param string $user     Virtual MySQL user.
+#| @param string $database Database.
+#- @return bool|string True on success. False with error message otherwise.
+sak_cpanel_map_dbuser() {
+  local err owner="$1" user="$2" db="$3" exe="/usr/local/cpanel/bin/dbmaptool"
+
+  [[ ! -x "$exe" ]] &&
+    sak_fatal $SAK_ERR_UNK "Database map tool does not exist or is not executable. Is this not a cPanel system?"
+
+  err="$("$exe" "$owner" --type "mysql" --dbs "$db" --dbusers "$user")"
+
+  [[ -n "$err" ]] &&
+    echo "$err" &&
+    return 1
+  return 0
+}
+
+#+ Retrieve configuration file values.
+#| Pulls define and variable settings from typical PHP config files. Values are
+#| trimmed of whitespace and quotes.
+#|
+#| NOTE: -a (array) flag does not check the parent array name! This is primarily
+#| only used for W3 Total Cache settings which returns a generic array. May
+#| change later.
+#|
+#| sak_get_php_opt [-a|-d|-v] FILE OPTNAME
+#| @param string $type=-d Type of value. Default is -d (define).
+#| @param string $file    File path.
+#| @param string $name    Name of identifier to retrieve.
+#- @return string|bool    Value of identifier on success. False otherwise.
+sak_get_php_opt() {
+  local file l name re sre value type="-d"
+
+  [[ -n "$3" ]] && type="$1" && shift
+  file="$1"
+  name="$2"
+  [[ ! -f "$file" ]] && return 1
+
+  case "$type" in
+    -a) # Last array will succeed, so we tail -n 1
+      printf -v re '[\x27"]?%s[\x27"]?\\s*=>\\s*[\x27"]?.*?[\x27"]?\\s*[,)]' "$name"
+      printf -v sre 's/^[\x27"]?%s[\x27"]?\\s*=>(\\s*[\x27"]?.*?[\x27"]?\\s*)[,)]$/\\1/' "$name"
+      value="$("$SAK_PHP" -w "$file" | grep -oP "$re" | tail -n 1 | sed -r "$sre")" ||
+        return 1 ;;
+    -d) # Only first define() will succeed, so we head -n 1
+      printf -v re '(?i:define\\s*\\(\\s*[\x27"]?(?-i:%s)[\x27"]\\s*,[^)]+[^\\\\]\\);)' "$name"
+      printf -v sre 's/^\\s*\\S+\\s*\\(\\s*[\x27"]?%s[\x27"]?\\s*,\\s*([\x27"]?.*?[\x27"]?)\\s*\\);\\s*/\\1/' "$name"
+      value="$("$SAK_PHP" -w "$file" | grep -oP "$re" | head -n 1 | sed -r "$sre")" ||
+        return 1 ;;
+    -v) # Last variable will succeed, so we tail -n 1
+      printf -v re '\\$%s\\s*=\\s*[\x27"]?.*?[\x27"]?\\s*;' "$name"
+      printf -v sre 's/^\\$%s\\s*=(\\s*[\x27"]?.*?[\x27"]?\\s*);/\\1/' "$name"
+      value="$("$SAK_PHP" -w "$file" | grep -oP "$re" | tail -n 1 | sed -r "$sre")" ||
+        return 1 ;;
+  esac
+
+  # trim whitespace
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+
+  re="^('.*'|\".*\")$"
+  if [[ "$value" =~ $re ]]; then
+    let "l=${#value}-2"
+    value="${value:1:$l}"
+  fi
+
+  printf "$value"
+  return 0
+}
+
+##################################################################
+##################################################################
+#
+# File/Directory Functions
+#
+
+#+ File and directory backup.
+#| Targets are for the PATH given and do not need PATH prefixed.
+#| @uses sak_file_backup_fork
+#| @param string $path        Parent directory of backup.
+#| @param string $name        Name of the backup. Default = "manual-backup"
+#| @param bool   $inhome      Optional. Used to override SAK_BUP_HOME.
+#| @param bool   $noexclude   If 1, disables default file exclusions.
+#| @param string $targets...  Arbitrary list of targets. Wildcards allowed.
+#- @return bool True on success.
+sak_file_backup() {
+  sak_log_ifdebug "sak_file_backup $@ -- Caller = $(caller 0)"
+  local backup path="$1" name="${2:-manual-backup}" inhome="${3:-$SAK_BUP_HOME}" \
+        exclude="$4" options="${SAK_TAR_EXCLUDE[@]}"
+
+  shift 4 # Skip to targets
+  printf -v backup '%s/sak-%s-%s.tar.gz' \
+    "$(sak_get_backup_loc "$path" "$inhome")" "$name" "$(date +'%Y-%m-%d_%H-%M-%S')"
+
+  if [[ "$exclude" -eq "1" ]]; then options=""; fi
+
+  cd "$path"
+
+  (( SAK_QUIET < 2 )) &&
+    sak_message "Backup" \
+      "Creating backup...\n\nPATH: `dirname $backup`\nFILE: `basename $backup`" 6 60 ||
+    sak_message "Backup" "$backup"
+
+  if [[ "$SAK_QUIET" -le "0" ]]; then
+    sak_file_backup_fork "$backup" "$options" "$@" &> "$SAK_LOG_DIR/backup.$SAK_PID.log" &
+
+    sak_tail_file "Backup Log $SAK_LOG_DIR/backup.$SAK_PID.log" \
+                  "$SAK_LOG_DIR/backup.$SAK_PID.log" \
+                  "$!"
+  else
+    sak_file_backup_fork "$backup" "$options" "$@" &> "$SAK_LOG_DIR/backup.$SAK_PID.log"
+    (( SAK_QUIET < 2 )) && echo &&
+    /bin/ls -l "$backup" 2>/dev/null && echo
+  fi
+
+  cd "$owd"
+
+  return 0
+}
+
+#@ @internal
+sak_file_backup_fork() {
+  local backup="$1" options="$2"
+  shift 2
+  echo "+++ $SAK_BACKTITLE - Backup Start - $(date +'%Y-%m-%d %H-%M-%S')"
+  tar $options -cvzf "$backup" $@
+  echo
+  /bin/ls -l "$backup" 2>/dev/null
+  echo
+  echo "+++ $SAK_BACKTITLE - Backup Finished - $(date +'%Y-%m-%d %H-%M-%S')"
+}
+
+##################################################################
+##################################################################
+#
+# Database Functions
+#
+
+#+ Generate a MySQL dump of a database.
+#| sak_data_backup DATABASE PATH
+#| @uses sak_data_backup_fork
+#| @uses sak_tail_file
+#| @param string $database Database to dump.
+#| @param string $path     Path of the backup to create.
+#- @return int Exit status of {@link sak_tail_file}
+sak_data_backup() {
+  sak_log_ifdebug "sak_data_backup $@ -- Caller = $(caller 0)"
+  local db="$1" path="$2"
+
+  [[ -z "$db" || -z "$path" ]] && return 1
+
+  ts="$(date +'%Y-%m-%d_%H-%M-%S')"
+  backup="$(sak_get_backup_loc "$path")/sak-backup-$db-$ts.sql.gz"
+
+  sak_data_backup_fork "$db" "$backup" &> "$SAK_LOG_DIR/backup.$SAK_PID.log" &
+
+  sak_tail_file "Backup Log $SAK_LOG_DIR/backup.$SAK_PID.log" \
+                "$SAK_LOG_DIR/backup.$SAK_PID.log" \
+                "$!"
+
+  return "$?"
+}
+
+#@ @internal
+sak_data_backup_fork() {
+  local db="$1" file="$2" RES
+
+  # TODO: Show some sort of progress here
+  echo "+++ $SAK_BACKTITLE - Backup Start - $(date +'%Y-%m-%d %H-%M-%S')"
+  echo "Dumping \`$db' to $file ..."
+  mysqldump "$db" | gzip -9 - > "$file"
+  RES="$?"
+  echo
+  /bin/ls -l "$file" 2>/dev/null
+  echo
+  echo "+++ $SAK_BACKTITLE - Backup Finished - $(date +'%Y-%m-%d %H-%M-%S')"
+  return "$RES"
+}
+
+##################################################################
+##################################################################
+#
+# Core File Functions
+#
+
+#+ Downloads core install files for an installation.
+#| sak_core_get_install INDEX
+#| @uses sak_core_get_install_generic
+#| @param int $index Software install index.
+#- @return bool True on success. False otherwise.
+sak_core_get_install() {
+  local i="$1" vuln soft path ver
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+  case "$soft" in
+    wordpress|joomla)
+      if ! sak_core_check_avail "$soft" "$ver"; then
+        sak_wait_message 10 "Error" "$(sak_soft_name "$soft") version ${ver} is not available for download! If this is a new release, please file a bug report."
+        return 1
+      fi
+      sak_core_get_install_generic "$soft" "$ver" ;;
+    *) sak_wait_message 10 "Error" "$(sak_soft_name "$soft") is not supported."
+       return 1 ;; # We don't support it! (yet)
+  esac
+  return 0
+}
+
+#@ @internal
+sak_core_get_install_generic() {
+  local inst md5s soft="$1" ver="$2" url="http://sak.dev.gatorsec.net/software"
+
+  mkdir -p "$SAK_CORE_TMP/$soft"
+  inst="$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz"
+  md5s="$SAK_CORE_TMP/$soft/$soft-$ver.md5.gz"
+
+  if [[ ! -s "$inst" ]]; then
+    sak_message "Downloading" "Downloading `sak_soft_name $(sak_soft_name ${soft})` ${ver} installation..." 5 45
+    sak_download "$url/installs/$soft/$soft-$ver.tar.gz" "$inst" ||
+      sak_fatal_backtrace $SAK_ERR_INT_CNF "Could not download core install!"
+  fi
+
+  if [[ ! -s "$md5s" ]]; then
+    sak_message "Downloading" "Downloading `sak_soft_name $(sak_soft_name ${soft})` ${ver} checksums..." 5 45
+    sak_download "$url/checksums/$soft/$soft-$ver.md5.gz" "$md5s" ||
+      sak_fatal_backtrace $SAK_ERR_INT_CNF "Could not download core checksums!"
+  fi
+  return "$?"
+}
+
+#+ Check for software based on installation index
+#| @uses sak_core_check_avail
+#| @param string $index Installation index.
+#- @return bool True if exists. False otherwise. Script exit on fatal errors.
+sak_core_check_avail_index() {
+  local i="$1"
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+  sak_core_check_avail "$soft" "$ver" && return 0
+  return 1
+}
+
+#+ Check for a specific software version.
+#| Creates and updates cache file of software in the repository. Returns if
+#| requested software and version exists.
+#| @param string $software  Software name.
+#| @param string $version   Software version.
+#- @return bool True if exists. False otherwise. Script exit on fatal errors.
+sak_core_check_avail() {
+  local soft="$1" ver="$2" g item ts="" now="$(date +%s)" re='^[0-9]+$' \
+        url="http://sak.dev.gatorsec.net/software/available.php"
+
+  [[ -f "$SAK_CORE_AVAIL" ]] && read -r ts g < "$SAK_CORE_AVAIL"
+
+  # Download if ts is invalid or delta > 6 hours (in seconds)
+  if [[ -n "$SAK_CORE_REFRESH" || -z "$ts" || ! "$ts" =~ $re ]] || (( now - ts > 21600 )); then
+    sak_message "Cache" "Updating available core installations."
+    SAK_CORE_REFRESH=""
+    cfile="$(sak_mkcache)" ||
+      sak_fatal $SAK_ERR_UNK "Could not create cache file! Check for room and any filesystem problems."
+
+    sak_download "$url" "$cfile" &&
+    read -r ts g < "$cfile" ||
+      sak_fatal $SAK_ERR_UNK "Could not query available core installs! Is there a networking issue?"
+
+    [[ -z "$ts" || ! "$ts" =~ $re ]] && # Check that new timestamp is valid
+      sak_fatal $SAK_ERR_UNK "Error checking available core installs! Timestamp invalid!"
+
+    if (( now - ts <= 60 )); then       # Allow up to 60 second clock skew
+      mv -f "$cfile" "$SAK_CORE_AVAIL" &>/dev/null ||
+        sak_fatal $SAK_ERR_UNK "Could not copy cache file for available installs!"
+    else
+      sak_fatal $SAK_ERR_UNK "Error checking available core installs! Timestamp delta too high! Is system clock correct?"
+    fi
+  fi
+
+  while read -r item; do  # about as simple as it gets...
+    [[ "$item" == "${soft}-${ver}" ]] && return 0
+  done < "$SAK_CORE_AVAIL"
+  return 1
+}
+
+#+ Display a core file diff.
+#| sak_core_diff INDEX [SUMMARY]
+#| @param int $index Software install index.
+#- @param bool $sum  Summary mode (show checksums test only) if true.
+sak_core_diff() {
+  sak_log_ifdebug "sak_core_diff $@ -- Caller = $(caller 0)"
+  local i="$1" sum="${2:-0}" f=0 m=0 t=0 file files=() missing=() owd="$PWD" \
+        url="http://sak.dev.gatorsec.net/software/source" \
+        re="\.(php[345]?|html|htm|phtml|shtml|js|xml|css)$" \
+        vunl soft path ver IFS=$'\n'
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+  sak_core_get_install "$i" ||
+    return 1
+  cd "$path" ||
+    sak_fatal $SAK_ERR_UNK "Could not change directories to: $path"
+
+  sak_message "Diff" "Verifying core files..."
+  while IFS=$':' read -r file status; do
+    ((t++))
+    [[ "$status" == " FAILED open or read" ]] &&
+      missing[((m++))]="$file" && continue
+    [[ "$status" == " FAILED" && "$file" =~ $re ]] &&
+      files[((f++))]="$file"
+  done <<< "$(zcat "$SAK_CORE_TMP/$soft/$soft-$ver.md5.gz" | md5sum -c - 2>/dev/null)"
+
+  sak_message "Diff" "Checksum failed on $f file(s) with $m missing.\nTotal files checked: $t"
+  if [[ "${#files[@]}" -gt "0" || "${#missing[@]}" -gt "0" ]]; then
+    echo -e "File differences for $(sak_soft_name ${soft}) $ver at $path\n\nNOTE: Files that fail but do not show a diff only have changes in whitespace characters." > \
+      "$SAK_LOG_DIR/diff.$SAK_PID.log"
+
+    if [[ "${#missing[@]}" -gt "0" ]]; then
+      printf "\n\e[31mMissing Files:\e[0m\n" >> "$SAK_LOG_DIR/diff.$SAK_PID.log"
+      printf "%s\n" "${missing[@]}" >> "$SAK_LOG_DIR/diff.$SAK_PID.log"
+    fi
+
+    if [[ "${#files[@]}" -gt "0" ]]; then
+      printf "\n\e[33mChecksum Failed Files:\e[0m\n" >> "$SAK_LOG_DIR/diff.$SAK_PID.log"
+      printf "%s\n" "${files[@]}" >> "$SAK_LOG_DIR/diff.$SAK_PID.log"
+      if [[ "$sum" == "0" ]]; then
+        printf "\n\n\e[34mFile differences (Unified):\e[0m\n" >> "$SAK_LOG_DIR/diff.$SAK_PID.log"
+        sak_message "Diff" "Generating unified diff."
+        for file in "${files[@]}"; do
+          sak_download_pipe "$url/$soft/$soft-$ver/$file" | diff -uBw - "$file"
+        done | sed -ur 's/^(-.*)/\x1B[32m\1\x1B[0m/g;s/^(\+.*)/\x1B[31m\1\x1B[0m/g' \
+          >> "$SAK_LOG_DIR/diff.$SAK_PID.log"
+        less -SR "$SAK_LOG_DIR/diff.$SAK_PID.log"
+      else
+        t="$(wc -l "$SAK_LOG_DIR/diff.$SAK_PID.log" 2>/dev/null)"
+        [[ "${t% *}" -le "50" ]] &&
+          echo && cat "$SAK_LOG_DIR/diff.$SAK_PID.log" && echo ||
+          less -SR "$SAK_LOG_DIR/diff.$SAK_PID.log"
+      fi
+    fi
+  else
+    if [[ "$SAK_CLI_MODE" -eq "1" ]]; then
+      sak_message "Diff" "No differences found."
+    else
+      sak_waitbox 5 "Information" "No differences found for:\n\n $path"
+    fi
+  fi
+
+  cd "$owd"
+}
+
+#+ Replaces core install files for an installation.
+#| sak_core_replace INDEX
+#| @uses sak_core_replace_generic
+#| @param int $index Software install index.
+#- @return bool True on success. False otherwise.
+sak_core_replace() {
+  sak_log_ifdebug "sak_core_replace $@ -- Caller = $(caller 0)"
+  local i="$1" vuln soft path ver
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  # This only exists in case certain software has special requirements
+  case "$soft" in
+    wordpress|joomla) sak_core_replace_generic "$i" || return 1 ;;
+    *) return 1 ;; # Unsupported
+  esac
+  return 0
+}
+
+#@ @internal
+sak_core_replace_generic_file() {
+  local i="$1" file="$2" cfile nfile owner group owd="$PWD" \
+        url="http://sak.dev.gatorsec.net/software/source/%s/%s-%s/%s" \
+        vuln soft path ver
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+  cd "$path" ||
+    sak_fatal $SAK_ERR_UNK "Could not change directories to: $path"
+
+  if ! nfile="$(readlink -f "$file" 2>/dev/null)"; then # canonicalize path
+    sak_fatal $SAK_ERR_ARG "Unable to determine full path to file: $file"
+  elif [[ -e "$nfile" && ! -f "$nfile" ]]; then # if exist, better be a file
+    sak_fatal $SAK_ERR_ARG "Target exists, but is not a file: $file"
+  elif [[ "$nfile" =~ ^/ ]]; then # should always trigger due to readlink
+    nfile="${nfile#$PWD/}"
+    [[ "$nfile" =~ ^/ ]] && # didn't match $PWD
+      sak_message "Error" "Specified target is not relative to this install.\nPlease specify a filename located within: $PWD" &&
+      exit $SAK_ERR_ARG
+  fi
+
+  file="$nfile"
+  sak_core_get_install "$i" || return 1
+  md5s="$SAK_CORE_TMP/$soft/$soft-$ver.md5.gz"
+
+  # Last chance validation
+  if ! zgrep -qP "^.{32}  (:?\./)?$nfile\$" "$md5s"; then
+    sak_fatal $SAK_ERR_ARG "File not found in core install: $file"
+  fi
+
+  if [[ -e "$file" ]]; then
+    owner="$(stat -c "%u %g" "$nfile")"
+    group="${owner#* }"
+    owner="${owner% *}"
+  else
+    owner="$(stat -c "%u" .)"
+    group="${SAK_GIDS[$owner]}"
+  fi
+
+  if [[ "$owner" -lt "500" || "${SAK_UIDS[$owner]}" == "nobody" || \
+        ( -n "$group" && "$group" -lt "500" ) ]]
+  then
+    sak_fatal $SAK_ERR_UNK "Permissions or owner of the file or current directory is invalid. >${owner}:${group}<"
+  fi
+
+  if [[ -f "$file" ]]; then
+    sak_message "Replace" "Creating backup."
+    ((SAK_QUIET+=2))
+    sak_file_backup "$path" "${soft}-file" 1 1 "$file"
+    ((SAK_QUIET-=2))
+  fi
+
+  printf -v url "$url" "$soft" "$soft" "$ver" "$file"
+  cfile="$(sak_mkcache)"
+  sak_message "Replace" "Attempting to download fresh copy of file."
+  if ! sak_download "$url" "$cfile"; then
+    sak_message "Warning" "Unknown error downloading replacement file. Extracting from tarball."
+    if ! tar --no-same-owner -Oxzf "$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz" "$file" > "$cfile"; then
+      rm -f "$cfile"
+      sak_fatal $SAK_ERR_UNK "Could not download and/or extract replacement file."
+    fi
+  fi
+
+  sak_message "Replace" "Installing and adjusting permissions, ownership."
+  umask 0022
+  touch "$file"                     &&
+  chown "${owner}:${group}" "$file" &&
+  cat "$cfile" > "$file"
+  umask 0077
+
+  sak_message "Replace" "Complete."
+  rm -f "$cfile"
+  echo; /bin/ls -l "$file"; echo
+  cd "$owd"
+
+  return 0
+}
+
+#+ Performs backup and replacement of files.
+#| sak_core_replace_generic INDEX [NOSTAT OWNER]
+#| @uses sak_core_set_stats
+#| @param int $index    Software install index.
+#| @param bool $nostat  Skip file statlog. See {@link sak_cli_wp_resurrect}.
+#| @param string $owner Required when $nostat is True. See {@link sak_cli_wp_resurrect}.
+#- @return bool True on sucess. False otherwise.
+sak_core_replace_generic() {
+  local i="$1" statlog file missing owner group ts \
+        domiss=0 nostat="${2:-0}" owd="$PWD" owner="$3" \
+        vuln soft path ver
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  cd "$path" ||
+    sak_fatal $SAK_ERR_UNK "Could not change directories to: $path"
+
+  if [[ "$nostat" != "1" ]]; then
+    # Make our backup before we do anything
+    sak_core_backup "$i" || return 1
+
+    ts="$(date +'%Y-%m-%d_%H-%M-%S')"
+    statlog="$(sak_get_backup_loc "$path")/sak-statlog-${ts}.gz"
+
+    sak_message "Ownership" "Backing up file ownership..." 5 35
+
+    # Store stat info about the files we're replacing
+    # user  group  mode  atime  mtime  ctime  size  filename
+    tar -tzf "$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz" | \
+      sak_core_filter "$path" | \
+      xargs stat -c $'%U\t%G\t%a\t%X\t%Y\t%Z\t%s\t%n' | \
+      gzip -9 - > \
+      "$statlog"
+
+    # Keep track of missing files
+    while read -r file; do
+      if [[ ! -e "$file" ]]; then
+        printf -v missing "%s%s\n" "$missing" "$file"
+        domiss=1
+      fi
+    done <<< "$(tar -tzf "$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz")"
+
+    sak_message "Extracting" "Extracting $(sak_soft_name ${soft}) ${ver}..." 5 45
+
+    # Extract directly over our current directory
+    umask 0022
+    tar --no-same-owner \
+        -xzf "$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz"
+
+    # If we have any files that were missing, we do special handling
+    if [[ "$domiss" -eq "1" ]]; then
+      # Guess the owner based on the current diretory owner (dirty)
+      owner="$(stat -c %u .)"
+      # Use user's primary gid as group
+      group="${SAK_GIDS[$owner]}"
+      # Check that we're not doing something crazy
+      if [[ -n "$owner" && "$owner" -ge "500" && "${SAK_UIDS[$owner]}" != "nobody" && \
+            -n "$group" && "$group" -ge "500" ]]
+      then
+        for file in $missing; do
+          printf '%s\x1E%s\x1E%s\n' "$owner" "$group" "$file"
+        done | sak_core_set_stats "$path"
+      #else
+        # TODO: error
+      fi
+    fi
+
+    # Restore ownership
+    zcat "$statlog" | cut -d$'\t' --output-delimiter=$'\x1E' -f1,2,8 | \
+      sak_core_set_stats "$path"
+  else
+    # Extract directly over our current directory
+    umask 0022
+    tar --no-same-owner \
+        -xzf "$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz"
+
+    # Use user's primary gid as group
+    group="${SAK_GIDS[$owner]}"
+    while read -r file; do
+      printf '%s\x1E%s\x1E%s\n' "$owner" "$group" "$file"
+    done <<< "$(tar -tzf "$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz")" | \
+      sak_core_set_stats "$path"
+  fi
+
+  umask 0077
+  cd "$owd"
+
+  return 0
+}
+
+#+ Restores file ownership reading input from statlog.
+#| sak_core_set_stats PATH
+#| @todo Restore file modes?
+#| @param int $index Software install index.
+#- @return bool True.
+sak_core_set_stats() {
+  local u g i=0 l=0 user group file files=() owd="$PWD" path="$1"
+
+  cd "$path"
+
+  sak_message "Ownership" "Correcting file ownership..." 5 35
+  while IFS=$'\x1E' read -r user group file; do
+    # We're caching user:group and forking when it changes otherwise
+    # we keep chugging until we hit an acceptable arg count
+    if [[ -z "$u$g" ]]; then
+      u="$user"
+      g="$group"
+    fi
+
+    # Fork if character total >= 7000, args >= 2000, or if user:group changes
+    if [[ "$l" -ge "7000" || "$i" -ge "2000" || "x$u:x$g" != "x$user:x$group" ]]; then
+      # Fork!
+      chown "$u:$g" ${files[@]}
+
+      # Reset our stats
+      i=0; l=0
+      files=()
+      u="$user"
+      g="$group"
+    fi
+
+    let "l = $l + ${#file}"
+    files[((i++))]="$file"
+  done
+
+  # Finish up anything left over
+  if [[ -n "${files[@]}" ]]; then
+    chown "$u:$g" ${files[@]}
+  fi
+
+  cd "$owd"
+
+  return 0
+}
+
+#+ Performs a core install backup.
+#| sak_core_backup INDEX
+#| @uses sak_core_backup_fork
+#| @param int $index Software install index.
+#- @return bool True.
+sak_core_backup() {
+  sak_log_ifdebug "sak_core_backup $@ -- Caller = $(caller 0)"
+  local i="$1" ts backup owd="$PWD" soft path ver \
+        options=${SAK_TAR_EXCLUDE[@]}
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  if [[ ! -s "$SAK_CORE_TMP/$soft/$soft-$ver.md5.gz" ]]; then
+    sak_core_get_install "$i" || return 1
+  fi
+
+  ts="$(date +'%Y-%m-%d_%H-%M-%S')"
+  backup="$(sak_get_backup_loc "$path")/sak-backup-$soft-$ts.tar.gz"
+
+  cd "$path" ||
+    sak_fatal $SAK_ERR_UNK "Could not change directories to: $path"
+
+  sak_message "Backup" \
+    "Creating backup...\n\nPATH: `dirname $backup`\nFILE: `basename $backup`" \
+    6 60
+
+  if [[ "$SAK_QUIET" -le "0" ]]; then
+    sak_core_backup_fork "$i" "$backup" $options &> "$SAK_LOG_DIR/backup.$SAK_PID.log" &
+
+    sak_tail_file "Backup Log $SAK_LOG_DIR/backup.$SAK_PID.log" \
+                  "$SAK_LOG_DIR/backup.$SAK_PID.log" \
+                  "$!"
+  else
+    sak_core_backup_fork "$i" "$backup" $options &> "$SAK_LOG_DIR/backup.$SAK_PID.log"
+    echo
+    /bin/ls -l "$backup" 2>/dev/null
+    echo
+  fi
+
+  cd "$owd"
+
+  return 0
+}
+
+#+ @internal
+#- @uses sak_core_filter
+sak_core_backup_fork() {
+  local i="$1" backup="$2" options="$3"
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  echo "+++ $SAK_BACKTITLE - Backup Start - $(date +'%Y-%m-%d %H-%M-%S')"
+  zcat "$SAK_CORE_TMP/$soft/$soft-$ver.md5.gz" | \
+    cut -d\  -f3 | \
+    sak_core_filter "$path" | \
+    xargs tar $options -cvzf "$backup"
+  echo
+  /bin/ls -l "$backup" 2>/dev/null
+  echo
+  echo "+++ $SAK_BACKTITLE - Backup Finished - $(date +'%Y-%m-%d %H-%M-%S')"
+}
+
+#+ Filters non-existant files via pipe.
+#| @deprecated Old function. Should not be needed now as there are better ways.
+#- @internal
+sak_core_filter() {
+  local line file path="$1" md5="$2"
+
+  if [[ -z "$md5" ]]; then
+    while read -r file; do
+      if [[ -e "$path/$file" ]]; then
+        echo "$file"
+      fi
+    done
+  else
+    while read -r line; do
+      file="${line:34}"
+      if [[ -e "$path/$file" ]]; then
+        echo "$line"
+      fi
+    done
+  fi
+}
+
+#+ Finds orphaned files or directories.
+#| The principle behind this first takes the directories listed in the install
+#| tarballs and calls find -(min|max)depth 1 on them so that we do not descend
+#| into directories with potentially large amounts of inodes.
+#| @todo Unused variable $filter?
+#| @uses sak_core_orphan_filter
+#| @param int $index Software install index.
+#- @return bool True on success. False otherwise.
+sak_core_orphans() {
+  local l i="$1" odir="$PWD" lfile ofile tfile \
+        filter="$2" soft path ver
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  case "$soft" in
+    joomla|wordpress) ;;
+    *) return 1 ;; # Not supported
+  esac
+
+  sak_core_get_install "$i" || return 1
+
+  tfile="$(sak_mkcache)"  # Temp store
+  ofile="$(sak_mkcache)"  # Orphan storage
+  lfile="$(sak_mkcache)"  # Final output storage for display
+
+  cd "$path" ||
+    sak_fatal $SAK_ERR_UNK "Could not change directory to '$path' !"
+
+  # Find all items in core directories (does not descend any farther)
+  # Subshell so files are sorted properly
+  (
+    find -maxdepth 1 -mindepth 1 -type f | sed -r 's|^\./?||g' &&
+    tar -tf "$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz" | \
+      grep '/$' | \
+      sed -r 's:(^\./|/$)::g' | \
+      xargs -I_DIRS_ \
+      find _DIRS_ -mindepth 1 -maxdepth 1 \( -type d -iname cache -print -prune \) -or -print \
+      2>/dev/null
+  ) | sort > "$tfile"
+
+  # Diff to install tarball
+  tar -tf "$SAK_CORE_TMP/$soft/$soft-$ver.tar.gz" | \
+    sed -r 's:(^\./|/$)::g' | \
+    sort | \
+    diff "$tfile" - | \
+    grep '^< ' | \
+    sed 's/^< //' > "$ofile"
+
+  l="$(wc -l "$ofile")"
+  l="${l%% *}"
+
+  if [[ "$l" -gt "0" ]]; then
+    sak_core_orphan_filter "$ofile" "$l" > "$lfile"
+    # Re-used
+    l="$(wc -l "$lfile")"
+    l="${l%% *}"
+    let "l = (l * 100) / LINES" 2>/dev/null # If LINES=0 or unset, l survives
+    [[ "$SAK_CLI_MODE" -eq "0" || "$l" -gt "50" ]] &&
+      less -SR "$lfile" ||
+      cat "$lfile"
+  else
+    sak_wait_message 5 "Information" "No orphans found."
+  fi
+
+  rm -f "$lfile" "$ofile" "$tfile"
+  cd "$odir"
+  return 0
+}
+
+#@ @internal
+sak_core_orphan_filter() {
+  local file list ofile="$1" l="$2" n=0 f=0 IFS=$'\x1E'
+
+  if [[ "${SAK_ORPHAN_OPTS[0]}" -eq "1" ]]; then
+    echo -e "\n\e[1mFiltered\e[0m list of orphans at $PWD:\n"
+    while read -r; do
+      let "l--"
+      # Filter top-level out if set
+      if [[ "${SAK_ORPHAN_OPTS[1]}" -eq "0" || "$REPLY" =~ "/" ]]; then
+        # Slight cheat by adding / to the beginning
+        case "/$REPLY" in
+          # Filtered:
+          */cache/*|*/cgi-bin|*/error_log|*/.htaccess|\
+          */php.ini|*/sitemap.*|*/wp-config.php|\
+          */wp-content/w3-total-cache-config.php|\
+          */wp-content/wp-cache-config.php|\
+          */wp-content/advanced-cache.php|\
+          */wp-content/db.php|*/wp-content/object-cache.php|\
+          */wp-content/cache|*/wp-content/commentavatars|\
+          */wp-content/upgrade|*/wp-content/uploads) let "f++" ;;
+          # Filtered if not directory:
+          */wp-content/plugins/*|*/wp-content/themes/*)
+            [[ ! -d "$REPLY" ]] &&
+            printf -v list '%s%s\x1E' "$list" "$REPLY" &&
+            let "n++" || let "f++" ;;
+          *) # Anything else goes through:
+            printf -v list '%s%s\x1E' "$list" "$REPLY"
+            let "n++" ;;
+        esac
+      else
+        let "f++"
+      fi
+    done < "$ofile"
+  else
+    [[ "${SAK_ORPHAN_OPTS[1]}" -eq "0" ]] &&
+      echo -e "\n\e[1mUnfiltered\e[0m list of orphans at $PWD:\n" ||
+      echo -e "\n\e[1mFiltered\e[0m list of orphans at $PWD:\n"
+
+    while read -r; do
+      let "l--"
+      if [[ "${SAK_ORPHAN_OPTS[1]}" -eq "0" || "$REPLY" =~ "/" ]]; then
+        printf -v list '%s%s\x1E' "$list" "$REPLY"
+        let "n++"
+      else
+        let "f++"
+      fi
+    done < "$ofile"
+  fi
+
+  if [[ "$n" -ne "0" ]]; then # $list unquoted due to IFS
+    /bin/ls -FXdl --color=always $list 2>/dev/null
+    [[ "$f" -ne "0" ]] &&
+      printf '\n\e[1m%d orphan(s) were filtered out.\e[0m\n' "$f"
+  else
+    printf '\e[1mAll %d orphans were filtered out.\e[0m\n' "$f"
+  fi
+}
+
+##################################################################
+##################################################################
+#
+# Requirement help functions
+#
+
+#+ Searches for PHP or Python.
+#| @uses sak_test_bin
+#| @param string $type Binary type.
+#- @return string|bool Binary path name. False if not found or not acceptable.
+sak_find_bin() {
+  local type="$1" bin i=0 dirs=() bins=("php-cli" "php")
+  [[ "$type" == "python" ]] && bins=("python")
+  IFS=":" read -ra dirs <<< "$PATH" # Splits $PATH into a usable array
+  for bin in "${bins[@]}"; do
+    for dir in "${dirs[@]}"; do
+      sak_test_bin "$type" "${dir%%/}/${bin}" && return 0
+    done
+  done
+  return 1
+}
+
+#+ Tests for proper versions of PHP or Python.
+#| @param string $type Binary type.
+#| @param string $path Binary path name.
+#- @return bool True on test success. False otherwise.
+sak_test_bin() {
+  local type="$1" bin="$2"
+  [[ ! -f "$bin" || ! -x "$bin" ]] && return 1
+  case "$type" in
+    python) opt=""; code="$(printf 'import sys\nif sys.version_info[:2]<(2,4):\n sys.exit(1)')"  ;;
+    php)    opt="-q"; code='<?php if(php_sapi_name()!="cli"||substr(PHP_VERSION,0,1)<5)exit(1);' ;;
+    *) return 1 ;;
+  esac
+  "$bin" $opt <<< "$code" &>/dev/null && printf '%s' "$bin" && return 0
+  return 1
+}
+
+#@ Test and create directories.
+sak_check_dir() {
+  local dir
+  for dir; do
+    if [[ -d "$dir" ]]; then
+      [[ ! -w "$dir" || ! -r "$dir" ]] &&
+        sak_fatal_backtrace $SAK_ERR_INT_CNF "Required directory \`$dir' is not readable and/or writable."
+    else
+      if [[ ! -e "$dir" ]]; then
+        mkdir -p "$dir" &>/dev/null ||
+          sak_fatal_backtrace $SAK_ERR_INT_CNF "Required directory \`$dir' could not be created."
+      else
+        sak_fatal_backtrace $SAK_ERR_INT_CNF "Required directory \`$dir' exists, but is not a directory."
+      fi
+    fi
+  done
+}
+
+#+ Checks dialog version.
+#| Recursively calls itself.
+#| @param bool $reget Force download (called recursively).
+#| @param string $bin Binary name.
+#| @param string $ver Binary version to download.
+#- @return bool True on success. False otherwise.
+sak_check_get_dialog() {
+  local ver reget="$1" bin="$2" bver="$3" base="http://sak.dev.gatorsec.net/bin"
+
+  if [[ "$reget" -eq "1" || ! -f "$SAK_BIN_DIR/${bin}" ]]; then
+    sak_download "${base}/${bver}/${bin}" "$SAK_BIN_DIR/${bin}" &&
+    chmod 0100 "$SAK_BIN_DIR/${bin}" || return 1 # Download or chmod failed
+  fi
+
+  ver="$("$SAK_BIN_DIR/${bin}" --version 2>/dev/null)"
+  ver="${ver#* }"
+  if [[ "$ver" != "$bver" ]]; then
+    if [[ "$reget" -eq "1" ]]; then
+      rm -f "$SAK_BIN_DIR/${bin}"
+      return 1 # We downloaded again and still got the wrong version
+    else
+      sak_check_get_dialog 1 "$bin" "$bver" && return 0
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+#+ Checks for installed dialog binary.
+#| @uses sak_check_get_dialog For downloading if not installed.
+#| @param string $version Version required.
+#- @return bool True on success. False otherwise.
+sak_check_dialog() {
+  local b bin bins ver bver="$1"
+
+  # Check dialog symlink and update if needed
+  if [[ -L "$SAK_BIN_DIR/dialog" ]]; then
+    ver="$("$SAK_BIN_DIR/dialog" --version 2>/dev/null)" ||
+      rm -f "$SAK_BIN_DIR/dialog"
+    [[ "${ver#* }" == "$bver" ]] && return 0
+  else
+    rm -f "$SAK_BIN_DIR/dialog"
+  fi
+
+  # i686, fallback
+  bins="dialog.i686 dialog.i686.static"
+
+  # Check machine arch and add x64 bins if needed
+  [[ "$(uname -m)" == "x86_64" ]] &&
+    bins="dialog.x64 dialog.x64.static $bins"
+
+  for b in $bins; do
+    sak_check_get_dialog 0 "$b" "$bver" ||
+      continue
+    bin="$b"
+    break
+  done
+
+  [[ -z "$bin" ]] &&
+    return 1
+
+  ln -sf "$SAK_BIN_DIR/${bin}" "$SAK_BIN_DIR/dialog"
+  return 0
+}
+
+##################################################################
+# Early checks and switches
+
+# Open and redirect FD3 to STDERR
+exec 3>&2
+
+# Bash 3.1 or higher is required for printf -v
+# http://tiswww.case.edu/php/chet/bash/CHANGES
+[[ "${BASH_VERSINFO[0]}" -lt "3" ||
+  ("${BASH_VERSINFO[0]}" -eq "3" && "${BASH_VERSINFO[1]}" -lt "1") ]] &&
+  echo "Error: Bash version 3.1 or higher is required for this utility. This environment has Bash ${BASH_VERSION}." >&3 &&
+  exit 255
+
+SAK_DEBUG=0
+SAK_SID="$(printf '%s' "${SSH_CONNECTION-$PPID}" "${RUSER--}" | md5sum || printf '')"
+SAK_SID="${SAK_SID:0:12}"   # Session ID
+if [[ "$1" == "-d" || "$1" == "--debug" ]]; then
+  SAK_DEBUG_LOG="/root/bin/.sak/logs/debug.$$.log"
+  # Attempt to redirect set -x output to a log
+  [[ -d "/root/bin/.sak/logs" ]] &&
+    exec 2>>"$SAK_DEBUG_LOG"
+  [[ -r "/proc/$SAK_PID/cmdline" ]] &&
+    cmdline="$(cat /proc/$$/cmdline | tr '\0' ' ' | cut -d' ' -f2-)" ||
+    cmdline="${SAK_BASENAME} ${BASH_ARGV[@]}"
+  printf -v debugging '\nDebugging:\n  %s\n\n  Host: %s (%s)\n  Bash: %s\n  Ver : %s (%s)\n  SID : %s\n  PID : %d\n  CWD : %s\n  Command line: %s\n\n' \
+    "$(uname -a)" "$(hostname 2>/dev/null)" "$(hostname -i 2>/dev/null)" \
+    "${BASH_VERSION} (${BASH_VERSINFO[5]})" "$SAK_VER" "$SAK_TS" "$SAK_SID" "$$" "$PWD" \
+    "$cmdline"
+  printf 'Logging to %s\n%s' "$SAK_DEBUG_LOG" "$debugging" >&3
+  echo "$debugging" >&2
+  unset debugging
+  PS4='+[${BASH_SOURCE##$SAK_MOD_DIR/}:${LINENO}${FUNCNAME[0]:+ ${FUNCNAME[0]}()}] '
+  shift; set -x
+  export SAK_DEBUG=1 # Exported so debugging can be enabled in external scripts
+fi
+
+##################################################################
+##################################################################
+#
+# Static variables
+#
+
+printf -v SAK_BACKTITLE "Swiss-Army-Knife version %s (%s)" "$SAK_VER" "$SAK_TS"
+
+SAK_ERR_SWT=1       # Switch
+SAK_ERR_ARG=3       # Switch argument
+SAK_ERR_INT_CNF=7   # Internal config
+SAK_ERR_INT_CMD=15  # Internal command
+SAK_ERR_SUB_CNF=31  # Sub-command config
+SAK_ERR_SUB_ERR=63  # Sub-command error
+SAK_ERR_UNK=127     # Unknown
+SAK_ERR_ESC=255     # ESC pressed
+
+ERR=$'\e[37;1m[\e[31m!!\e[37m]'      # Error
+WRN=$'\e[37;1m[\e[33m==\e[37m]\e[0m' # Warning
+INF=$'\e[37;1m[\e[32m++\e[37m]\e[0m' # Information
+VRB=$'\e[37;1m[\e[36m??\e[37m]\e[0m' # Verbose
+
+SAK_HOME_DIR="/root/bin/.sak"
+SAK_BIN_DIR="$SAK_HOME_DIR/bin"
+SAK_LOG_DIR="$SAK_HOME_DIR/logs"
+SAK_MOD_DIR="$SAK_HOME_DIR/modules"
+SAK_LOCK_DIR="$SAK_HOME_DIR/lock"
+
+SAK_CACHE_DIR="$SAK_HOME_DIR/cache"
+
+SAK_CORE_TMP="$SAK_HOME_DIR/coretmp" # Temporary dir for core install packages
+SAK_CORE_AVAIL="$SAK_CORE_TMP/available.cache"
+
+SAK_PID="$$"
+SAK_LOG="$SAK_HOME_DIR/swiss-army-knife.log"
+SAK_LOCKFILE="$SAK_LOCK_DIR/lock.$SAK_PID"
+
+SAK_LOG_LEVELS=("INFO" "MESG" "WARN" "ERROR" "DEBUG")
+
+# For backups, we keep a list of arguments to skip potentially large files and archives
+SAK_TAR_EXCLUDE=("--exclude=*.tar.gz" "--exclude=*.zip" "--exclude=*.rar" "--exclude=error_log")
+
+SAK_DIALOG=("$SAK_BIN_DIR/dialog" "--stdout" "--no-mouse" "--colors" "--backtitle" "$SAK_BACKTITLE")
+export DIALOG_ERROR=127
+export DIALOGRC="$SAK_HOME_DIR/.dialogrc"
+
+##################################################################
+##################################################################
+#
+# Other Variable Intialization and other start-up tasks
+#
+
+# Enable sigal trapping
+trap sak_trap SIGINT SIGTERM
+
+# This is so we clean up on any exit
+trap sak_cleanup EXIT
+
+# Intercepts "window change" signal when terminal is resized
+trap 'SAK_SIGWINCH="${SECONDS}"' SIGWINCH
+
+# Set shell options
+shopt -s extglob dotglob
+shopt -u xpg_echo
+
+# Set default mask, helps prevent data leakage
+umask 0077
+
+# Store our base name for later usage where it needs to be printed
+# Defaults to "sak"
+SAK_BASENAME="$(basename $0)"
+if [[ "${0%%/$SAK_BASENAME}" == "/dev/fd" || "$SAK_BASENAME" == "stdin" || -z "$SAK_BASENAME" || "$SAK_BASENAME" == "-" ]]; then SAK_BASENAME="sak"; fi
+
+# Script requires root for now (may change in the future)
+[[ "$UID" != "0" ]] &&
+  sak_fatal $SAK_ERR_UNK "Error: This script currently only works when run as root."
+
+# Array declarations
+SAK_USERS=()        # User targets
+SAK_PATHS=()        # Path targets
+SAK_SOFTWARE=()     # Detected targets (using above)
+SAK_UIDS=()         # System UID cache
+SAK_GIDS=()         # System GID cache
+SAK_UHOM=()         # User home directory cache
+SAK_RIDS=()         # Reseller cache
+SAK_CACHE_FILE=()   # Universal caching array
+SAK_CACHE_TYPE=()   # Caching lookup array
+SAK_ORPHAN_OPTS=()  # Orphan function settings
+
+# Global variables
+SAK_TARGETS_MOD=0   # Toggle indicating targets have been modified
+SAK_CLI_MODE=0      # Toggle between interactive and command-line mode
+SAK_QUIET=0         # Quiet level (CLI-only)
+SAK_RCACHE=0        # Resellers cached flag
+SAK_BUP_HOME=1      # Store backups in $HOME
+
+SAK_USER_SORT=1     # Sort user list by UID
+
+SAK_USE_WGET=1      # Use wget if it exists
+SAK_USE_GET=1       # Use libwww-perl's GET if it exists
+SAK_USE_CURL=1      # Use curl if it exists
+
+SAK_ORPHAN_OPTS[0]=1 # Filter typical
+SAK_ORPHAN_OPTS[1]=0 # Filter top-level
+
+SAK_SIGWINCH=0       # Global to detect terminal resizing
+SAK_CORE_REFRESH=""  # Forces update of available core cache
+
+# Make sure home and lock directory are available and usable
+sak_check_dir "$SAK_LOCK_DIR" "$SAK_BIN_DIR" "$SAK_LOG_DIR" \
+              "$SAK_MOD_DIR" "$SAK_CORE_TMP" "$SAK_CACHE_DIR"
+
+# If our basename is sak-cli, we switch CLI mode on by default
+[[ "$SAK_BASENAME" == "sak-cli" ]] && SAK_CLI_MODE=1
+
+touch "$SAK_LOCKFILE"
+PATH="$PATH:$SAK_BIN_DIR"
+SAK_VDETECT_PATH="/root/bin/vdetect"
+SAK_VDETECT_OPT=("--sig-loc=http://sak.dev.gatorsec.net/bin/vdetect.xml" "--dups")
+
+# Python >= 2.4 is required for VDetect
+if [[ -z "$SAK_PYTHON" || ! -x "$SAK_PYTHON" ]]; then
+  SAK_PYTHON="$(sak_find_bin "python")" || sak_fatal $SAK_ERR_INT_CMD "Unable to find Python binary or incorrect versions < 2.4."
+else
+  sak_test_bin "python" "$SAK_PYTHON" || sak_fatal $SAK_ERR_INT_CMD "Specified Python binary not found or incorrect version < 2.4."
+fi
+
+# Check for valid $SAK_PHP, find one if not
+if [[ -z "$SAK_PHP" || ! -x "$SAK_PHP" ]]; then
+  SAK_PHP="$(sak_find_bin "php")" || sak_fatal $SAK_ERR_INT_CMD "Unable to find CLI version of PHP or PHP 5 could not be found."
+else
+  sak_test_bin "php" "$SAK_PHP" || sak_fatal $SAK_ERR_INT_CMD "Specified PHP binary not found or incorrect SAPI (CLI required)."
+fi
+
+# Dialog is currently required for menus
+if [[ "$SAK_CLI_MODE" -eq "0" ]]; then
+  sak_check_dialog "1.1-20111020" ||
+    sak_fatal_backtrace $SAK_ERR_INT_CMD "Error: Dialog could not be downloaded, or could not be updated. Please report this as a bug."
+fi
+
+sak_setwinsize    # Set window size
+sak_cache_users   # Cache valid users -- Need to do this early
+
+##################################################################
+##################################################################
+#
+# Options parsing
+#
+
+sak_log 0 "START" "Command line: $SAK_BASENAME $*"
+sak_log 0 "START" "Working dir: $PWD"
+
+args=("$@")
+scomm="hqv"                         # Common short opts
+lcomm="cache-update,curl,get,help," # Common long opts
+lcomm+="home,no-home,quiet,verbose,version,wget,vlocal,vremote,"
+sopts="D:U:R:"                      # non-CLI short opts
+lopts="directory:,reseller:,user:"  # non-CLI long opts
+
+# If CLI mode, we only parse the first options and break
+if sak_cli_mode; then
+  pargs=("$@"); args=(); unset sopts lopts
+  if [[ "${pargs[0]}" =~ ^- ]]; then
+    for i in "${!pargs[@]}"; do
+      [[ "${pargs[$i]}" =~ ^- ]] &&
+        args[$i]="${pargs[$i]}" && unset pargs[$i] || break
+    done
+    shift $i
+  fi
+fi
+
+# Use getopt to create easily parsed options
+SAK_GETOPT_ARGS=$(getopt -n "$SAK_BASENAME" -o "${scomm}${sopts}" -l "${lcomm}${lopts}" -- "${args[@]}")
+SAK_GETOPT_RES="$?"
+
+# Display help and exit if an invalid option was passed
+if [[ "$SAK_GETOPT_RES" != "0" ]]; then
+  ! sak_cli_mode && sak_help && exit "$SAK_GETOPT_RES"
+  . "${SAK_MOD_DIR}/cli" && sak_cli_help || sak_help
+  exit "$SAK_GETOPT_RES"
+fi
+unset args sopts lopts scomm lcomm
+
+SKIP_ARGS=0
+parse_args() {
+  local i="${#@}"
+
+  while :; do
+    case "$1" in
+      #### curses mode only ######################################################
+      -D|--directory) sak_add_targets "$2"; shift; ;;
+      -U|--user)      sak_add_targets "$2"; shift; ;;
+      -R|--reseller)  sak_add_rtargets "$2"; shift; ;;
+      #### cli mode only #########################################################
+      --home)    SAK_BUP_HOME=1 ;; # out-of-tree backups
+      --no-home) SAK_BUP_HOME=0 ;; # in-tree backups
+      #### common ################################################################
+      --cache-update) SAK_CORE_REFRESH=1 ;;
+      --wget) SAK_USE_WGET=1; SAK_USE_GET=0; SAK_USE_CURL=0 ;;
+      --get)  SAK_USE_WGET=0; SAK_USE_GET=1; SAK_USE_CURL=0 ;;
+      --curl) SAK_USE_WGET=0; SAK_USE_GET=0; SAK_USE_CURL=1 ;;
+      -V|--verbose)   ((SAK_QUIET--)) ;;
+      -q|--quiet)     ((SAK_QUIET++)) ;;
+      -h|--help)      [[ "$SAK_CLI_MODE" -eq "1" ]] && break 2; sak_help; exit ;;
+      -v|--version)   sak_version; exit ;;
+      --)             shift; break ;;
+    esac
+    shift
+  done
+  (( SKIP_ARGS += i - "${#@}" ))
+}
+
+! sak_cli_mode && eval set -- $SAK_GETOPT_ARGS  # Non-cli mode args from getopt
+parse_args $SAK_GETOPT_ARGS         # Parse getopt args (both modes)
+! sak_cli_mode && shift $SKIP_ARGS  # Non-cli shift
+sak_log 0 "START" "Parsed  Args: $*"
+
+##################################################################
+##################################################################
+#
+# Module init
+#
+
+# Include our main modules as needed
+. "${SAK_MOD_DIR}/cli" &&
+. "${SAK_MOD_DIR}/gui" &&
+for MODULE in "${SAK_MOD_DIR}"/soft/*/main; do
+  . "${MODULE}"
+done ||
+  sak_fatal_backtrace $SAK_ERR_INT_CMD "Error during module inclusion."
+
+##################################################################
+
+# Parse targets from command line. If none, we guess based off PWD
+if ! sak_cli_mode; then
+  if [[ -z "$@" ]]; then    # We yank the user out of our PWD
+    if [[ "${#PWD}" -gt "6" && "${PWD:0:6}" == "/home/" ]]; then
+      user="${PWD#/home*/}" # chomp /home/ off
+      user="${user%%/*}"    # chomp off any trailing subdirs
+      # We make sure the owner of the dir matches what we pulled if anything
+      [[ -n "$user" && "$(stat -c %U "/home/$user")" == "$user" ]] &&
+        sak_add_targets "$user"
+    fi
+  else  # we skip all that jazz and use the arguments
+    sak_add_targets "$@"
+  fi
+  sak_get_installations             # Scan now for installations
+  while sak_menu_main; do :; done   # Main menu loop
+  echo
+else
+  while [[ "${1:0:1}" == "-" && ! "$1" =~ ^-?-h ]]; do shift; done
+  sak_cli "$@" # Enter CLI command loop
+fi
+
+trap "" SIGINT SIGTERM  # Reset traps

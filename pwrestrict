@@ -1,0 +1,217 @@
+#!/usr/bin/perl -w
+#################################################################
+# pwrestrict.pl - Michael Karr
+# Utility to generate the necessary .htaccess and .htpasswd entries to restrict access to a folder.
+#
+# https://confluence.endurance.com/display/HGS2/PWRestrict
+# 
+# Please submit all bug reports at http://jira.endurance.com
+#
+# (c) 2012 - HostGator.com, LLC.
+#################################################################
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+use File::Spec;
+use File::Path;
+use FileHandle;
+use Sys::Hostname;
+
+our $VERSION = '1.15';
+
+$| = 1; #turn on autoflush of stdout
+
+# begin main
+
+print "pwrestrict.pl - Michael Karr\n\n";
+
+my $remove = undef;
+my $chattr = 0;
+my $ticket = undef;
+my $hostname = Sys::Hostname::hostname;
+
+GetOptions (
+    'remove|r' => \$remove,
+    'chattr|c' => \$chattr,   
+    'ticket|t:s' => \$ticket,
+);
+
+if (my $dir = $ARGV[0]) {
+    if (-d $dir) {
+        pwrestrict($dir, $remove);
+    } else {
+        print "Given directory does not seem to exist.\n";
+    }
+} else {
+    pwrestrict(File::Spec->curdir(), $remove);
+}
+
+# end main
+
+sub pwrestrict {
+    my ($dir, $remove) = @_;
+    my $absdir = File::Spec->rel2abs($dir);
+    
+    if ($absdir =~ /\/home[1-4]?\/([^\/]*)(.*?)$/) {    
+        if ($remove) {
+            enabledir($absdir, $1, $2);
+        } else {
+            disabledir($absdir, $1, $2);
+        }
+    } else {
+        print "Given directory does not appear to be inside a user's home.\n"
+    }
+}
+
+sub disabledir {
+    my ($dir, $user, $udir) = @_;
+    
+    my @pwent = getpwnam($user);
+    my $uid = $pwent[2];
+    my $gid = $pwent[3];
+    my $homedir = $pwent[7];
+
+    my $pwdir = "$homedir/.htpasswds$udir";
+    my $pwfile = "$pwdir/.hgpwrestrict";
+    my $htaccess = "$dir/.htaccess";
+    my $file401 = "hg401.html";
+    my $file401path = "$dir/hg401.html";
+    my $file401ht = $udir;
+    $file401ht =~ s/\/public_html//;
+    
+    if (-f $pwfile) {
+        print "Password protection appears to be already enabled.\n\n";
+        return;
+    }
+
+    my $pass = randtext(8);
+    my $salt = randtext(2);
+    my $cryptedpass = crypt($pass, $salt);
+
+    print "Enabling password protection on directory: $dir\n\n";
+    print "User: $user\n";
+    print "Password: $pass\n\n";
+    
+    # if the directory for the password file does not exist, make it
+    
+    if (!-d $pwdir) {
+        mkpath($pwdir, {mode=>0755, owner=>$user, group=>$user});
+    }
+    
+    # create the password file (this will kill anything that currently exists)
+    
+    my $pfh = FileHandle->new(">$pwfile");
+    print $pfh "$user:$cryptedpass";
+    $pfh->close();
+    
+    chown $uid, $gid, ($pwfile);
+    
+    # create the 401.html file (some scripts wont work otherwise)
+    
+    # my $ffh = FileHandle->new(">$file401");
+    # print $ffh "Access Denied!";
+    # $ffh->close();
+    
+    # chown $uid, $gid, ($file401);
+    
+    # create necessary .htaccess entries
+    
+    my $hfh = FileHandle->new(">>$htaccess");
+    print $hfh "\n## start pwrestrict.pl\n";
+    if ($ticket) {
+	print $hfh "#See ticket $ticket\n";
+    }
+    # print $hfh "ErrorDocument 401 $file401ht/$file401\n";
+    print $hfh "ErrorDocument 401 'Access Denied!'\n";
+    print $hfh "AuthUserFile \"$pwfile\"\n";
+    print $hfh "AuthName \"Access Restricted (pwrestrict)\"\n";
+    print $hfh "AuthType Basic\n";
+    print $hfh "require user $user\n";
+    
+    print $hfh "## end pwrestrict.pl\n";
+    $hfh->close();
+    
+    chown $uid, $gid, ($htaccess);
+
+    # chattr .htaccess
+    
+    if ($chattr) {
+        `chattr +ia $htaccess`;
+    }
+    
+    if ($ticket) {
+        if ($hostname =~ /\.(hostgator\.(com(\.(tr|br))?|in)|(websitewelcome|webhostsunucusu|ehost(s)?|ideahost|hostclear|bluehost|justhost|accountservergroup|arvixe|webserversystems|asmallorange|rhostjh|rhostbh)\.com|websitedns\.in|prodns\.com\.br)$/) {
+            if ( ! -d '/opt/eig_linux/var/pwrestrict'){
+		    mkpath('/opt/eig_linux/var/pwrestrict');
+	    }
+	    $hfh = FileHandle->new(">>/opt/eig_linux/var/pwrestrict/$user");
+	    print $hfh $ticket;
+	} else {
+	    $hfh = FileHandle->new(">>/root/.lockdown-$user");
+            print $hfh $ticket;
+	}
+    }
+    $hfh->close();
+
+    print "Done.\n\n"
+}
+
+sub enabledir {
+    my ($dir, $user, $udir) = @_;
+    
+    my @pwent = getpwnam($user);
+    my $homedir = $pwent[7];
+
+    my $pwdir = "$homedir/.htpasswds$udir";
+    my $pwfile = "$pwdir/.hgpwrestrict";
+    my $htaccess = "$dir/.htaccess";
+    my $file401path = "$dir/hg401.html";
+    
+    print "Disabling password protection for user '$user' on directory: $dir\n\n";
+    
+    # remove password and 401 files if still there
+
+    if (-f $pwfile) {
+        unlink($pwfile);
+    }
+    
+    if (-f $file401path) {
+        unlink($file401path);
+    }
+
+    if (-f "/opt/eig_linux/var/pwrestrict/$user") {
+        unlink("/opt/eig_linux/var/pwrestrict/$user");
+    }
+    if (-f "/root/.lockdown-$user") {
+        unlink("/root/.lockdown-$user");
+    }
+
+    # unchattr .htaccess
+
+    `chattr -ia $htaccess`;
+    
+    # remove pwrestrict entries from the .htaccess
+
+    my $hfh = FileHandle->new("<$htaccess");
+    my @listing = <$hfh>;
+    $hfh->close();
+    
+    my $listings = join("",@listing);
+    $listings =~ s/[\r\n]*## start pwrestrict\.pl(\r|\n|.)*?## end pwrestrict\.pl[\r\n]?[\r\n]?//;
+    
+    $hfh = FileHandle->new(">$htaccess");
+    print $hfh $listings;
+    $hfh->close();
+    
+    print "Done.\n\n"
+}
+
+sub randtext {
+    my ($length) = @_;
+    my @chars = ("a".."z","A".."Z","0".."9");
+
+    return join("",@chars[map{ rand @chars} (1..$length)]); 
+}

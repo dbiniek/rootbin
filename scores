@@ -1,0 +1,199 @@
+#!/bin/bash                                                                                                                                                                                                                                  
+# scores:       provides a quick/short view of scoreboard output, sorted highest to lowest.                                                                                                                                                  
+# author:       ford (brought to you by ford like the truck)                                                                                                                                                                                 
+# project: git.toolbox.hostgator.com/scores
+# wiki: https://gatorwiki.hostgator.com/Admin/ScoresAndScoreboard
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostGator.com, LLC
+#
+#
+#                                                                                                                                                                                                                                            
+# 0.24: escalf@: updated to _really_ work with apache 2. Requires new 'scoreboard' from /root/bin/scoreboard                                                                                                                                 
+# 0.23: jshanley@: removed complexity, updated for apache 2.x, removed scoreboard dependency                                                                                                                                                 
+# 0.22: jshanley@: add MySQL threadcount/apache uptime                                                                                                                                                                                       
+# 0.21: jshanley@: handle 404 pages (lynx return status was still 0 but obviously the data was invalid)                                                                                                                                      
+# 0.2:  jshanley@: added a few more stats, cleaned up output.                                                                                                                                                                                
+# 0.1:  ford@: original release                                                                                                                                                                                                              
+#                                                                                                                                                                                                                                            
+# TODO:                                                                                                                                                                                                                                      
+# - Warn if the "top" user also has > $DOMAIN_COUNT domains on the system (probably indicative of continued heavy use)                                                                                                                       
+# - DONE perfectly align output of each line
+# - build an array of each domain & associated stats to work with up-front instead of re-parsing the file(s)
+# - DONE instead of putting spacing/formatting in the var results, do it in the output
+#
+# notes:
+# - rockets in the sky...
+NOW=$(date "+%Y-%m-%d %H:%M")
+
+DISPLAY_COUNT="5"       # Total number of domains to display
+DOMAIN_COUNT="100"      # Number of domains/subdomains before generating a warning.
+
+#### Shouldn't need to touch anything below here ####
+TEMPDIR="/root/tmp/scores"
+LOG_TEMP="${TEMPDIR}/scores.${RANDOM}.tmp.$$.${RANDOM}.txt"
+LOG_TEMP_STAT="${TEMPDIR}/apachestat.tmp.$$.txt"
+
+# BIN_GREP="/bin/grep"
+BIN_GREP=`which grep`
+BIN_CAT=`which cat`
+BIN_LYNX=`which elinks`
+BIN_HTTPD="/usr/local/apache/bin/httpd"
+BIN_SCOREBOARD="/root/bin/scoreboard"
+
+LYNX_ARGS="-connect_timeout=10 -accept_all_cookies -cookie_file=${TEMPDIR}/lynx.$$.cookies -cookie_save_file=${TEMPDIR}/lynx.$$.cookies -nopause"
+URL_SERVSTAT="http://localhost/whm-server-status"
+if [ ! -e "/usr/bin/bc" ]; then
+yum install bc -y
+fi
+if [ ! -e "/usr/bin/elinks" ]; then
+yum install elinks -y
+fi
+
+
+use() {
+        echo "use: $0"
+        exit 2
+}
+
+error() {
+        echo "$*"
+        exit 2
+}
+
+check_result() {
+        # expects: "status code that is ok" "actual status code" "text if failed"
+        if [ -z "$3" ]; then error "check_result requires 3 args: [ok status code] [actual status] [text if failed]" ; return ; fi
+        case "$1" in
+                ${1})
+                  return
+                ;;
+                *)
+                  error "${1} (${2})"
+                ;;
+        esac
+}
+
+scoreboard_preflight() {
+        FUNCTION="scoreboard_preflight"
+        if [ ! -d "$TEMPDIR" ]; then mkdir -p "$TEMPDIR" &>/dev/null ; fi
+        for REQUIREMENT in ${BIN_GREP} ${BIN_CAT} ${BIN_LYNX} ${BIN_HTTPD}; do
+                if [ ! -e "${REQUIREMENT}" ]; then error "Required component ($REQUIREMENT) is unavailable." ; fi
+        done
+        cd $TEMPDIR
+}
+
+scoreboard_verify_not404(){
+        # Make sure we haven't downloaded a 404 page somehow.
+        # Rarely, a server will not have the scoreboard handler installed.
+        # This detection is based off the HG 404 page, so it may change I guess.
+        for file in ${LOG_TEMP} ${LOG_TEMP_STAT} ; do
+                local is_404=$(grep "ERROR 404" "${LOG_TEMP}")
+                if [ ! -z "$is_404" ]; then error "Retrieving stats pages failed (handler for /whm-scoreboard probably missing). Exiting." ; fi
+        done
+}
+
+
+scoreboard_getlogs() {
+        FUNCTION="scoreboard_getlogs"
+        # FIXME: if either of these fails (apache down, etc) exit gracefully since nothing else will work
+        ${BIN_LYNX} -dump ${URL_SERVSTAT} > "$LOG_TEMP_STAT"
+        awk '/GET|POST/ && $4~ "[a-zA-Z]" { print $11"\t\t"$12"\t\t"$14 }' "$LOG_TEMP_STAT" | sort > "$LOG_TEMP"
+        check_result "0" "$?" "Retrieving apache scoreboard data"
+        check_result "0" "$?" "Retrieving apache status data"
+        scoreboard_verify_not404
+}
+
+scoreboard_calcuate_mysql_cpu() {
+        local SQL_CPU_USE=0
+        for MORE in `ps -C mysqld,mysqld_safe -o pcpu|grep -vE "%"|sed -e "s/^ //g"`; do
+                local SQL_CPU_USE=$(echo "scale=4; ${SQL_CPU_USE}+${MORE}" | bc)
+        done
+        MYSQL_CPU="${SQL_CPU_USE}"
+}
+
+scoreboard_getstats() {
+        FUNCTION="scoreboard_getstats"
+        PROC_COUNT_APACHE=$(ps auxwww|grep "${BIN_HTTPD}"|wc -l)
+        LOAD=$(uptime|sed -e "s/.* load average: //g")
+        REQUESTS_SEC=$(grep "requests/sec" $LOG_TEMP_STAT|sed -e "s/^   //g")
+        REQUESTS_CURRENT=$(grep "currently being processed" $LOG_TEMP_STAT|sed -e "s/^   //g")
+        APACHE_UPTIME=$(grep "Server uptime:" $LOG_TEMP_STAT|sed -e "s/.*Server uptime: //g")
+        MYSQL_CPU=$(ps -C mysqld -o pcpu|grep -vE "%"|sed -e "s/^ //g")
+        if [ -z "$MYSQL_CPU" ]; then MYSQL_CPU=unknown ; fi
+        IOSTAT_RESULTS=$(iostat -c|grep -E "^ .*[0-9]")
+        CPU_USR=$(echo "$IOSTAT_RESULTS"|awk '{print $1}')
+        CPU_NICE=$(echo "$IOSTAT_RESULTS"|awk '{print $2}')
+        CPU_SYS=$(echo "$IOSTAT_RESULTS"|awk '{print $3}')
+        CPU_WAIT=$(echo "$IOSTAT_RESULTS"|awk '{print $4}')
+        CPU_IDLE=$(echo "$IOSTAT_RESULTS"|awk '{print $5}')
+        CPU_REPORT="${CPU_USR}/usr ${CPU_NICE}/ni ${CPU_SYS}/sys ${CPU_WAIT}/wa ${CPU_IDLE}/id"
+        scoreboard_calcuate_mysql_cpu
+}
+
+scoreboard_processlog_get() {
+        FUNCTION="scoreboard_processlog_get"
+        case "$1" in
+                tophost)
+                        local TEMPCOUNT=$(awk '{print $2}' ${LOG_TEMP}|grep -viE "^$"|sed -e "s/^www\.//g"|sort|uniq -c|sort -rn|head -n 1)
+                        TOPHOSTCOUNT=$(echo "$TEMPCOUNT"|awk '{print $1}')
+                        TOPHOST=$(echo "$TEMPCOUNT"|awk '{print $2}')
+                        scoreboard_processlog_get uri "$TOPHOST"
+                        printf "%15s %-55s\n" "Top:" "$TOPHOSTCOUNT: $TOPHOST ($TOPURICOUNT: $TOPURI)"
+
+                ;;
+                top5)
+                        TOP5=$(awk '{print $2}' ${LOG_TEMP}|grep -viE "^$"|sed -e "s/^www\.//g"|sort|uniq -c|sort -rn|head -n 5)
+                        echo "${TOP5}" | \
+                          while read domain ; do
+                                local COUNT=$(echo "$domain" |awk '{print $1}')
+                                local NAME=$(echo "$domain"  |awk '{print $2}')
+                                printf "%15s %-55s\n" " " "$COUNT $NAME"
+                          done
+                ;;
+
+                uri)
+                        shift
+                        if [ -z "$1" ]; then
+                                error "$FUNCTION: uri: no var passed. Bad dog!"
+                                return
+                        else
+                                TOPURICOUNT=$(grep "$1" $LOG_TEMP|grep -viE "^$"|awk '{print $3}'|sort|uniq -c|sort -rn| head -n 1|awk '{print $1}')
+                                # remove ?blahblah from the URI
+                                TOPURI=$(grep "$1" $LOG_TEMP|grep -viE "^$"|awk '{print $3}'|sed -e "s/\?.*//g"|sort|uniq -c|sort -rn| head -n 1|awk '{print $2}')
+                        fi
+                ;;
+                *)
+                        use
+                        exit
+                ;;
+
+        esac
+}
+
+cleanup() {
+        rm -rf $TEMPDIR
+}
+
+scoreboard_preflight
+scoreboard_getlogs
+scoreboard_getstats
+
+# Print some output
+
+        echo
+        printf "%15s %-55s\n" "Load:" "$LOAD at $NOW (${MYSQL_CPU}% SQL)"
+        printf "%15s %-55s\n" " "     "$CPU_REPORT"
+        echo
+        printf "%15s %-55s\n" "Apache:" "$REQUESTS_SEC"
+        printf "%15s %-55s\n" " " "$REQUESTS_CURRENT"
+        printf "%15s %-55s\n" " " "Apache Uptime $APACHE_UPTIME"
+
+        echo ""
+        scoreboard_processlog_get tophost
+        echo ""
+        scoreboard_processlog_get top5
+        echo ""
+
+cleanup
+

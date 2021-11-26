@@ -1,0 +1,1407 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# DNSchecker
+# Script that faciliates simple DNS checks to ensure that domains are resolving to the server properly.
+# https://confluence.endurance.com/display/HGS2/Script%3A+dnschecker
+# Please submit all bug reports at jira.endurance.com
+#
+# (C) 2013 - HostGator.com, LLC
+###########
+#
+# Rish
+#
+# Changelog:
+# 3.0   - Init. Rewrite script to be modular. 
+#         See 'Examples' and 'Interface' files for more information on module usage.
+# 3.1   - '--dominfo' added
+# 3.2   - '--all' added
+# 3.3.0 - '--mxlookup' added. Added $VERSION for easy module usage.
+# 3.3.1 - '--propcheck' added.
+# 3.3.2 - Updated --short functionality to now display unresolvable domains also.
+# 3.3.3 - Updated hostname check regex
+#
+
+my $token;
+my $currversion;
+
+{
+package Dnschecker;
+
+use strict;
+use Sys::Hostname;
+use Getopt::Long qw (:config pass_through);
+use Cwd;
+use JSON;
+
+my $user;
+my $dominfo;
+my $domain;
+my $userlist;
+my $domlist;
+my $glue;
+my $registrar;
+my $mxlookup;
+my $good = 0;
+my $bad = 0;
+my $short = 0;
+my $help;
+my $reseller;
+my $propcheck;
+my $procsubs;
+my $nocolor;
+my $all;
+my $tokensupport;
+my $token_name;
+my $json;
+my @ips;
+
+my $dnschecker;
+
+sub main {
+	GetOptions ( 'user=s'      => \$user,
+                 'domain=s'    => \$domain,
+                 'userlist=s'  => \$userlist,
+                 'dominfo=s'   => \$dominfo,
+                 'domlist=s'   => \$domlist,
+                 'glue'        => \$glue,
+                 'good'        => \$good,
+                 'bad'         => \$bad,
+                 'reseller=s'  => \$reseller,
+                 'subs'        => \$procsubs,
+                 'short'       => \$short,
+                 'registrar'   => \$registrar,
+                 'mxlookup'    => \$mxlookup,
+                 'propcheck=s' => \$propcheck,
+                 'nocolor'     => \$nocolor,
+                 'all'         => \$all,
+                 'help'        => \$help
+               );
+
+	if (@ARGV || $help) {
+		help()
+	}
+
+	$dnschecker = Dnschecker::helpers->new($nocolor, \&processoutput);
+	$dnschecker->{good}  = $good;
+	$dnschecker->{bad}   = $bad;
+	
+	#Remove stale tokens and generate the API Token if cPanel and >= 64.
+	if ($dnschecker->{tokensupport})
+	{
+	#Clean up the API Token before exit
+		END{
+			if($token_name){
+				`whmapi1 api_token_revoke token_name=$token_name`
+			}
+		}
+		#Remove stale tokens
+		stale_tokens();
+		{
+			my $revoked;
+			$SIG{INT} = sub { 
+				unless ($revoked) {
+					$revoked = 1;
+					fork or exec('whmapi1', 'api_token_revoke', "token_name=$token_name");
+				}
+				die "Interrupted"
+			};
+		}
+		#Generate the token
+		$token_name = "dnschecker_".time();
+		$json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+		$token = from_json($json)->{'data'}{'token'};
+	}
+
+	if ($registrar) {
+		$dnschecker->{registrar} = 1;
+	}
+
+	if ($glue) {
+		$dnschecker->{glue} = 1;
+	}
+	
+	if ($mxlookup) {
+		$dnschecker->{mxlookup} = 1;
+	}
+
+	if ($dnschecker->{isPlesk} && $dnschecker->{isCpanel}) {
+		print "[!] Plesk and cPanel found on the server... \n";
+		exit 1;
+	}
+
+	if ($propcheck) {
+		$dnschecker->propcheck($propcheck);
+		exit;
+	}
+
+	if ($all) {
+		processall();
+		exit;
+	}
+
+	if ( ($user || $domain || $userlist || $domlist || $reseller || $dominfo) && ($#ARGV >= 0)) {
+		print "Unknown option passed... please see --help.\n";
+		exit 1;
+	} elsif (!($user || $domain || $userlist || $domlist || $reseller || $dominfo) && ($#ARGV == -1)) {
+		if ($dnschecker->{isCpanel}) {
+			$user = (split(/\//, getcwd()))[2];
+		} elsif($dnschecker->{isPlesk}) {
+			my $docroot = getcwd();
+			chomp $docroot;
+			$user = $dnschecker->findpleskuser($docroot);
+		}
+
+		if (not $user) {
+			print "Unclear request... please see --help.\n";
+			exit 1;
+		}
+	}
+
+	if ($dominfo) {
+		$dnschecker->dominfo($dominfo);
+	}
+
+	if ($user) {
+		if (not $dnschecker->{ohnoes}) {
+			my ($domcount, $domgood, $dombad) = $dnschecker->processuser($user, $procsubs);
+		} else {
+			print "[!] USER options have been disabled.\n";
+		}
+	}
+
+	if ($domain) {
+		$dnschecker->processdomain($domain);
+	}
+
+	if ($userlist) {
+		if ( -s $userlist && ! -d $userlist){
+			if (not $dnschecker->{ohnoes}){
+				processulist($userlist);
+			} else {
+				print "[!] USER options have been disabled.\n";
+			}
+		} else {
+			print "[!] $userlist does not exist or is 0 bytes. Please double check.\n";
+		}
+	}
+
+	if ($domlist) {
+		if ( -s $domlist && ! -d $domlist){
+			processdomlist($domlist);
+		} else {
+			print "[!] $domlist does not exist or is 0 bytes. Please double check.\n";
+		}
+	}
+
+	if ($reseller) {
+		if ($dnschecker->{isCpanel}) {
+			if (not -e "/var/cpanel/users/$reseller" ) {
+				print "[!] $reseller does not exist on the server.\n";
+			} else {
+				open (my $trueuserowners, "<", "/etc/trueuserowners");
+				my @lusergrep = grep(/: $reseller$/, <$trueuserowners>);
+				close ($trueuserowners);
+
+				my @luserlist;
+				foreach my $entry (@lusergrep) {
+					push @luserlist, (split(/:/, $entry))[0];
+				}
+				my $count = scalar(@luserlist);
+				processoutput("\n[*] Number of users to process: $count\n");
+				my ($totaldoms, $totalbad, $totalgood) = (0, 0, 0);
+				foreach my $user (@luserlist) {
+					chomp $user;
+					$user = lc $user;
+					my ($temptot, $tempgood, $tempbad) = $dnschecker->processuser($user, $procsubs);
+					$totaldoms += $temptot;
+					$totalbad += $tempbad;
+					$totalgood += $tempgood;
+				}
+				processoutput("\n[*] Total Domains: ".colorify("green", $totaldoms).". Domains that resolve: ".colorify("green", $totalgood).". Domains that do not resolve: ".colorify("red", $totalbad).".\n");
+			}
+		} else {
+			print "[!] Sorry, --reseller is only available on cPanel servers.\n";
+		}
+	}
+}
+
+sub stale_tokens {
+	my $token_list = `whmapi1 api_token_list --output=json`;
+	my $listjson = from_json($token_list);
+	my $current_time = time(); 
+	if ($currversion >= 11.68){ 
+		foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+			if( $token_name =~ /dnschecker_/ ){
+				my $token_time = $token_name;
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_name`;
+				}
+			}
+		}
+	} else {
+		foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+			if( $token_data->{'name'} =~ /dnschecker_/ ){
+				my $token_time = $token_data->{'name'};
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+				}
+			}
+		}
+	}
+}
+
+sub processall {
+
+	if ( isshared() ) {
+		print "[!] '--all' can not be used on shared servers. Use one of the other options instead!\n";
+		exit 1;
+	}
+
+	my @users;
+	if ($dnschecker->{isCpanel}) {
+		my $dir = "/var/cpanel/users";
+		opendir (CPUSERS, $dir);
+		@users = grep { -f "$dir/$_" } readdir(CPUSERS);
+		closedir CPUSERS;
+	} elsif ($dnschecker->{isPlesk}) {
+		$dnschecker->listpleskusers(\@users);
+	}
+
+	my $count = scalar(@users);
+	processoutput("\n[*] Number of users to process: $count\n");
+	my ($totaldoms, $totalbad, $totalgood) = (0, 0, 0);
+	foreach my $user (@users) {
+		chomp $user;
+		$user = lc $user;
+		if ($user eq "root") { next; }
+		my ($temptot, $tempgood, $tempbad) = $dnschecker->processuser($user, $procsubs);
+		$totaldoms += $temptot;
+		$totalbad += $tempbad;
+		$totalgood += $tempgood;
+	}
+	processoutput("\n[*] Total Domains: ".colorify("green", $totaldoms).". Domains that resolve: ".colorify("green", $totalgood).". Domains that do not resolve: ".colorify("red", $totalbad).".\n");
+}
+
+sub processulist {
+
+	my $listfile = shift;
+	my @luserlist;
+	eval {
+		open (INFILE, $listfile);
+		@luserlist = <INFILE>;
+		close INFILE;
+	} or do {
+		print "Error reading file $listfile\n";
+		exit 1;
+	};
+	
+	my ($totaldoms, $totalbad, $totalgood) = (0, 0, 0);
+	foreach my $user (@luserlist) {
+		chomp $user;
+		$user = lc $user;
+		if ($user eq "root") { next; }
+		my ($temptot, $tempgood, $tempbad) = $dnschecker->processuser($user, $procsubs);
+		$totaldoms += $temptot;
+		$totalbad += $tempbad;
+		$totalgood += $tempgood;
+	}
+	processoutput("\n[*] Total Domains: ".colorify("green", $totaldoms).". Domains that resolve: ".colorify("green", $totalgood).". Domains that do not resolve: ".colorify("red", $totalbad).".\n");
+}
+
+sub processdomlist {
+
+	my $listfile = shift;
+	my @ldomlist;
+	eval {
+		open (INFILE, $listfile);
+		@ldomlist = <INFILE>;
+		close INFILE;
+	} or do {
+		print "Error reading file $listfile\n";
+		exit 1;
+	};
+	
+	my $totaldoms = scalar(@ldomlist);
+	my ($totalbad, $totalgood) = (0, 0);
+	
+	foreach my $domain (@ldomlist) {
+		chomp $domain;
+		$domain = lc $domain;
+		my $temp = $dnschecker->processdomain($domain);
+		if ($temp == 0) {
+			$totalbad++;
+		} else {
+			$totalgood++;
+		}
+	}
+	processoutput("\n[*] Total Domains: ".colorify("green", $totaldoms).". Domains that resolve: ".colorify("green", $totalgood).". Domains that do not resolve: ".colorify("red", $totalbad).".\n");
+}
+
+sub processoutput {
+
+	my $line = shift;
+
+	my $all = 0;
+	if ( ($good && $bad) or not ($good or $bad) ) {
+		$all = 1;
+	}
+	
+	if ($short && $line =~ m/^\[\*\]/) {
+		#skip
+	} else {
+		if ($all || ($line =~ m/^\n/ || $line =~ m/^\[\*\]/ || $line =~ m/^\[\-\]/ || $line =~ m/^\[\#\]/) ) {
+			print $line;
+		} elsif ($good && ($line =~ m/^\[\+\]/) ) {
+			print $line;
+		} elsif ($bad && ($line =~ m/^\[\!\]/) ) {
+			print $line;
+		}
+	}
+}
+
+sub help {
+
+	print "DNSChecker version: $Dnschecker::helpers::VERSION\n";
+
+	print "Usage: dnschecker with the following switches:\n";
+	print "       --user <cPanel or Plesk username>\n";
+	print "         NOTE: This will check all domains setup under the given account on the server.\n";
+	print "       --reseller <reseller username>\n";
+	print "         NOTE: only works on cPanel servers.\n";
+	print "       --domain <single domain you want to check>\n";
+	print "       --userlist <Name of file that contains the users to process>\n";
+	print "       --domlist <Name of file that contains the domains to process>\n";
+	print "       Note: If no args/switches are passed, it will try to process the user, whose home directory/document root you are in.\n\n";
+	print "       OUTPUT options:\n";
+	print "       --good  - Display only domains that resolve to the server.\n";
+	print "       --bad   - Display only domains that DO NOT resolve to the server.\n";
+	print "       --short - Display only the checks, no 'processing user' etc lines.\n";
+	print "       --subs  - Process the subdomains that are setup on the cPanel also.\n";
+	print "       If you specify both, or neither of these options, it will output all checks.\n\n";
+	print "       #############################\n";
+	print "       --registrar - Pass this if you want the script perform a whois lookup and fetch the registrar information out of it.\n";
+	print "                     It queries specific servers for the following TLDs: com, net, org, info, biz, uk, us\n";
+	print "                     For the rest of the TLDs, it will use 'TLD.whois-servers.net' for the whois server\n";
+	print "                     Note: All the 'quirks' that finicky whois servers have to limit queries apply, so abusing this (like say running it across 7000 domains at once >.>) can cause incorrect results\n";
+	print "                           To minimize these types of issues, the script will sleep for 3 seconds between domains if this switch is passed.\n\n";
+	print "       --glue      - Pass this if you want the script to perform some DNS glue checks -.\n";
+	print "       Output is 'spammy' so please be sure log this to a file or increase your output buffer accordingly. Currently, glue output will follow --good and --bad output specification.\n";
+	print "       --mxlookup  - Check the MX records for the domain and see if they are using 'custom' MX records.\n";
+	print "       #############################\n\n";
+	print "       --dominfo <domain name> - display basic info about a domain (resolving ip, ns, and registrar).\n";
+	print "       --propcheck <domain name> - Queries DNS servers around the world, and returns the IP addresses that those servers are seeing for the domain.\n";
+	print "       --help - displays this help text.\n\n";
+	exit 1;
+}
+
+sub isshared {
+
+	my $hostname = Sys::Hostname::hostname;
+	if ($hostname =~ /\.(hostgator\.(com(\.(tr|br))?|in)|(websitewelcome|webhostsunucusu|ehost(s)?|ideahost|hostclear|bluehost|justhost|accountservergroup|arvixe|webserversystems|asmallorange|rhostjh|rhostbh)\.com|websitedns\.in|prodns\.com\.br)$/) {
+		return 1;
+	}
+	return 0;
+}
+
+
+sub colorify {
+	return $dnschecker->colorify(@_);
+}
+
+__PACKAGE__->main unless caller; # call main function unless we were included as module
+
+1;    
+} #main package
+
+
+BEGIN {
+package Dnschecker::helpers;
+
+use strict;
+use Term::ANSIColor;
+use Sys::Hostname;
+use Cwd;
+use JSON;
+
+our $VERSION = "3.3.3";
+
+sub new {
+
+	my $class = shift;
+	my $self  = {};
+	$self->{class}         = $class;
+	$self->{isCpanel}      = 0;
+	$self->{isPlesl}       = 0;
+	$self->{dbh}           = undef;
+	$self->{ohnoes}        = 0;
+	$self->{good}          = 0;
+	$self->{bad}           = 0;
+
+	#set by caller
+	$self->{nocolor}       = shift;
+	$self->{callback}      = shift;
+	$self->{token}         = shift;
+
+	#optional stuff
+	$self->{registrar}     = 0;
+	$self->{glue}          = 0;
+	$self->{mxlookup}      = 0;
+
+	$self->{ips}           = [];
+	$self->{tlds}          = {};
+	$self->{hostname}      = "";
+	$self->{tokensupport}  = 0;
+
+	if ( -s "/etc/psa/.psa.shadow" ) {
+
+		open(FILE, "</etc/psa/.psa.shadow");
+		my $mysqlpass = do { local $/; <FILE> };
+		close(FILE);
+		chomp $mysqlpass;
+
+		use DBI;
+		my $dbh = DBI->connect("DBI:mysql:database=psa;host=127.0.0.1","admin","$mysqlpass") or die "couldnt connect";
+		$self->{dbh} = $dbh;
+		$self->{isPlesk} = 1;
+
+        } elsif ( -s "/usr/local/cpanel/cpanel"){
+
+                $self->{isCpanel} = 1;
+	        #Check for cPanel version for API token.  Was introduced in v64.
+	        if( $self->{isCpanel} ){
+                	$currversion = +(split /\./,`cat /usr/local/cpanel/version`)[1]; 
+	                if ( $currversion >= 64 ){
+        	                $self->{tokensupport} = 1;
+                	}
+	        }
+
+		if ($currversion >= 70 || Dnschecker::isshared()){
+			require cPanel::PublicAPI;
+		} elsif (eval {require '/usr/local/share/perl5/cPanel/PublicAPI.pm';} ) {
+			require '/usr/local/share/perl5/cPanel/PublicAPI.pm';
+			if ( $currversion >= 64 && $cPanel::PublicAPI::VERSION < 2.2 ) {
+				die "[!] cPanel::PublicAPI out of date, please ensure 2.2 or greater for API Token support";
+			}
+		} else {
+			die "[!] Failed to load the necessary modules for this script to function properly. Please install cPanel::PublicAPI via '/scripts/perlinstaller cPanel::PublicAPI' - ";
+		}
+
+		if (eval {require XML::Simple;}) {
+			require XML::Simple;
+		} else {
+			die "[!] Failed to load the necessary modules for this script to function properly. Plese install XML::Simple via 'cpan install XML::Simple' - ";
+		}
+		if ( $self->{token} ){
+			$token = $self->{token};
+		}
+        } else {
+                $self->{ohnoes} = 1;
+        }
+
+	$self->{hostname} = (split(/\./, Sys::Hostname::hostname))[0];
+	my @ipc;
+
+	if ($> == 0) {
+		@ipc = grep (/inet.*global/, `/sbin/ip a`);
+	}
+
+	foreach my $t (@ipc) {
+		my $ip = (split(/\//, $t))[0];
+		$ip = (split(/\s+inet\s+/, $ip))[1];
+		if ($ip !~ m/^127\.|^10\./){
+			push @{$self->{ips}}, $ip;
+		}
+	}
+
+	bless($self, $class);
+	return $self;
+}
+
+sub dominfo {
+
+	my $self   = shift;
+	my $domain = shift;
+
+	$self->domHelper($domain, "unknown");
+	$self->processglue($domain, 1);
+	$self->processoutput("[#] Registrar info:\n");
+	$self->lookupregis($domain, 1);
+	$self->processoutput("[#] MX record info:\n");
+	$self->mxlookup($domain, 1);
+}
+
+sub processuser {
+
+	my $self     = shift;
+	my $luser    = shift;
+	my $procsubs = shift;
+
+	my $domcount = 0;
+	my $domgood  = 0;
+	my $dombad   = 0;
+
+	$self->processoutput("[*] Processing ".$self->colorify("red", $luser)." now...:\n");
+	if ($self->{isPlesk}) {
+		($domcount, $domgood, $dombad) = $self->process_plesk_user($luser, $procsubs);
+	} elsif ($self->{isCpanel}) {
+		($domcount, $domgood, $dombad) = $self->process_cpanel_user($luser, $procsubs);
+	}
+
+	if ($domcount == 0) {
+		return 0;
+	}
+	
+	$self->processoutput("[*] $luser has ".$self->colorify("green", $domcount)." domain(s), of which ".$self->colorify("green", $domgood)." domain(s) are resolving to the server, and ".$self->colorify("red", $dombad).", domain(s) are not.\n\n");
+	return ($domcount, $domgood, $dombad);
+}
+
+sub process_plesk_user {
+
+	my $self     = shift;
+	my $luser    = shift;
+	my $procsubs = shift;
+
+	my $domcount = 0;
+	my $domgood  = 0;
+	my $dombad   = 0;
+
+	my $querystring = qq^select hosting.dom_id from hosting inner join sys_users on hosting.sys_user_id=sys_users.id inner join domains on domains.id=hosting.dom_id where sys_users.login = '$luser' and domains.webspace_id=0 limit 1;^;
+	my $query = $self->{dbh}->prepare($querystring);
+	$query->execute;
+	my $maindomid = $query->fetchrow_array;
+
+	if (length($maindomid) == 0){
+		$self->processoutput->("[!] Unable to process $luser. User most likely does not exist on the server.\n");
+		return 0;
+	}
+
+	$querystring = qq^select domains.name from hosting inner join sys_users on hosting.sys_user_id=sys_users.id inner join domains on domains.id=hosting.dom_id where sys_users.login = '$luser' and domains.webspace_id=0 limit 1;^;
+	$query = $self->{dbh}->prepare($querystring);
+	$query->execute;
+	my $maindom = $query->fetchrow_array; 
+
+	$querystring = qq^select name from domains where webspace_id=$maindomid;^;
+	$query = $self->{dbh}->prepare($querystring);
+	$query->execute;
+	
+	my @addons;
+	while (my $addon = $query->fetchrow_array) {
+		push @addons, $addon;
+	}
+	push @addons, $maindom;
+
+	if ($procsubs) {
+			
+		my $querystring = qq^select CONCAT(subdomains.name,'.',domains.name) from subdomains inner join domains on domains.id=subdomains.dom_id AND webspace_id=$maindomid;^;
+		my $query = $self->{dbh}->prepare($querystring);
+		$query->execute;
+
+		my @subs = $query->fetchrow_array;
+		while (my $sub = $query->fetchrow_array) {
+            push @addons, $sub;
+        }
+	}
+
+	$domcount = scalar(@addons);
+
+	foreach my $addon (@addons) {
+		my $ip = $self->get_domainip_plesk($addon);
+		if (not $ip) {
+			$self->processoutput("[!] IP look up for $addon on the server failed. This might mean indicate more issues than the DNS settings, please be sure to review throughly.\n");
+			return 0;
+		}
+		my $counthelp = $self->domHelper($addon, $ip);
+		if ($counthelp == 0) {
+			$dombad++;
+		} else {
+			$domgood++;
+		}
+	}
+
+	return ($domcount, $domgood, $dombad);
+}
+
+sub process_cpanel_user {
+
+	my $self     = shift;
+	my $luser    = shift;
+	my $procsubs = shift;
+
+	my $domcount = 0;
+	my $domgood  = 0;
+	my $dombad   = 0;
+
+	if ( !-e "/var/cpanel/users/$luser" ) {
+		$self->processoutput("[!] $luser does not exist on the server.\n");
+		return 0;
+	}
+
+	my @domains = getdomains_cpanel($luser);
+
+	if ($procsubs) {
+		my @subs = getsubs_cpanel($luser);
+		foreach my $sub (@subs) {
+			push (@domains, $sub);
+		}
+	}
+	
+	open (my $userfile, "<", "/var/cpanel/users/$luser");
+	my $ip = (split(/=/, (grep(/^IP=/, <$userfile>))[0]))[1];
+	close ($userfile);
+	chomp $ip;
+
+	$domcount = scalar(@domains);
+	foreach my $addon (@domains){
+		chomp $addon;
+		if (not $addon or ($addon =~ /^\s*$/)) { # if addon is blank or just has spaces.
+			$self->processoutput("[!] cPanel API returned an EMPTY string as a domain name. This is indicative of bigger problems on the server - Please investigate further.\n");
+			return 0;
+		}
+		my $counthelp = $self->domHelper($addon, $ip);
+		if ($counthelp == 0){
+			$dombad++;
+		} else {
+			$domgood++;
+		}
+	}
+
+	return ($domcount, $domgood, $dombad);
+}
+
+sub processdomain {
+
+	my $self    = shift;
+	my $ldomain = shift;
+	my $result;
+
+	if ($self->{isPlesk}) {
+		my $ip = $self->get_domainip_plesk($ldomain);
+		if (not $ip) {
+			$self->processoutput("[!] IP look up for $ldomain on the server failed. Domain is most likely not configured under any accounts on the server. Lets see if it resolves to the server atleast...\n");
+			$result = $self->domHelper($ldomain, undef);
+		} else {
+			$result = $self->domHelper($ldomain, $ip);
+		}
+	}
+
+	if ($self->{isCpanel}) {
+		my $ip = $self->get_domainip_cpanel($ldomain);
+		if (not $ip) {
+			$self->processoutput("[!] $ldomain does not appear to be configured under any accounts on the server. Lets see if it resolves to the server atleast...\n");
+			$result = $self->domHelper($ldomain, $ip);
+		} else {
+			$result = $self->domHelper($ldomain, $ip);
+		}
+	}
+
+	if ($self->{ohnoes}) {
+		my $ip = undef;
+		$result = $self->domHelper($ldomain, $ip);
+	}
+	
+	return $result;
+}
+
+sub get_domainip_cpanel {
+
+	my $self   = shift;
+	my $domain = shift;
+	my $owner  = findowner($domain);
+	if ( $owner eq "" || (!-e "/var/cpanel/users/$owner" ) ) {
+		return;
+	} else {
+		open (my $userfile, "<", "/var/cpanel/users/$owner");
+		my $ip = (split(/=/, (grep(/^IP=/, <$userfile>))[0]))[1];
+		close ($userfile);
+		chomp $ip;
+		return $ip;
+	}
+}
+
+sub get_domainip_plesk {
+
+	my $self   = shift;
+	my $domain = shift;
+	my $querystring = qq^SELECT IP_Addresses.ip_address FROM IP_Addresses INNER JOIN domains ON domains.name = '$domain' OR domains.name = 'www.$domain' INNER JOIN clients ON clients.id=domains.cl_id INNER JOIN ip_pool ON ip_pool.id=clients.pool_id WHERE IP_Addresses.id = ip_pool.ip_address_id;^;
+	my $query       = $self->{dbh}->prepare($querystring); $query->execute();
+	if (my $result  = $query->fetchrow_hashref) {
+		return $result->{ip_address};
+	}
+	return;
+}
+
+sub domHelper {
+
+	my $self = shift;
+	my $ldom = shift;
+	my $lip  = shift;
+
+	$ldom =~ s/^\s+|\s+$//g; #strip white space
+	my $string;
+	
+	my $gDig = hostnametoip($ldom);
+	chomp $gDig;
+	chomp $lip;
+
+	if ($gDig) {
+		if (not $lip or $lip eq '*' or $lip eq 'unknown') {
+			if (not scalar(@{$self->{ips}})) {
+				$self->processoutput("[*] ".$self->colorify("green", $ldom)." resolves to $gDig\n");
+				return 1;
+			}
+			if ($self->isLocalip($gDig)) {
+				$self->processoutput("[*] ".$self->colorify("green", $ldom)." appears to resolve to an IP address on the server: $gDig\n");
+				return 1;
+			} else {
+				$self->processoutput("[!] ".$self->colorify("red", $ldom)." does NOT appear to resolve to an IP address on the server. Global IP: $gDig\n");
+				return 0;
+			}
+		}
+
+		if (not $self->isLocalip($lip)) {
+			$self->processoutput("[!] The local IP configured for ".$self->colorify("red", $ldom)." is: $lip - this IP is NOT on $self->{hostname}. This indicates more issues than just a DNS issue. Please do further testing.\n");
+			return 0;
+		}
+
+		if ($gDig eq $lip) {
+			$self->processoutput("[+] ".$self->colorify("green", $ldom)." is resolving to \'$self->{hostname}\'. IP: $lip.\n");
+			if (not $self->{bad}) {
+				$self->lookupregis($ldom, $self->{registrar});
+				$self->processglue($ldom, $self->{glue});
+				$self->mxlookup($ldom, $self->{mxlookup});
+			}
+			return 1;
+		} else {
+			if ($self->isLocalip($gDig)) {
+				$self->processoutput("[!] ".$self->colorify("yellow", $ldom)." is resolving to the server at $gDig, but the account is configured to use $lip.\n");
+				$self->lookupregis($ldom, $self->{registrar});
+				$self->processglue($ldom, $self->{glue});
+				$self->mxlookup($ldom, $self->{mxlookup});
+				return 0;
+			} else {
+				$self->processoutput("[!] ".$self->colorify("red", $ldom)." is not resolving to \'$self->{hostname}\'. Local IP: $lip - Global IP: $gDig.\n");
+				if (not $self->{good}) {
+					$self->lookupregis($ldom, $self->{registrar});
+					$self->processglue($ldom, $self->{glue});
+					$self->mxlookup($ldom, $self->{mxlookup});
+				}
+				return 0;
+			}
+		}
+	} else {
+		$self->processoutput("[!] Unable to resolve ".$self->colorify("red", $ldom)." on the server. Likely this domain is unregistered, or is configured incorrectly at the domain registrar level.\n");
+		return 0;
+	}
+}
+
+sub processglue {
+
+	my $self   = shift;
+	my $domain = shift;
+	my $glue   = shift;
+	if (not $glue) {
+		return 0;
+	}
+
+	my $rdnsq = $self->getroot($domain);
+	my @digcall = grep(/\bNS\b/, `dig \+nocmd \+nostats \+noquestion \+noanswer NS $domain \@$rdnsq`);
+	my @globalNS;
+	if (scalar(@digcall)) { 
+		foreach my $NS (@digcall) {
+			$NS = (split(' ', $NS))[4];
+			$NS = lc $NS;
+			push @globalNS, $NS;
+		}
+	} else {
+		push @globalNS, "Parent Nameservers ".$self->colorify("red", "do not have any nameservers listed.");
+		push @globalNS, "This typically means that the name does not exist or your registrar is experiencing technical difficulties.";
+	}
+	@globalNS = sort (@globalNS);
+
+	my @localNS;
+	if ($self->{isPlesk}) {
+		my @grep = grep(/\bNS\b/, `/usr/local/psa/bin/dns --info $domain`);
+		foreach my $localNS (@grep) {
+			$localNS = lc((split(' ', $localNS))[2]);
+			push @localNS, $localNS;
+		}
+	} elsif ($self->{isCpanel}) {
+		if (-e "/var/named/$domain.db") {
+			open (my $namedconf, "<", "/var/named/$domain.db");
+			my @grep = grep(/\sNS\s/, <$namedconf>);
+			foreach my $localNS (@grep) {
+				my @splits = split(/\s/, $localNS);
+				$localNS = lc($splits[$#splits]);
+				push @localNS, $localNS;
+			}
+		} else {
+			$self->processoutput("[#] /var/named/$domain.db does not appear to exist...\n");
+			return 0;
+		}
+	}
+
+	my $result;
+	if (scalar(@localNS)) {
+		@localNS = sort (@localNS);
+
+		if ( not comparearrays(@localNS, @globalNS) ) {
+			$self->processoutput("[#] ".$self->colorify("red", $domain)." DNS Glue mismatch found:\n");
+			$result = 0;
+		} else {
+			$self->processoutput("[#] ".$self->colorify("green", $domain)." DNS glue checks out.\n");
+			$result = 1;
+		}
+		$self->processoutput("[#] Local Nameservers:\n");
+		foreach my $ns (@localNS) {
+			my $nsIP = (grep(/[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}/, `dig \+nocmd \+nostats \+noquestion \+noanswer A +short $ns \@localhost`))[0];
+			chomp $nsIP;
+			if ($nsIP) {
+				if ($self->isLocalip($nsIP)) {
+					$self->processoutput("[-]\t$ns - ".$self->colorify("green", $nsIP)."\n");
+				} else {
+					$self->processoutput("[-]\t$ns - ".$self->colorify("red", $nsIP)." is not on this server.\n");
+				}
+			} else {
+				$self->processoutput("[-]\t$ns - No IP set at localhost. Please add the proper A records on the DNS zone.\n");
+			}
+		}
+	}
+
+	$self->processoutput("[#] Global Nameservers:\n");
+	foreach my $ns (@globalNS) {
+		$self->processoutput("[-]\t$ns\n");
+	}
+
+	return $result;
+}
+
+sub propcheck {
+
+	my $self   = shift;
+	my $domain = shift;
+	my $resolvers = {
+		"4.2.2.1"        => "Broomfield, CO, USA (Level 3)",
+		"18.71.0.151"    => "Cambridge, MA, USA (MIT)",
+		"64.105.163.106" => "Seattle, Washington",
+		"202.57.128.67"  => "Bangkok, Thailand",
+		"204.174.16.4"   => "New Westminister, Ottawa, Canada",
+		"204.153.24.1"   => "Mexico, Mexico",
+		"210.131.249.33" => "Tokyo, Japan",
+		"210.215.48.100" => "Canberra, Australia",
+		"62.153.158.62"  => "Berlin, Germany",
+		"89.189.156.5"   => "Birsk, Russia",
+		"93.88.144.138"  => "Root, Netherlands",
+		"129.7.1.1"      => "Houston, TX, USA (University of Houston)",
+		"222.73.127.66"  => "Beijing, China",
+		"61.31.233.1"    => "Taipei, Taiwan",
+		"195.49.216.15"  => "Yeditepe, Turkey",
+		"196.2.45.101"   => "Johannesburt, South Africa",
+		"200.19.215.1"   => "Brazil",
+	};
+	my $lip;
+	my $llip = hostnametoip($domain) || "Unresolvable";
+	if ($self->{isPlesk}) {
+		$lip = $self->get_domainip_plesk($domain);
+	} elsif ($self->{isCpanel}) {
+		$lip = $self->get_domainip_cpanel($domain);
+	} else {
+		$lip = "unknown";
+	}
+
+	$self->processoutput("[*] Propagation check for '$domain' - Hosted on '$lip', and resolving to '$llip' locally:\n\n");
+	foreach my $dns (keys %{$resolvers}) {
+		my $gip = (grep (/$domain has address|timed out|no A record/, `host -t A $domain $dns 2>&1`))[0];
+		chomp $gip;
+		if ($gip =~ /has address/) {
+			$gip =~ s/^.*address\s|\s*$//;
+		} elsif ($gip =~ /no A record/) {
+			$gip = "None";
+		} else {
+			$gip = undef;
+		}
+		if ($gip) {
+			my $color = "red";
+			if ($llip eq $gip) { $color = "green";}
+			$self->processoutput("[+] '$domain' resolves to '".$self->colorify ($color, $gip)."' at '$resolvers->{$dns}'\n");
+		} else {
+			$self->processoutput("[!] '$domain' does not resolve at '$resolvers->{$dns}'\n");
+		}
+	}
+}
+
+sub lookupregis {
+
+	my $self   = shift;
+	my $domain = shift;
+	my $lookup = shift;
+
+	if (not $lookup) {
+		return 0;
+	}
+
+	my  $WHOIS_TIMEOUT = 15;
+	my  $WHOIS_PORT    = 43;
+	our $WHOIS_MAP     = {
+                              com      => { whois => "whois.crsnic.net", registrar => qr/\s*Registrar:/, },
+                              net      => { whois => "whois.crsnic.net", registrar => qr/\s*Registrar:/, },
+                              org      => { whois => "whois.publicinterestregistry.net", registrar => qr/\s*Sponsoring Registrar:/, },
+                              info     => { whois => "whois.afilias.info", registrar => qr/\s*Sponsoring Registrar:/, },
+                              biz      => { whois => "whois.neulevel.biz", registrar => qr/\s*Sponsoring Registrar:\s*/, },
+                              uk       => { whois => "whois.nic.uk", registrar => qr/\s*Registrar:\r\s*/, },
+                              us       => { whois => "whois.nic.us", registrar => qr/\s*Sponsoring Registrar:\s*/, },
+                              co       => { whois => "whois.nic.co", registrar => qr/\s*Sponsoring Registrar:\s*/, },
+                              default  => { whois => "place", registrar => "Registrar:", },
+                             };
+	require IO::Socket;
+	my @registrars;
+	$domain =~ s/\.+$//;
+	if ($domain =~ /\.(\w+)$/) {
+		my $tld = $1;
+		my $w;
+
+		if (not exists $WHOIS_MAP->{$tld} ) {
+			$w = $WHOIS_MAP->{default};
+			$w->{whois} = "$tld.whois-servers.net";
+		} else {
+			$w = $WHOIS_MAP->{$tld};
+		}
+			
+		if ($w) {
+			my $oalarm = alarm($WHOIS_TIMEOUT + 1);
+			local $SIG{ALRM} = sub { $self->processoutput("[-]\t".$self->colorify("red", "$w->{whois}: Timeout!")."\n"); return 0; };
+
+			my $ip = hostnametoip($w->{whois});
+			if (not $ip) {
+				$self->processoutput("[-]\t".$self->colorify("red", "$domain: I do not know the whois server for this TLD: $tld")."\n");
+				return 0;
+			}
+
+			my $ok = eval {
+					if (my $io = IO::Socket::INET->new( PeerAddr => "$w->{whois}.:$WHOIS_PORT", Timeout  => $WHOIS_TIMEOUT, Proto => 'tcp')) {
+						$io->print("$domain\r\n");
+						my $whois = join "","[$w->{whois}]\n", <$io>;
+						$io->close;
+						if ( $whois =~ /$w->{'registrar'}(.*)/ ) {
+							my $registrar = $1;
+							if (length ($registrar) and $registrar !~ m/^\s*$/) { push @registrars, $registrar; }
+						}
+					} else {
+						die "$w->{whois}: Failed to find information for $domain: $@";
+					}
+					sleep 3;
+					1;
+				 };
+			alarm($oalarm);
+			if (not $ok) {
+				$self->processoutput("[-]\tFailed to fetch whois information for '$domain':\n");
+				chomp $@;
+				$self->processoutput("[-]\t".$self->colorify("red", $@)."\n");
+				return 0;
+			}
+		} else {
+			$self->processoutput("[-]\t".$self->colorify("red", "$domain: Unimplemented whois server for TLD: $tld")."\n");
+			return 0;
+		}
+	} else {
+		$self->processoutput("[-]\t".$self->colorify("red", "$domain: Unable to determine tld")."\n");
+		return 0;
+	}
+
+	if (scalar(@registrars)) {
+		$self->processoutput("[-]\tRegistrar for '$domain' is: ".$self->colorify("green", $registrars[0])."\n");
+		return $registrars[0];
+	} else {
+		$self->processoutput("[-]\tUnable to find registrar Information for: ".$self->colorify("red", $domain)."\n");
+		return undef;
+	}
+}
+
+sub mxlookup {
+
+	my $self = shift;
+	my $domain = shift;
+	my $lookup = shift;
+
+	if (not $lookup) {
+		return undef;
+	}
+	
+	my @digcall = grep(/\bMX\b/, `dig \+nocmd \+nostats \+noquestion MX $domain \@8.8.8.8`);
+	my $globalMX = {};
+	if (scalar(@digcall)) { 
+		foreach my $MX (@digcall) {
+			my (undef, undef, undef, undef, $priority, $record) = split (/\s+/, $MX);
+			$globalMX->{lc $record} = $priority;
+		}
+	}
+	
+	my $localMX = {};
+	my $exchanger;
+	if ($self->{isPlesk}) {
+		my @grep = grep(/\bMX\b/, `/usr/local/psa/bin/dns --info $domain`);
+		foreach my $MX (@grep) {
+			my (undef, undef, $priority, $record) = split (/\s+/, $MX);
+			$localMX->{lc $record} = $priority;
+		}
+		$exchanger = getmxtype_plesk($domain);
+	} elsif ($self->{isCpanel}) {
+		if (-e "/var/named/$domain.db") {
+			open (my $namedconf, "<", "/var/named/$domain.db");
+			my @grep = grep(/^[^;]*\sMX\s/, <$namedconf>);
+			close $namedconf;
+			
+			foreach my $MX (@grep) {
+				my (undef, undef, undef, $priority, $record) = split (/\s+/, $MX);
+				$localMX->{lc $record} = $priority;
+			}
+		}
+		$exchanger = getmxtype_cpanel($domain);
+	}
+	
+	if (keys %{$localMX}) {
+		if (not comparehashs($globalMX, $localMX)) {
+			$self->processoutput("[#] ".$self->colorify("red", $domain)." MX record mismatch found:\n");
+
+			$self->processoutput("[#] Local MX records:\n");
+			foreach my $key (sort { $localMX->{$a} <=> $localMX->{$b} } (keys(%{$localMX})) ) {
+				$self->processoutput("[-]\t$localMX->{$key} - $key\n");
+			}
+			$self->processoutput("[#] Global MX records:\n");
+			foreach my $key (sort { $globalMX->{$a} <=> $globalMX->{$b} } (keys(%{$globalMX})) ) {
+				$self->processoutput("[-]\t$globalMX->{$key} - $key\n");
+			}
+		} else {
+			$self->processoutput("[#] ".$self->colorify("green", $domain)." MX records check out.\n");
+			foreach my $key (sort { $localMX->{$a} <=> $localMX->{$b} } (keys(%{$localMX})) ) {
+				$self->processoutput("[-]\t$localMX->{$key} - $key\n");
+			}
+		}
+	}
+	
+	if (not keys %{$localMX}) {
+		$self->processoutput("[#] Global MX records:\n");
+		foreach my $key (sort { $globalMX->{$a} <=> $globalMX->{$b} } (keys(%{$globalMX})) ) {
+			$self->processoutput("[-]\t$globalMX->{$key} - $key\n");
+		}
+	}
+
+	if (not defined $exchanger and keys %{$localMX}) {
+		$self->processoutput("[#] ".$self->colorify("red", $domain)." Unable to determine MX exchanger type.\n");
+		return (undef, undef);
+	} elsif ( $exchanger eq "remote") {
+		$self->processoutput("[-] ".$self->colorify("yellow", $domain)." MX exchanger type: 'remote'\n");
+		return ("remote", $globalMX);
+	} elsif ( $exchanger eq "local") {
+		$self->processoutput("[-] ".$self->colorify("green", $domain)." MX exchanger type: 'local'\n");
+		return ("local", $localMX);
+	}
+}
+
+
+#Helper functions - none of these should be called directly
+
+sub processoutput {
+
+	my $self   = shift;
+	return $self->{callback}->(@_);
+}
+
+sub getroot {
+
+	my $self   = shift;
+	my $domain = shift;
+
+	my $tld = (split(/\./, $domain))[-1];
+
+	if (not exists $self->{tlds}->{$tld}) {
+		my @digcall = grep(/\bNS\b/, `dig \+nocmd \+nostats \+noquestion \+noanswer NS $domain \@e.root-servers.net`);
+		my $RNS = (split(' ', $digcall[0]))[4];
+		$RNS = lc $RNS;
+		$self->{tlds}->{$tld} = $RNS;
+	}
+
+	if (exists($self->{tlds}->{$tld}) and $self->{tlds}->{$tld} !~ /^\s*$/) {
+		return $self->{tlds}->{$tld};
+	} else {	
+		return "e.root-servers.net";
+	}
+}
+
+sub getmxtype_cpanel {
+
+	my $domain = shift;
+
+	open (my $remotedomains, "<", "/etc/remotedomains") or return undef;
+	if (grep (/^$domain$/, <$remotedomains>)) {
+		return "remote";
+	}
+	
+	open (my $localdomains, "<", "/etc/localdomains") or return undef;
+	if (grep (/^$domain$/, <$localdomains>)) {
+		return "local";
+	}
+	
+	close $remotedomains;
+	close $localdomains;
+	return undef;
+}
+
+sub getmxtype_plesk {
+
+	my $domain = shift;
+
+	my @grep = grep(/^Mail service:\s+/, `/usr/local/psa/bin/domain --info $domain`);
+	if (@grep) {
+		my ($status) = $grep[0] =~ m/^Mail service:\s+(\w+)$/;
+		if ($status =~ m/on/i) {
+			return "local";
+		} else {
+			return "remote";
+		}
+	}
+	return undef;
+}
+
+sub comparearrays {
+
+	my (@array1,@array2) = @_;
+	my %count;
+	my $item;
+	
+	foreach $item (@array1, @array2) { $count{$item}++; }
+
+	foreach $item (keys %count) {
+		if ($count{$item} != 2) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+sub comparehashs { #only checks hash keys, not the values. 
+
+	my $hash1 = shift;
+	my $hash2 = shift;
+
+	if (keys %{$hash1}  != keys %{$hash2}) {
+		return 0;
+	} else {
+		my %cmp = map { $_ => 1} keys %{$hash1};
+		foreach my $key (keys %{$hash2}) {
+			last unless exists $cmp{$key};
+			delete $cmp{$key};
+		}
+		if (%cmp) {
+			return 0;
+		}
+	}
+	
+	return 1;
+}
+
+sub findpleskuser {
+
+	my $self    = shift;
+	my $docroot = shift;
+
+	my $querystring = qq^select sys_users.login from sys_users inner join hosting on hosting.sys_user_id=sys_users.id where hosting.www_root = '$docroot' limit 1;^;
+	my $query = $self->{dbh}->prepare($querystring);
+	$query->execute();
+
+	my $user = $query->fetchrow_array;
+
+	if ($user) {
+		return $user;
+	} else {
+		return undef;
+	}
+}
+
+sub listpleskusers {
+	
+	my $self  = shift;
+	my $users = shift;
+
+	my $querystring = qq^SELECT clients.login FROM clients;^;
+	my $query = $self->{dbh}->prepare($querystring);
+	$query->execute();
+
+	while (my $user = $query->fetchrow_array()) {
+		if ($user eq 'admin') { next; }
+		$user = lc($user);
+		push @{$users}, $user;
+	}
+}
+
+sub hostnametoip {
+
+	my (@bytes, @octets, $packedaddr, $raw_addr, $host_name, $ip);
+	if($_[0] =~ /[a-zA-Z]/g) {
+		$raw_addr = (gethostbyname($_[0]))[4];
+		@octets = unpack("C4", $raw_addr);
+		$host_name = join(".", @octets);
+	} else {
+		$host_name = $_[0];
+	}
+	return $host_name;
+}
+
+sub getdomains_cpanel {
+
+	my $luser = shift;
+	my $apic;
+	my @domains;
+	my $response;
+	my $output;
+	my $domainjson;
+
+	if ( !-s "/root/.accesshash" && !defined($token)) {
+	$ENV{'REMOTE_USER'} = 'root';
+		system('/usr/local/cpanel/bin/realmkaccesshash');
+	}
+
+	if ($token){
+		$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0', api_token => $token );
+	}
+	else{
+		$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+	}
+	$response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'DomainLookup', 'func' => 'getbasedomains', 'user' => $luser, }, { }, 'json');
+	$domainjson = from_json($response);
+
+
+	if (ref($domainjson->{'cpanelresult'}{'data'}) eq 'ARRAY'){
+		foreach my $domain(@{$domainjson->{'cpanelresult'}{'data'}}){
+			push (@domains, $domain->{'domain'});
+		}
+	} 
+
+	return @domains;
+}
+
+sub getsubs_cpanel {
+
+	my $luser = shift;
+	my $apic;
+	my @domains;
+	my $response;
+	my $output;
+	my $subjson;
+
+	if ( !-s "/root/.accesshash" && !defined($token)) {
+		$ENV{'REMOTE_USER'} = 'root';
+		system('/usr/local/cpanel/bin/realmkaccesshash');
+	}
+
+	if ($token){
+		$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0', api_token => $token );
+	}
+	else{
+		$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+	}
+	$response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'SubDomain', 'func' => 'listsubdomains', 'user' => $luser, }, { }, 'json');
+	$subjson = from_json($response);
+	
+	if (ref($subjson->{'cpanelresult'}{'data'}) eq 'ARRAY'){
+		foreach my $obj (@{$subjson->{'cpanelresult'}{'data'}}){
+			my $tempu = $obj->{'domain'};
+			if (not addonsub($tempu)){
+				push (@domains, $tempu);
+			}
+		}
+	} elsif(!($subjson->{'data'}->{'domain'} eq "")) {
+		if (not addonsub($subjson->{'data'}->{'domain'})){
+			push (@domains, $subjson->{'data'}->{'domain'});
+		}
+	}
+
+	return @domains;
+}
+
+sub addonsub {
+
+	my $ldom = shift;
+	if ($ldom =~ m/^\*/){
+		return 1;
+	}
+
+	open (my $httpconf, "<", "/etc/httpd/conf/httpd.conf");
+	my $grep = (grep(/\bwww\.$ldom\b/, <$httpconf>))[0];
+	close ($httpconf);
+
+	$grep =~ s|serveralias||i;
+	$grep =~ s|www.$ldom$||i;
+	$grep =~ s/^\s+//;
+	$grep =~ s/\s+$//;
+	
+	if (length($grep) > 0){
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub findowner {
+
+	my $domain = shift;
+	my $owner;
+
+	open(my $USERDOMAINS, "/etc/userdomains" );
+	while (<$USERDOMAINS>) {
+		if (/^$domain: (\S+)/i) {
+			$owner = $1;
+		}
+	}
+	close($USERDOMAINS);
+
+	if ($owner eq ""){
+
+		open (my $httpconf, "<", "/etc/httpd/conf/httpd.conf");
+		my $grep;
+		while (<$httpconf>) {
+			if (/\b$domain\b/i) {
+				while (<$httpconf>){
+					$grep = $_;
+					last if (/documentroot/i);
+				}
+			}
+		}
+		close ($httpconf);
+
+		if ($grep) {
+			$grep =~ s|documentroot||gi;
+			$grep =~ s/^\s+//;
+			$grep =~ s/\s+$//;
+			$owner = (split(/\//, $grep))[2];
+		}
+	}
+	return $owner;
+}
+
+sub isLocalip {
+
+	my $self = shift;
+	my $lip  = shift;
+
+	return exists { map { $_ => 1 } @{$self->{ips}} }->{$lip};
+}
+
+sub colorify {
+
+	my $self   = shift;
+	my $color  = shift;
+	my $string = shift;
+
+	if ($self->{nocolor}) {
+		return $string;
+	} else {
+		return color("$color").$string.color("reset");
+	}
+}
+
+1;
+} #Dnschecker::helpers

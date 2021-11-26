@@ -1,0 +1,158 @@
+#!/usr/bin/env perl
+# ipfix - finds and corrects DNS <> vHost mismatches.
+# jlavoy - 09.09.2011
+# Please report bugs to bugs.hostgator.com
+# (C) 2012 HostGator.com, LLC
+use strict;
+use Cwd;
+
+my ( @path, @domains, @parkeddomains, @iplist, @ips, @vhost, @apacheip, @conf, @confcheck, $user );
+
+if ( @ARGV < 1 ) {
+	chomp(my $pwd = cwd());
+	my @path = split(/\//, $pwd);
+	$user = $path[2];
+	my $safe = $path[1];
+	if ( $safe !~ /^home/ ) {
+		die "[!] Not in home. Stopping\n";
+	}
+} else {
+	($user) = @ARGV;
+}
+
+if ( ! ($user) ) {
+	die "No user defined. Did you specify one or run this from the users directory?\n";
+} else {
+	print "[*] User defined as $user\n";
+	run($user);
+}
+
+sub run {
+	my ($user) = @_;
+	open(my $DAT, "<", "/etc/trueuserdomains");
+		while(<$DAT>) {
+			if ( $_ =~ /^([a-z0-9\-\.]+):\s$user$/ ) {
+				push(@domains, $1);
+			}
+		}
+	close($DAT);
+	my $primarydom = $domains[0];
+	open($DAT, "<", "/etc/userdomains");
+		while(<$DAT>){
+			if ( $_ =~ /^([a-z0-9\-\.]+)\.$primarydom:\s$user$/ ) {
+				push(@domains, "$1\.$primarydom");
+			}
+		}
+	close($DAT);
+	# parked domains
+	my $parked = 1;
+	open($DAT, "<", "/var/cpanel/userdata/$user/main");
+		while(<$DAT>) {
+			if ( /^parked_domains:/ ) {
+				$parked = 0;
+			}
+			if ( $parked == 0 ) {
+				if ( /^\s+\-\s([a-z0-9\-\.]+)/ ) {
+					push(@parkeddomains, $1);
+				} elsif ( /^sub_domains:/ ) {
+					last;
+				}
+			}
+		}
+	close($DAT);
+	chomp(my $primaryip = `hostname -i`);
+	open($DAT, "-|", "/sbin/ifconfig");
+		while(<$DAT>) {
+			if ( $_ =~ /^\s+inet\saddr\:([0-9.]+).*$/ ){
+				push(@ips, $1);
+			}
+		}
+	close($DAT);
+	my $fixneeded = 'n';
+	foreach my $domain (@domains) {
+		my $apacheip;
+		chomp(my $realdomain = `grep -w addon==$domain /etc/userdatadomains |awk -F: '{print \$1}'`);
+		if ( ! $realdomain ) {
+			$realdomain = $domain;
+		}
+		if ( $domain =~ /^$primarydom$/ ) {
+			open($DAT, "-|", "grep -w -2 www.$domain /usr/local/apache/conf/httpd.conf");
+				while(<$DAT>) {
+					if ( /\<VirtualHost\s([0-9.]+)\:80(80)?\>/ ){
+						$apacheip = $1;
+					}
+				}
+			close($DAT);
+		} else {
+			open($DAT, "-|", "grep -w -2 $domain /usr/local/apache/conf/httpd.conf");
+				while(<$DAT>) {
+					if ( /\<VirtualHost\s([0-9.]+)\:80(80)?\>/ ){
+						$apacheip = $1;
+					}
+				}
+			close($DAT);
+		}
+		chomp(my $zoneip = `dig \@$primaryip A $realdomain \+short`);
+		if (!($zoneip)) {
+			chomp($zoneip = `dig A $realdomain \+short`);
+		}
+		if ( ! ($zoneip) ) {
+			print "[-] $realdomain does not resolve, skipping.\n";
+		} elsif ( ! grep(/$zoneip/, @ips ) ) {
+			print "[-] $realdomain resolves off network, skipping.\n";
+		} elsif (( grep(/^$domain$/, @parkeddomains) ) || ( grep(/^$realdomain$/, @parkeddomains) )) {
+			print "[-] $realdomain is a parked domain, skipping.\n";
+		} elsif ( ! ($apacheip) ) {
+			print "[!] $realdomain does not have a vhost entry.\n";
+			print "[*] Setting $realdomain to have vhost rebuilt.\n";
+			$fixneeded = 'y';
+		} elsif ( $zoneip ne $apacheip ) {
+			print "[!] Mismatch found: $realdomain (dns:$zoneip / apache:$apacheip)\n";
+			print "[*] Fixing with DNS IP...";
+			my $copy = "/bin/cp -p /var/cpanel/userdata/$user/$domain /var/cpanel/userdata/$user/$domain.bu";
+			system($copy);
+			if ( ! -e "/var/cpanel/userdata/$user/$domain.bu" ) {
+				die "[!] Backup of userdata file failed, Quitting for safety.\n";
+			}
+			open($DAT, "<", "/var/cpanel/userdata/$user/$domain.bu") or die "Cannot open userdata copy file.\n";
+				open(my $WAT, ">", "/var/cpanel/userdata/$user/$domain") or die "Cannot open userdata file.\n";
+					while(<$DAT>) { 
+						$_ =~ s/ip:.*/ip:\ $zoneip/g;
+						print $WAT $_;
+					}
+				close($WAT);
+			close($DAT);
+			open($DAT, "<", "/var/cpanel/userdata/$user/$domain");
+				my @confcheck = <$DAT>;
+			close($DAT);
+			if (grep(/$zoneip/, @confcheck)) {
+				print "Fix Successful.\n";
+				$fixneeded = 'y';
+			} else {
+				unlink("/var/cpanel/userdata/$user/$domain.bu");
+				die "Fix failed, check manually.\n";
+			}
+		} else {	
+			print "[*] No Mismatch found on $realdomain.\n";
+		}
+	}
+	if ($fixneeded eq 'y'){
+		fix($fixneeded);
+	}
+}
+
+
+sub fix {
+	my ($fixneeded) = @_;
+	if ( $fixneeded eq 'y' ){
+		print "[*] Fix needed, applying changes.\n";
+		print "============================================================================================\n\n";
+		system("/scripts/updateuserdomains");
+		system("/scripts/updateuserdatacache");
+		system("/scripts/rebuildhttpdconf");
+		system("/etc/init.d/httpd graceful");
+		print "\n============================================================================================\n";
+	}
+}
+
+print "[*] Done. \n";

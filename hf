@@ -1,0 +1,1602 @@
+#!/usr/local/cpanel/3rdparty/bin/perl -w
+#################################################################
+# hf.pl - Michael Karr
+# Small utility to correlate modify time/date of a file with log entries.
+#
+# Git: http://git.toolbox.hostgator.com/hf
+# Wiki: https://gatorwiki.hostgator.com/Security/HF
+#
+# Please submit all bug reports at http://bugs.hostgator.com
+#
+# (c) 2012 - HostGator.com, LLC.
+#################################################################
+
+{ # start main package
+package main;
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+use FileHandle;
+use Cwd;
+use File::Spec;
+
+use DateTime;
+use Date::Parse;
+
+use Term::ANSIColor;
+
+use LWP::UserAgent;
+use Sys::Hostname;
+
+MK::Utility::use_from_cpan("JSON");
+
+# grab arguments
+
+my %args = (
+    range => 60, # range (in seconds) of results to display
+    num_results => 5, # maximum number of results to display
+    extrafilter => 1, # employ extra, protocol specific, filters
+);
+
+GetOptions (
+    'user|u=s' => \$args{user},
+    'range|r=s' => \$args{range},
+    'usage|help|z|?' => \$args{usage},
+    'get|g' => \$args{get},
+    'json|j' => \$args{json},
+    'silent|s' => \$args{silent},
+    'number|n=s' => \$args{num_results},
+    'extrafilter=s' => \$args{extrafilter},
+    'filename=s' => \$args{filename},
+    'filesize=s' => \$args{filesize},
+    'nofollow' => \$args{nofollow},
+);
+
+if ($args{json}) {
+    $args{silent} = 1;
+}
+
+# main routine
+
+display("hf.pl - Michael Karr\n\n");
+
+if ($args{usage}) {
+    usage();
+} elsif (!exists $ARGV[0]) { #quick check to make sure we have an argument
+    error("No arguments provided!\n\n");
+    usage();
+} elsif (my $file = HF::FileStat->new(filename => $ARGV[0], follow => !($args{nofollow}))) {
+    find_file($file);
+} elsif (defined(my $time = time_to_epoch($ARGV[0]))) {
+    if (defined(get_user())) {
+        if (defined($args{filename}) && defined($args{filesize})) {
+            my $fakefile = HF::FileStat->fake(filename => $args{filename}, size => $args{filesize});
+            find_time(DateTime->from_epoch(epoch => $time), undef, $fakefile);
+        } else {
+            find_time(DateTime->from_epoch(epoch => $time));
+        }
+    } else {
+        error("Not within a valid home directory, or no user specifed.\n\n");
+        usage();
+    }
+} else {
+    error("Unknown argument provided or file does not exist.\n\n");
+    usage();
+}
+
+display("Done.\n");
+exit 0;
+
+# main subs
+
+sub display {
+    my ($text) = @_;
+
+    if (!$args{silent}) {
+        print $text;
+    }
+}
+
+sub error {
+    my ($text) = @_;
+
+    print STDERR $text;
+}
+
+sub usage {
+    display("Usage:\n\n");
+    display("$0 [filename|timestamp] [options]\n\n");
+    display("Options:\n\n");
+    display("--usage, -? : Display this help message.\n");
+    display("--range, -r : Specify the time range when searching. (all modes, default = 60 seconds)\n");
+    display("--get, -g : Search for GET requests too. (all modes)\n");
+    display("--user, -u : Specify a user to search for. (timestamp mode)\n");
+    display("--number, -n : Maximumum number of results to display per log. (all modes, default = 5)\n");
+    display("--extrafilter=(1|0) : Enable extra protocol specific filters. (1 = on, 0 = off, default = 1)\n");
+    display("--filename : Specify a filename to filter for. (requires size be specified as well)\n");
+    display("--filesize : Specify a filesize to filter for. (requires name be specified as well)\n");
+    display("--nofollow : Do not dereference a specified symlink.\n");
+    display("--json, -j : JSON output.\n");
+    display("\n");
+}
+
+
+sub time_to_epoch {
+    my ($time) = @_;
+
+    if ($time =~ /^(\d+)(\.\d+)?$/) { # are we a whole number? probably an epoch value
+        return $1
+    } elsif (defined(my $epoch = str2time($time))) {
+        return $epoch;
+    } else {
+        return undef;
+    }
+}
+
+sub get_user {
+    if (($args{user}) && ((-e '/var/cpanel/users/'.$args{user}) || ($args{user} eq 'root'))) {
+	return $args{user}
+    } elsif (my $user = dir_to_user(cwd())) {
+        if (-e '/var/cpanel/users/'.$user) {
+            return $user;
+        } else {
+            return undef;
+        }
+    } else {
+        return undef;
+    }
+}
+
+sub dir_to_user {
+    my ($dir) = @_;
+    my %home_dirs;
+
+    while(my @ent = getpwent()) {
+        $home_dirs{File::Spec->canonpath($ent[7])} = $ent[0];
+    }
+
+    endpwent();
+
+    my @dp = File::Spec->splitdir($dir);
+
+    while (scalar(@dp)) {
+        my $nd = File::Spec->canonpath(File::Spec->catdir(@dp));
+
+        if (exists($home_dirs{$nd})) {
+            return $home_dirs{$nd};
+        }
+
+        pop(@dp);
+    }
+
+    return undef;
+}
+
+sub request_pattern {
+    my $self = shift;
+
+    my @requests = ("POST");
+
+    if ($args{get}) {
+	push (@requests, "GET");
+    }
+
+    return '(?:'.join('|',@requests).')';
+}
+
+sub find_file {
+    my ($file) = @_;
+
+    display($file->to_text()."\n");
+    display("Search Range: ".$args{range}." seconds.\n\n");
+
+    my $user;
+
+    if ($args{user}) {
+        display(color 'bold');
+        display("Search user forced to '".$args{user}."'.\n\n");
+        display(color 'reset');
+
+        $user = $args{user};
+    } else {
+        $user = $file->user;
+    }
+
+    my $results = {};
+
+    display("Searching for Modify Time.\n\n");
+    $results->{mtime} = find_hack($file->mtime, $user, $file);
+
+    if ($file->mtime != $file->ctime) {
+        display("Change time is different than Modify Time.\n");
+        display("Searching for Change Time.\n\n");
+        $results->{ctime} = find_hack($file->ctime, $user, $file);
+    }
+
+    if ($args{json}) {
+        json($results);
+    }
+
+    check_ssh_key($user);
+    post_dashboard_file($file, $results);
+}
+
+sub find_time {
+    my ($time, $user, $file) = @_;
+    $user = ($user ? $user : get_user());
+    my $tz = DateTime::TimeZone->new(name =>'local');
+    $time->set_time_zone($tz);
+
+    display("User: $user\n");
+    display('Time: '.$time->strftime("%a, %d %b %Y %H:%M:%S %z")." (".$time->epoch().")\n\n");
+    display("Search Range: ".$args{range}." seconds.\n\n");
+
+    my $results = find_hack($time, $user, $file);
+
+    if ($args{json}) {
+        json($results);
+    }
+}
+
+sub find_hack {
+    my ($time, $user, $file) = @_;
+    my %results;
+    my $handlers = HF::Handlers::get_handlers();
+    my @handlers_s;
+
+    my %params = (
+        user => $user,
+        time => $time,
+        range => $args{range},
+        request_pattern => request_pattern(),
+        end_early => 1,
+        file => $file,
+    );
+
+
+    if ($user eq 'root') {
+        display(color 'bold');
+        display("Root user detected, disabling some checks.\n");
+        display("You may need to force a user using the -u option.\n\n");
+        display(color 'reset');
+
+        @handlers_s = qw(ftp_messages apache_access cpanel cpanel_fml bash_history);
+    } else {
+        @handlers_s = qw(ftp_messages ftp_xfer apache_dom apache_access cpanel cpanel_fml bash_history);
+    }
+
+    for my $handler (@handlers_s) {
+        display("Searching for entries in the ".$handlers->{$handler}->{title}."...\n\n");
+        $results{$handler} = $handlers->{$handler}->{handler}->(%params);
+
+        # run extra, protocol-specific, filters for the result set (if called for)
+
+        if ($args{extrafilter}) {
+            $results{$handler}->extrafilter($handler, %params);
+        }
+
+        $results{$handler}->filter($time, $args{num_results});
+        display_results($results{$handler});
+    }
+
+    return(\%results);
+}
+
+sub display_results {
+    my ($results) = @_;
+
+    if ($results->get_log_count() > 0) {
+        if (scalar(@{$results->get_match_list_ref()}) > 0) {
+            for my $match (@{$results->get_match_list_ref()}) {
+                if ($match->{flag}) {
+                    display(color 'bold');
+                    display($match->{match}->log.": ".$match->{match}->entry."\n");
+                    display(color 'reset');
+                } else {
+                    display($match->{match}->log.": ".$match->{match}->entry."\n");
+                }
+            }
+
+            display("\n");
+        } else {
+            display("\tNo matches found.\n\n")
+        }
+    } else {
+        display("\tNo logs found for the requested time period.\n\n")
+    }
+}
+
+sub check_ssh_key {
+    my $user = shift;
+    my $current_time = time;
+    my $one_day  = 86400;
+    my $filename = "/home/$user/.ssh/authorized_keys";
+    my $warning  = 0;
+    if ( -f $filename ) {
+        display("Checking authorized_key for recent modifications...\n\n");
+        my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($filename);
+        if ( ($current_time - $mtime) < $one_day ) {
+            $warning++;
+        }
+        if ( ($current_time - $ctime) < $one_day ) {
+            $warning++;
+        }
+    }
+    if ( $warning ) {
+        display(color 'bold');
+        display("\tWARNING '$filename' modified within the past 24 hours\n\n");
+        display(color 'reset');
+    } else {
+        display("\tOk.\n\n");
+    }
+}
+
+sub json {
+    my ($results) = @_;
+
+    print(JSON->new->allow_blessed->convert_blessed->encode($results)."\n");
+}
+
+sub post_dashboard_file {
+    my ($file, $results) = @_;
+
+    my $host = hostname;
+    unless ($host =~ /\.(hostgator|websitewelcome)\.com/) {
+        return;
+    }
+
+    my %rpc = (
+        method => 'add_hf_log',
+        jsonrpc => '2.0',
+        id => undef,
+        params => {
+            filename => $file->{filename},
+            modified => $file->{mtime}->epoch(),
+            changed => $file->{ctime}->epoch(),
+            logs => {},
+        },
+    );
+
+    for my $t ('ctime', 'mtime') {
+        for my $h (keys %{$results->{$t}}) {
+            for my $m (@{$results->{$t}->{$h}->{matches}}) {
+                if ($m->{flag}) {
+                    push(@{$rpc{params}->{logs}->{$t}->{$h}}, $m->{match}->{entry})
+                }
+            }
+        }
+    }
+
+    my $ua = new LWP::UserAgent;
+    my $req = new HTTP::Request 'POST','http://scripts.hostgator.com/~sec/json_rpc_stub.php';
+    $req->content_type('application/json-rpc');
+    $req->content(JSON->new->encode(\%rpc));
+    my $res = $ua->request($req);
+
+    unless($res->is_success) {
+        error("Failed to notify dashboard server: ".$res->code.".\n");
+    }
+}
+
+} # end main package
+
+
+BEGIN { # begin package MK::Utility
+package MK::Utility;
+use strict;
+use warnings;
+use Carp;
+
+use Cwd 'abs_path';
+use Term::ANSIColor;
+
+sub regex_file_match {
+    my ($file, $rex, $endearly) = @_;
+    my $fh;
+
+    if ($file =~ /^.*?\.gz$/) {
+        open($fh, "-|", "zcat " . $file); # total hack, but super fast
+    } else {
+        $fh = FileHandle->new("<$file");
+    }
+
+    unless(defined($fh)) {
+	return undef;
+    }
+
+    my @matches;
+    my $found = 0;
+    my $counter = 0; # sometimes logs are not exactly 'sorted', we may need to ignore some incongruities
+
+    while(my $line = <$fh>) {
+        if ($line =~ /$rex/) {
+            push (@matches, $1);
+
+            unless (wantarray()) {
+                last;
+            }
+
+            $found = 1;
+            $counter = 0;
+        } else {
+            $counter++;
+
+            if ($found && $endearly && ($counter > 100)) {
+                last;
+            }
+        }
+    }
+
+    $fh->close();
+
+    if (wantarray()) {
+        return @matches;
+    } else {
+        return shift @matches;
+    }
+}
+
+sub install_module_cpan {
+    my ($module) = @_;
+
+    my $cwd = abs_path(); # save the working directory, cpan will clobber it
+
+    # load up CPAN
+
+    eval { require CPAN };
+    CPAN->import();
+
+    # try to get the root user CPAN config first, otherwise get the system level config
+
+    my $config_file = '/root/.cpan/CPAN/MyConfig.pm';
+
+    if (!(-e $config_file && eval { require $config_file })) {
+        eval { require CPAN::Config; };
+    }
+
+    # if that does not work, load our own config
+
+    require CPAN::HandleConfig;
+    my @missing = CPAN::HandleConfig::missing_config_data();
+
+    if (@missing) {
+        $CPAN::Config = {
+            'auto_commit' => q[0],
+            'build_cache' => q[100],
+            'build_dir' => q[/root/.cpan/build],
+            'build_dir_reuse' => q[0],
+            'build_requires_install_policy' => q[yes],
+            'bzip2' => q[/usr/bin/bzip2],
+            'cache_metadata' => q[1],
+            'check_sigs' => q[0],
+            'colorize_output' => q[0],
+            'commandnumber_in_prompt' => q[1],
+            'connect_to_internet_ok' => q[1],
+            'cpan_home' => q[/root/.cpan],
+            'ftp_passive' => q[1],
+            'getcwd' => q[cwd],
+            'gpg' => q[/usr/bin/gpg],
+            'gzip' => q[/bin/gzip],
+            'halt_on_failure' => q[0],
+            'histfile' => q[/root/.cpan/histfile],
+            'histsize' => q[100],
+            'inactivity_timeout' => q[0],
+            'index_expire' => q[1],
+            'inhibit_startup_message' => q[0],
+            'keep_source_where' => q[/root/.cpan/sources],
+            'load_module_verbosity' => q[none],
+            'make' => q[/usr/bin/make],
+            'make_install_make_command' => q[/usr/bin/make],
+            'mbuild_install_build_command' => q[./Build],
+            'pager' => q[/usr/bin/less],
+            'patch' => q[/usr/bin/patch],
+            'perl5lib_verbosity' => q[none],
+            'prefer_external_tar' => q[1],
+            'prefer_installer' => q[MB],
+            'prefs_dir' => q[/root/.cpan/prefs],
+            'prerequisites_policy' => q[follow],
+            'scan_cache' => q[atstart],
+            'shell' => q[/bin/bash],
+            'show_unparsable_versions' => q[0],
+            'show_upload_date' => q[0],
+            'show_zero_versions' => q[0],
+            'tar' => q[/bin/tar],
+            'tar_verbosity' => q[none],
+            'term_is_latin' => q[1],
+            'term_ornaments' => q[1],
+            'test_report' => q[0],
+            'trust_test_report_history' => q[0],
+            'unzip' => q[/usr/bin/unzip],
+            'urllist' => [
+                q[http://httpupdate.cpanel.net/CPAN/],
+                q[http://httpupdate1.cpanel.net/CPAN/],
+                q[http://httpupdate14.cpanel.net/CPAN/],
+                q[http://httpupdate15.cpanel.net/CPAN/],
+                q[http://httpupdate17.cpanel.net/CPAN/],
+                q[http://httpupdate18.cpanel.net/CPAN/],
+                q[http://httpupdate19.cpanel.net/CPAN/],
+                q[http://httpupdate23.cpanel.net/CPAN/],
+                q[http://httpupdate25.cpanel.net/CPAN/],
+                q[http://httpupdate27.cpanel.net/CPAN/],
+            ],
+            'use_sqlite' => q[0],
+            'version_timeout' => q[15],
+            'wget' => q[/usr/bin/wget],
+            'yaml_load_code' => q[0],
+            'yaml_module' => q[YAML],
+        };
+
+        # fill out rest of options with blank values
+
+        @missing = CPAN::HandleConfig::missing_config_data();
+
+        for my $opt (@missing) {
+            $CPAN::Config->{$opt} = q[];
+        }
+    }
+
+    CPAN::Shell->install($module);
+
+    chdir($cwd); # restore working directory
+}
+
+sub use_from_cpan {
+    my ($module) = @_;
+
+    my $ex_module = $module;
+    $ex_module =~ s#::#/#g;
+
+    if (eval { require $ex_module.'.pm' }) {
+        eval $module.'->import();';
+    } else {
+        # redirect STDOUT > STDERR temporarily
+
+        no warnings 'once'; # supress "used only once" warning
+
+        open (OLDOUT, ">&STDOUT");
+        open (STDOUT, ">&STDERR");
+
+        use warnings 'once';
+
+        print color 'bold';
+        print "Module '$module' not found. Installing.\n\n";
+        print color 'reset';
+
+        install_module_cpan($module);
+
+        if (eval { require $ex_module.'.pm' }) {
+            print color 'bold';
+            print "\nInstall of module '$module' succeded!\n\n";
+            print color 'reset';
+
+            eval $module.'->import();';
+        } else {
+            croak "Install of module '$module' failed!";
+        }
+
+        # restore STDOUT
+
+        open (STDOUT, ">&OLDOUT");
+    }
+}
+
+1;
+} # end package MK::Utility
+
+
+BEGIN { # begin package HF::Handlers
+package HF::Handlers;
+
+use strict;
+use warnings;
+use Carp;
+
+use DateTime;
+
+my %handlers = (
+    apache_access => {
+        title => 'Apache access_log',
+        handler => \&apache_access,
+    },
+    apache_dom => {
+        title => "Apache domlog",
+        handler => \&apache_dom,
+    },
+    ftp_messages => {
+        title => "FTP message_log",
+        handler => \&ftp_messages,
+    },
+    ftp_xfer => {
+        title => "FTP xferlog",
+        handler => \&ftp_xfer,
+    },
+    cpanel => {
+        title => "cPanel access_log",
+        handler => \&cpanel,
+    },
+    bash_history => {
+        title => "bash_history log",
+        handler => \&bash_history,
+    },
+    cpanel_fml => {
+        title => "cPanel File Manager logger",
+        handler => \&cpanel_fml,
+    },
+);
+
+sub get_handlers {
+    return \%handlers;
+}
+
+sub get_homedir {
+    my ($user) = @_;
+    my @pwent = getpwnam($user);
+    return $pwent[7];
+}
+
+sub apache_dom {
+    my (%params) = @_;
+    my $dt = $params{time}->clone;
+
+    $dt->set_time_zone(DateTime::TimeZone->new(name =>'local'));
+
+    my $primary = MK::Utility::regex_file_match('/var/cpanel/users/'.$params{user}, 'DNS=(.*?)$');
+    my $archive_pattern = $dt->strftime('%b-%Y');
+
+    # use the next month's log of it falls near the end of the month (archival system is not exact)
+
+    if (($dt->day() >= 30) || (($dt->month() == 2) && ($dt->day() >= 28))) {
+        my $ndt = $dt->clone;
+
+        $ndt->set_time_zone(DateTime::TimeZone->new(name =>'local'));
+        $ndt->add(weeks => 1); # weeks rather than months, a full month may cause it to skip a month
+
+        $archive_pattern = $archive_pattern.'|'.$ndt->strftime('%b-%Y');
+    }
+
+    my $searcher = HF::LogSearcher->new(
+        log_pattern => '([^\s]*\s-\s-\s\[##time##\]\s"'.$params{request_pattern}.'.*?$)',
+        time_format => '%d/%b/%Y:%H:%M:%S %z',
+        timezone => DateTime::TimeZone->new(name =>'local'),
+        file_directories => ['/usr/local/apache/domlogs',
+                             get_homedir($params{user}).'/logs',
+                             (grep {-d} glob '/home*/apachelogs/'.$params{user}),
+                             (grep {-d} glob '/home*/SERVER_BACKUP-*/home/apachelogs/'.$params{user})],
+        file_pattern => '('.$primary.'(\.bkup)?$)|(('.$archive_pattern.')\.gz)',
+        sorted => 'desc',
+        end_early => $params{end_early},
+        parser => 'binary_partition',
+    );
+
+    return $searcher->search($params{time}, $params{range});
+}
+
+sub apache_access {
+    my (%params) = @_;
+
+    my $searcher = HF::LogSearcher->new(
+        log_pattern => '([^\s]*\s-\s-\s\[##time##\]\s"'.$params{request_pattern}.'\s\/~'.$params{user}.'.*?$)',
+        time_format => '%d/%b/%Y:%H:%M:%S %z',
+        timezone => DateTime::TimeZone->new(name =>'local'),
+        file_directories => ['/usr/local/apache/logs', '/usr/local/apache/logs/archive'],
+        file_pattern => 'access_log(-.*?\.gz)?',
+        sorted => 'desc',
+        chrono => 1,
+        end_early => $params{end_early},
+        parser => 'binary_partition',
+    );
+
+    return $searcher->search($params{time}, $params{range});
+}
+
+sub ftp_messages {
+    my (%params) = @_;
+
+    my $searcher = HF::LogSearcher->new(
+        log_pattern => '(^##time##\s\w*?\spure-ftpd:\s\(.*?\)\s\[NOTICE\]\s(('.quotemeta(get_homedir($params{user})).'\/[^\s]*\suploaded)|(File successfully renamed or moved)).*?$)',
+        time_format => '%b +%e %H:%M:%S',
+        timezone => DateTime::TimeZone->new(name =>'local'),
+        file_directories => ['/var/log'],
+        file_pattern => '(messages|ftp.log)((-\d{8})|(\.\d))?(\.gz)?',
+        sorted => 'desc',
+        chrono => 1,
+        end_early => $params{end_early},
+        parser => 'binary_partition',
+    );
+
+    return $searcher->search($params{time}, $params{range});
+}
+
+sub ftp_xfer {
+    my (%params) = @_;
+
+    my $searcher = HF::LogSearcher->new(
+        log_pattern => '^(##time##.*?'.quotemeta(get_homedir($params{user})).'\/.*?i\sr\s[^\s]*\sftp\s1\s\*\s[ci]$)',
+        time_format => '%a %b %d %H:%M:%S %Y',
+        timezone => DateTime::TimeZone->new(name =>'local'),
+        file_directories => ['/usr/local/apache/domlogs/'.$params{user}],
+        file_pattern => '.*?-ftp_log',
+        end_early => $params{end_early},
+        parser => 'binary_partition',
+    );
+
+    return $searcher->search($params{time}, $params{range});
+}
+
+sub cpanel {
+    my (%params) = @_;
+
+    my $searcher = HF::LogSearcher->new(
+        log_pattern => '([^\s]*\s-\s'.$params{user}.'\s\[##time##\]\s"'.$params{request_pattern}.'.*?$)',
+        time_format => '%m/%d/%Y:%H:%M:%S -0000',
+        timezone => DateTime::TimeZone->new(name =>'UTC'),
+        file_directories => ['/usr/local/cpanel/logs', '/usr/local/cpanel/logs/archive'],
+        file_pattern => 'access_log(-.*?\.gz)?',
+        sorted => 'desc',
+        chrono => 1,
+        end_early => $params{end_early},
+        parser => 'binary_partition',
+    );
+
+    return $searcher->search($params{time}, $params{range});
+}
+
+sub cpanel_fml {
+    my (%params) = @_;
+
+    my $searcher = HF::LogSearcher->new(
+        log_pattern => '^(\[##time##\]\sinfo\s\[hgFML::Logger\].*?)$',
+        time_format => '%Y-%m-%d %H:%M:%S %z',
+        timezone => DateTime::TimeZone->new(name =>'local'),
+        file_directories => ['/usr/local/cpanel/logs', '/usr/local/cpanel/logs/archive'],
+        file_pattern => 'error_log(-.*?\.gz)?',
+        sorted => 'desc',
+        chrono => 1,
+        end_early => $params{end_early},
+    );
+
+    return $searcher->search($params{time}, $params{range});
+}
+
+sub bash_history {
+    my (%params) = @_;
+    my @files = ('/root/.bash_history', get_homedir($params{user}).'/.bash_history');
+    my $dt = $params{time}->clone();
+    my $epoch = $dt->epoch();
+    my $secrange = $params{range} / 2;
+    my $tz = DateTime::TimeZone->new(name =>'local');
+
+    my $matchlist = HF::LogMatchList->new();
+
+    for my $file (@files) {
+        $matchlist->inclogcnt();
+
+        if (-f $file) {
+            if (my $fh = FileHandle->new("<$file")) {
+                my $time = undef;
+
+                while (my $line = <$fh>) {
+                    if ($line =~ /^#(\d+)$/) {
+                        $time = $1;
+                    } else {
+                        if ($time && ($time >= ($epoch - $secrange)) && ($time <= ($epoch + $secrange))) {
+                            chomp($line);
+
+                            my $cdt = DateTime->from_epoch(epoch => $time);
+                            $cdt->set_time_zone($tz);
+                            my $result = $cdt->strftime("%a %b %d %H:%M:%S %Y").' - '.$line;
+
+                            my $match = HF::LogMatch->new(
+                                time => $time,
+                                log => $file,
+                                entry => $result,
+                            );
+
+                            $matchlist->add($match);
+
+                        }
+                    }
+                }
+
+                $fh->close;
+            }
+        }
+    }
+
+    return $matchlist;
+}
+
+1;
+} # end package HF::Handlers
+
+
+BEGIN { # begin class HF::LogMatch
+package HF::LogMatch;
+
+use strict;
+use warnings;
+use Carp;
+
+# class members
+
+my @members = qw(time log entry);
+
+# constructor
+
+sub new {
+    my($class, %params) = @_;
+    my $self = {};
+
+    for my $i (@members) {
+        defined($params{$i}) or croak "Attribute '$i' not passed to constructor.";
+        $self->{$i} = $params{$i};
+    }
+
+    bless($self, $class);
+    return $self;
+}
+
+# accessors
+
+no strict; # We are making evil with Perl
+
+for my $i (@members) {
+    *{"$i"} = sub {
+        my $self = shift;
+        return $self->{$i};
+    };
+}
+
+use strict;
+
+# public methods
+
+sub TO_JSON {
+    my $self = shift;
+    return {%$self};
+}
+
+1;
+} # end class HF::LogMatch
+
+
+BEGIN { # begin class HF::LogMatchList
+package HF::LogMatchList;
+
+use strict;
+use warnings;
+use Carp;
+
+use DateTime;
+use File::Spec;
+
+MK::Utility::use_from_cpan("JSON");
+
+# extra filter handlers
+
+my %extrafilters = (
+    ftp_messages => \&ex_messages_filter,
+    ftp_xfer => \&ex_xfer_filter,
+    apache_access => \&ex_404_filter,
+    apache_dom => \&ex_404_filter,
+    cpanel => \&ex_404_filter,
+    cpanel_fml => \&ex_fml_filter,
+);
+
+# constructor
+
+sub new {
+    my($class) = @_;
+
+    my $self = {
+        matches => [],
+        log_count => 0,
+    };
+
+    bless($self, $class);
+    return $self;
+}
+
+# accessors
+
+sub get_match_list_ref {
+    my $self = shift;
+    return [@{$self->{matches}}];
+}
+
+sub get_log_count {
+    my $self = shift;
+    return $self->{log_count};
+}
+
+# public methods
+
+sub add {
+    my $self = shift;
+    my ($match) = @_;
+
+    push(@{$self->{matches}}, {
+        match => $match,
+        flag => 0,
+    });
+}
+
+sub filter {
+    my $self = shift;
+    my ($dt, $num_results) = @_;
+    my $time = $dt->epoch();
+    my @sortedentries = sort {$a->{match}->{time} <=> $b->{match}->{time}} @{$self->{matches}};
+    my $closest;
+
+    for my $match (@sortedentries) {
+        if ($closest) {
+            my $cdistance = $time - $closest->{match}->{time};
+            my $mdistance = $time - $match->{match}->{time};
+
+            if (($cdistance >= $mdistance) && ($mdistance >= 0)) {
+                $closest = $match;
+            }
+        } else {
+            $closest = $match;
+        }
+    }
+
+    $closest->{flag} = 1;
+
+    my @filtered;
+
+    for my $match (@sortedentries) {
+        push(@filtered, $match);
+
+        if ((scalar(@filtered) > $num_results) && ($filtered[0]->{match}->{time} != $match->{match}->{time})) {
+            shift(@filtered);
+        }
+
+        if ($match->{flag}) {
+            last;
+        }
+    }
+
+    @{$self->{matches}} = @filtered;
+}
+
+sub regex_filter {
+    my ($self, $rex) = @_;
+    @{$self->{matches}} = map {($_->{match}->{entry} && ($_->{match}->{entry} =~ /$rex/)) ? $_ : ()} @{$self->{matches}};
+}
+
+sub regex_not_filter {
+    my ($self, $rex) = @_;
+    @{$self->{matches}} = map {($_->{match}->{entry} && ($_->{match}->{entry} =~ /$rex/)) ? () : $_} @{$self->{matches}};
+}
+
+sub inclogcnt {
+    my $self = shift;
+    $self->{log_count}++;
+}
+
+sub extrafilter {
+    my ($self, $handler, %params) = @_;
+
+    if (exists ($extrafilters{$handler})) {
+        $extrafilters{$handler}->($self, %params);
+    }
+}
+
+sub ex_messages_filter {
+    my ($self, %params) = @_;
+
+    if (defined $params{file}) {
+        my $cfile = File::Spec->canonpath($params{file}->filename);
+        $cfile =~ /\/?([^\/]+)$/;
+
+        my $unamerex = '\/home\d?\/.*?'.$1.'\suploaded';
+        my $usizerex = '\s\('.$params{file}->size.'\sbytes,';
+        my $mnamerex = 'renamed or moved:\s\[[^\[]*\]->\[[^\]]*'.$1.'[^\]]*\]';
+
+        my @filtered_matches;
+
+        for my $match (@{$self->{matches}}) {
+            my $entry = $match->{match}->{entry};
+
+            if ((($entry =~ /$unamerex/) && ($entry =~ /$usizerex/)) || ($entry =~ /$mnamerex/)) {
+                push(@filtered_matches, $match);
+            }
+        }
+
+        @{$self->{matches}} = @filtered_matches;
+    }
+}
+
+sub ex_xfer_filter {
+    my ($self, %params) = @_;
+
+    if (defined $params{file}) {
+        my $cfile = File::Spec->canonpath($params{file}->filename);
+        $cfile =~ /\/?([^\/]+)$/;
+
+        $self->regex_filter('\/home\d?\/.*?'.$1.'\s[ab]');
+        $self->regex_filter('\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s'.$params{file}->size.'\s\/home\d?');
+    }
+}
+
+sub ex_404_filter {
+    my ($self, %params) = @_;
+    $self->regex_not_filter(' HTTP/\d+\.\d+" 404');
+}
+
+sub ex_fml_filter {
+    my ($self, %params) = @_;
+    my @filtered;
+
+    for my $match (@{$self->{matches}}) {
+        unless($match->{match}->{entry} =~ /(\[[^\[\]]*\]) info \[hgFML::Logger\] (\{.*\})$/) {
+            next;
+        }
+
+        my ($rawtime, $json) = ($1, $2);
+        my $decoded;
+
+        unless (eval {$decoded = JSON->new->decode($json)}) {
+            next;
+        }
+
+        unless ($decoded->{data}->{user} eq $params{user}) {
+            next;
+        }
+
+        my @entry = ($rawtime, $decoded->{data}->{user});
+
+
+        if ($decoded->{context}->{event} eq 'Api2::Fileman::fileop') {
+            push(@entry,
+                $decoded->{data}->{args}->{op},
+                map { "$_->{path} (oldctime: $_->{oldctime}, oldmtime: $_->{oldmtime}, oldsize: $_->{oldsize})" } @{$decoded->{data}->{args}->{affectedfiles}},
+            );
+        } elsif ($decoded->{context}->{event} eq 'Api2::Fileman::savefile') {
+            push(@entry,
+                "savefile",
+                File::Spec->catfile($decoded->{data}->{args}->{dir}, $decoded->{data}->{args}->{filename}),
+                "(filesize: $decoded->{data}->{args}->{filesizebytes})",
+            );
+        } elsif ($decoded->{context}->{event} eq 'Api2::Fileman::mkdir') {
+            push(@entry,
+                "mkdir",
+                File::Spec->catfile($decoded->{data}->{args}->{path}, $decoded->{data}->{args}->{name}),
+            );
+        } elsif ($decoded->{context}->{event} eq 'Api1::Fileman::fmmkdir') {
+            push(@entry,
+                "mkdir",
+                File::Spec->catfile($decoded->{data}->{args}->{dir}, $decoded->{data}->{args}->{file}),
+            );
+        } elsif ($decoded->{context}->{event} eq 'Api2::Fileman::viewfile') {
+            push(@entry,
+                "viewfile",
+                File::Spec->catfile($decoded->{data}->{args}->{dir}, $decoded->{data}->{args}->{file}),
+                "(filesize: $decoded->{data}->{args}->{filesizebytes})",
+            );
+        } else {
+            push(@entry,
+                "Operation: $decoded->{context}->{event}",
+            );
+        }
+
+        push(@filtered, {
+            flag => 0,
+            match => HF::LogMatch->new(
+                time => $match->{match}->{time},
+                log => $match->{match}->{log},
+                entry => join(' ', @entry),
+            ),
+        });
+    }
+
+    $self->{matches} = \@filtered;
+}
+
+sub TO_JSON {
+    my $self = shift;
+    return {%$self};
+}
+
+1;
+} # end class HF::LogMatchList
+
+
+BEGIN { # begin class HF::FileStat
+package HF::FileStat;
+use strict;
+use warnings;
+
+use Carp;
+
+use File::Spec;
+use File::stat;
+use DateTime;
+
+# member fields
+
+my @members = qw(filename atime ctime mtime mode user group size);
+
+# Generate accessors for read-only attributes.
+
+no strict; # We are making evil with Perl
+
+for my $i (@members) {
+    *{"$i"} = sub {
+        my $self = shift;
+        return $self->{$i};
+    };
+}
+
+use strict;
+
+# Constructor
+
+sub new {
+    my($class, %params) = @_;
+
+    for my $i (qw(filename)) {
+        defined($params{$i}) or croak "Attribute '$i' not passed to constructor.";
+    }
+
+    if (my $fs = ((-l $params{filename} && !$params{follow}) ? lstat($params{filename}) : stat($params{filename}))) {
+
+	my $self = {
+	    filename => File::Spec->rel2abs($params{filename}),
+	    atime => DateTime->from_epoch(epoch => $fs->atime),
+	    mtime => DateTime->from_epoch(epoch => $fs->mtime),
+	    ctime => DateTime->from_epoch(epoch => $fs->ctime),
+	    mode => $fs->mode,
+	    user => scalar(getpwuid($fs->uid)),
+	    group => scalar(getgrgid($fs->gid)),
+            size => $fs->size,
+	};
+
+	bless($self, $class);
+	return $self;
+    } else {
+	return undef;
+    }
+}
+
+sub fake {
+    my($class, %params) = @_;
+    my %self;
+
+    for my $i (qw(filename size)) {
+        defined($params{$i}) or croak "Attribute '$i' not passed to constructor.";
+    }
+
+    for my $i (@members) {
+        $self{$i} = $params{$i};
+    }
+
+    bless(\%self, $class);
+    return \%self;
+}
+
+# Public Methods
+
+sub to_text {
+    my $self = shift;
+
+    my $tz = DateTime::TimeZone->new(name =>'local');
+
+    my $mt = $self->mtime->clone;
+    $mt->set_time_zone($tz);
+
+    my $ct = $self->ctime->clone;
+    $ct->set_time_zone($tz);
+
+    my $text = "File: ".$self->filename."\n".
+               "User: ".$self->user.", Group: ".$self->group."\n".
+               "Size: ".$self->size."\n".
+               "Modify: ".$mt->strftime("%a, %d %b %Y %H:%M:%S %z")." (".$mt->epoch().")\n".
+               "Change: ".$ct->strftime("%a, %d %b %Y %H:%M:%S %z")." (".$ct->epoch().")\n";
+
+    return $text;
+}
+
+1;
+} # end class HF::FileStat
+
+
+BEGIN { # begin class HF::LogSearcher
+package HF::LogSearcher;
+use strict;
+use warnings;
+use Carp;
+
+use DateTime;
+use File::stat;
+
+# class members
+
+my @members = qw(file_pattern log_pattern time_format file_directories timezone);
+my @opt_members = qw(sorted chrono end_early parser gz_parser);
+
+# constructor
+
+sub new {
+    my($class, %params) = @_;
+    my $self = {};
+
+    for my $i (@members) {
+        $params{$i} or croak "Attribute '$i' not passed to constructor.";
+        $self->{$i} = $params{$i};
+    }
+
+    for my $i (@opt_members) {
+        $self->{$i} = defined($params{$i}) ? $params{$i} : undef;
+    }
+
+    bless($self, $class);
+    return $self;
+}
+
+# accessors
+
+no strict; # We are making evil with Perl
+
+for my $i (@members, @opt_members) {
+    *{"$i"} = sub {
+        my $self = shift;
+        return $self->{$i};
+    };
+}
+
+use strict;
+
+# accessor for file list (lazy build)
+
+sub files {
+    my $self = shift;
+
+    if (!defined($self->{files})) {
+        $self->{files} = $self->_build_files();
+    }
+
+    if (@_) {
+        $self->{files} = $_[0];
+    }
+
+    return $self->{files};
+}
+
+sub _build_files {
+    my $self = shift;
+    my $rex = $self->file_pattern;
+    my @files;
+
+    for my $directory (@{$self->file_directories}) {
+        if (opendir(my $dh, $directory)) {
+            while(my $file = readdir($dh)) {
+                if ($file =~ /$rex/) {
+                    push (@files, $directory.'/'.$file);
+                }
+            }
+
+            closedir($dh);
+        }
+    }
+
+    return \@files;
+}
+
+# private methods
+
+sub _sort_files_desc {
+    my $self = shift;
+
+    @{$self->files} = sort { stat($b)->mtime <=> stat($a)->mtime } @{$self->files}
+}
+
+sub _sort_files_asc {
+    my $self = shift;
+
+    @{$self->files} = sort { stat($a)->mtime <=> stat($b)->mtime } @{$self->files}
+}
+
+sub _sort {
+    my $self = shift;
+
+    if ($self->sorted) {
+        if ($self->sorted eq 'desc') {
+            $self->_sort_files_desc();
+        } elsif ($self->sorted eq 'asc') {
+            $self->_sort_files_asc();
+        }
+    }
+}
+
+sub _time_start {
+    my $self = shift;
+    my ($file) = @_;
+    my $timerex = HF::TimeUtil::regex_from_format($self->time_format);
+
+    if (my $time = MK::Utility::regex_file_match($file, "($timerex)")) {
+        return HF::TimeUtil::parse_time($time, $self->time_format, $self->timezone);
+    } else {
+        return undef;
+    }
+}
+
+# public methods
+
+sub search {
+    my $self = shift;
+    my ($time, $range) = @_;
+
+    my $dt = $time->clone();
+
+    $self->_sort();
+
+    # search for pattern in files
+
+    my $matches = HF::LogMatchList->new();
+
+    for my $file (@{$self->files}) {
+        if (my $logt = $self->_time_start($file)) {
+            $logt->set_time_zone('UTC');
+
+            if ($dt < $logt) {
+                next; # start time predates current log, try the next older
+            } else {
+                $matches->inclogcnt();
+
+                if ($file =~ /^.*?\.gz$/) {
+                    my $parser = HF::Parsers::get_parser($self->gz_parser ? $self->gz_parser : 'default');
+                    $parser->($self, $time, $range, $matches, $file);
+                } else {
+                    my $parser = HF::Parsers::get_parser($self->parser ? $self->parser : 'default');
+                    $parser->($self, $time, $range, $matches, $file);
+                }
+
+                if ($self->{chrono}) {
+                    last;
+                }
+            }
+        }
+    }
+
+    return $matches;
+}
+
+1;
+} # end class HF::LogSearcher
+
+BEGIN { # begin package HF::TimeUtil
+package HF::TimeUtil;
+use strict;
+use warnings;
+use Carp;
+
+use DateTime;
+use Date::Parse;
+
+MK::Utility::use_from_cpan("DateTime::Format::Strptime");
+
+
+# strftime/strptime format to regex map
+
+my %format_to_regex = (
+    a => '[A-Z][a-z]{2}', # Abbreviated weekday name
+    b => '[A-Z][a-z]{2}', # Abbreviated month name
+    d => '[0-3][0-9]', # The day of the month as a decimal number (range 01 to 31).
+    e => '[ 1-3][0-9]', # Like %d, the day of the month as a decimal number, but a leading zero is replaced by a space.
+    H => '[0-2][0-9]', # The hour as a decimal number using a 24-hour clock (range 00 to 23).
+    m => '[0-1][0-9]', # The month as a decimal number (range 01 to 12).
+    M => '[0-5][0-9]', # The minute as a decimal number (range 00 to 59).
+    S => '[0-6][0-9]', # The second as a decimal number (range 00 to 61).
+    Y => '[0-9]{4}', # The year as a decimal number including the century.
+    z => '[+\-][0-9]{4}', # The time-zone as hour offset from UTC.
+    '%' => '%', # Escape character
+);
+
+sub regex_from_format {
+    my ($format) = @_;
+    $format =~ s/%(.)/$format_to_regex{$1}/eg;
+    return $format;
+}
+
+sub fuzzy_time {
+    my ($time, $time_format, $range) = @_;
+    my @times;
+
+    my $startt = $time->clone->subtract( seconds => ($range / 2));
+    my $endt = $time->clone->add( seconds => ($range / 2) );
+
+    while ($startt < $endt) {
+        push (@times, '('.quotemeta($startt->strftime($time_format)).')');
+        $startt->add( seconds => 1 );
+    }
+
+    return '(?:'.join('|', @times).')';
+}
+
+sub parse_time {
+    my ($time, $format, $tz) = @_;
+
+    my $dtp = new DateTime::Format::Strptime(pattern => $format);
+    my $dt = $dtp->parse_datetime($time);
+
+    # fall back to Date::Parse if DateTime::Format::Strptime fails
+
+    if (!$dt) {
+        $dt = DateTime->from_epoch(epoch => str2time($time));
+    }
+
+    if ($tz) {
+        unless (eval { $dt->set_time_zone($tz); }) {
+            print STDERR "Failed to set timezone!\n";
+            print STDERR "The time '$time' is likely impossible in the TZ '".$tz->name."'.\n";
+            print STDERR "This error may be caused by Daylight Savings issues.\n";
+            print STDERR "It may be necessary to investigate this log manually.\n\n";
+        }
+    }
+
+    return $dt;
+}
+
+1;
+}
+
+
+BEGIN { # begin package HF::Parsers
+package HF::Parsers;
+use strict;
+use warnings;
+use Carp;
+
+use DateTime;
+
+my %parsers = (
+    default => \&default_parser,
+    binary_partition => \&binary_partition,
+);
+
+sub get_parser {
+    my ($parser) = @_;
+    return $parsers{$parser};
+}
+
+sub default_parser {
+    my ($searcher, $time, $range, $matchlist, $file) = @_;
+
+    my $dt = $time->clone;
+    $dt->set_time_zone($searcher->timezone);
+
+    my $timerex = HF::TimeUtil::regex_from_format($searcher->time_format);
+    my $fuzzy_time = HF::TimeUtil::fuzzy_time($dt, $searcher->time_format, $range);
+
+    my $searchpattern = $searcher->log_pattern;
+    $searchpattern =~ s/##time##/$fuzzy_time/;
+
+    my @entries = MK::Utility::regex_file_match($file, $searchpattern, $searcher->end_early);
+
+    for my $entry (@entries) {
+        if ($entry =~ /($timerex)/) {
+            my $dt = HF::TimeUtil::parse_time($1, $searcher->time_format, $searcher->timezone);
+            chomp($entry);
+
+            my $match = HF::LogMatch->new(
+                time => $dt->epoch(),
+                log => $file,
+                entry => $entry,
+            );
+
+            $matchlist->add($match);
+        }
+    }
+}
+
+sub binary_partition {
+    my ($searcher, $time, $range, $matchlist, $file) = @_;
+
+    my $dts = $time->clone;
+    $dts->set_time_zone($searcher->timezone);
+
+    my $dtb = $dts->clone->subtract(seconds => ($range / 2));
+    my $dte = $dts->clone->add(seconds => ($range / 2));
+
+    my $timerex = HF::TimeUtil::regex_from_format($searcher->time_format);
+    my $searchpattern = $searcher->log_pattern;
+    $searchpattern =~ s/##time##/$timerex/;
+
+    my $spos = find_date_in_file($file, $searcher->time_format, $dtb, $searcher->timezone, 0);
+    my $epos = find_date_in_file($file, $searcher->time_format, $dte, $searcher->timezone, 1);
+
+    my @entries = find_entries_in_range($file, $spos, $epos);
+
+    @entries = map {/$searchpattern/ ? $_ : ()} @entries;
+
+    for my $entry (@entries) {
+        if ($entry =~ /($timerex)/) {
+            my $dt = HF::TimeUtil::parse_time($1, $searcher->time_format, $searcher->timezone);
+
+            if (($dt >= $dtb) && ($dt <= $dte)) {
+                chomp($entry);
+
+                my $match = HF::LogMatch->new(
+                    time => $dt->epoch(),
+                    log => $file,
+                    entry => $entry,
+                );
+
+                $matchlist->add($match);
+            }
+        }
+    }
+}
+
+sub find_date_in_file {
+    my ($file, $format, $date, $tz, $anchor) = @_;
+
+    my $rex = HF::TimeUtil::regex_from_format($format);
+
+    my $fh = FileHandle->new("< $file") or croak;
+
+    $fh->seek(0, 2); # seek to EOF
+    my $end = $fh->tell();
+    my $start = 0;
+    my $pos = int(($end - $start) / 2) + $start; # start search at middle of file
+    my ($ostart, $oend);
+
+    while (!((defined($ostart) && ($ostart == $start)) && (defined($oend) && ($oend == $end)))) {
+        ($ostart, $oend) = ($start, $end);
+
+        $fh->seek($pos, 0);
+        $fh->getline(); # jump to the next complete line
+        $pos = $fh->tell();
+
+        if (my $line = $fh->getline()) {
+            if ($line =~ /($rex)/) {
+                my $dt = HF::TimeUtil::parse_time($1, $format, $tz);
+
+                if ($dt < $date) {
+                    $start = $pos;
+                    $pos = int(($end - $start) / 2) + $start;
+                } else {
+                    $end = $pos;
+                    $pos = int(($end - $start) / 2) + $start;
+                }
+            }
+        } else {
+            last;
+        }
+    }
+
+    if ($anchor) {
+        $fh->getline();
+        $start = $fh->tell();
+    }
+
+    $fh->close();
+
+    return $start;
+}
+
+sub find_entries_in_range {
+    my ($file, $spos, $epos) = @_;
+    my @entries;
+
+    my $fh = FileHandle->new("< $file") or croak;
+
+    $fh->seek($spos, 0);
+
+    while (($fh->tell() <= $epos) && (my $line = $fh->getline())) {
+        push(@entries, $line);
+    }
+
+    $fh->close();
+
+    return @entries;
+}
+
+
+1;
+}

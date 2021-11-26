@@ -1,0 +1,657 @@
+#!/usr/bin/perl
+
+###########
+## wlmodsec.pl
+## The script is meant to parse the apache error log, the whitelist.conf mod_sec file, and present rules that
+## have not been whitelisetd yet.  This allows for multiple rules to be whitelisted at once.
+## https://gatorwiki.hostgator.com/DraftArticles/WLModSec
+## http://git.toolbox.hostgator.com/wlmodsec/wlmodsec
+## Please submit all bug reports at projects.hostgator.com
+##
+## (C) 2011 - HostGator.com, LLC
+############
+
+#Regex variable to prevent certain rules from being added
+#my $rules_to_not_whitelist = qr/\A(99999(7|9)|1235235)/xms;
+
+use strict;
+use warnings;
+
+use Carp qw{carp cluck confess croak};
+use English qw{-no_match_vars};
+use Term::ANSIColor;
+
+use Getopt::Long;
+
+use List::MoreUtils qw{none};
+
+use File::Copy; #This is used to backing up whitelist.conf before rewriting with new format
+#    print color("red"), "Stop!\n", color("reset");
+#    print color("green"), "Go!\n", color("reset");
+#Or like this:
+#
+#    use Term::ANSIColor qw(:constants);
+#    print RED, "Stop!\n", RESET;
+#    print GREEN, "Go!\n", RESET;
+
+use version;
+our $VERSION = qv('1.8.7');
+
+#The two files that this script requires
+my $mod_sec_conf = '/opt/mod_security/whitelist.conf';
+$mod_sec_conf = '/usr/local/apache/conf/mod_sec/whitelist.conf' if(-f "/usr/local/apache/conf/mod_sec/whitelist.conf");
+my $apache_error_log = '/usr/local/apache/logs/error_log';
+my $domain_check = '/etc/userdomains';
+my $blacklisted='/opt/mod_security/blacklist.conf';
+my @blacklisted;
+
+#Needed for Mod-Security 2.7.x
+my $RULE_ID='99000';
+
+#Check to see if /opt/mod_security/whitelist.conf changed at all (initial value)
+my $conf_size = (-s $mod_sec_conf);
+
+#used to make sure space is correct during the printing of mod_sec rules (hey...it's gotta look pretty
+#These are ONLY used in the print subroutines
+my $pretty_print='7';
+my $pretty_border="\t+----------+\n";
+my $left_side="\t|  ";
+my $right_space=" ";
+my $right_side="|\n";
+
+#just making a delcaration for the domain variable
+my $domain;
+my $user;
+
+
+#GetOptions Values -
+#initializing variables to have no value
+my $restart='';
+my $force='';
+
+my $new_cli = GetOptions (
+  'restart-apache|apache-restart=s' => \$restart,
+  'force=s'=> \$force,
+  'h|help' => sub { display_help(); exit; },
+  'update' => sub { force_update_whitelist_conf() }
+);
+
+if (-r $blacklisted) {
+  open(my $BLACKLISTED, "<", $blacklisted) or croak "Cannot open file $blacklisted. $OS_ERROR\n";
+  my @blacklisted = <$BLACKLISTED>;
+  close ($BLACKLISTED) or confess($OS_ERROR);
+  @blacklisted = map { chomp } <$BLACKLISTED>;
+} else {
+  print "\n\n$blacklisted file not found.  Defaulting to basic array\n\n";
+  @blacklisted=("999997","999999","1235235","9000043","900079","900083","900084","900095","900096","900102","900108","900113","900115","900117","900119","900121","900122","900123","900124","900126","900135","900137","900139","900998","999022","999023");
+}
+
+my $total_number='';
+my $m;
+my @manual;
+
+#Arrays that are being used
+my @whitelisted;
+my @whitelist;
+my @rules_to_whitelist;
+
+get_action_id();
+
+if (@ARGV) {
+
+    unless ($new_cli) {
+        if ($ARGV[2] || $ARGV[1]) {
+            if ($ARGV[2] =~ /(y|n)/m) {
+                $restart=$ARGV[2];
+            }
+            if ($ARGV[1] =~ /(y|n)/m) {
+                $restart=$ARGV[1];
+            }
+        }
+    }
+
+    if ($ARGV[0] =~ /whatis/) {
+        rule_lookup();
+        exit;
+    } elsif (-e "/var/cpanel/users/".$ARGV[0] && $ARGV[0] =~ /[a-z0-9]+/imxs) {
+        $user=$ARGV[0];
+        temp_url_whitelist();
+        exit;
+    } elsif ($ARGV[0] =~ m/^(http(s)?:\/\/)?(www\.)?([a-z0-9\-]+\.[a-z0-9\-]+(\.[a-z]+)*)/ixms) {
+        #Validate domain name
+        $domain = $4;
+        if (length($4) > 3) {
+            check_domain();
+
+           if ($ARGV[1] && $ARGV[1] =~ m/\d+/xms) {
+                whitelist_single_rule();
+                exit;
+            }
+
+            @whitelisted = get_whitelisted();
+            print_whitelisted();
+            @whitelist = get_rule_ID();
+            @rules_to_whitelist = compare_rule_and_whitelisted();
+            print_rules_to_whitelist();
+            exit;
+
+        } else {
+            print "Please enter a valid domain name\n\n";
+            exit;
+        }
+    }
+} else {
+	display_help();
+	exit;
+}
+
+sub display_help {
+    print "No domain provided\nWlModSec Tool - version $VERSION - John L.\n\n";
+    print "Available commands:\n";
+    print "wlmodsec [domain] [--restart-apache=y/n]\n";
+    print "wlmodsec [domain] [mod_sec rule] [--restart-apache=y/n]\n";
+    print "wlmodsec [user] [--apache-restart=y/n]\n";
+    print "And for those of you that are used to the old method, you can still use wlmodsec [domain] [mod_sec rule] [y/n]\n";
+}
+
+
+
+my $rule;
+
+sub whitelist_single_rule {
+#if (@ARGV && $ARGV[1]) {
+    my $rule=$ARGV[1];
+    my $already_whitelisted='false';
+
+    if ($rule =~ /^([0-9]{4,7})$/) {
+        open(my $WHITELIST_FILE, "<", $mod_sec_conf) or croak "Cannot open file $mod_sec_conf. $OS_ERROR\n";
+        my @sanity_check = <$WHITELIST_FILE>;
+        close($WHITELIST_FILE) or confess($OS_ERROR);
+        foreach my $content(@sanity_check) {
+            if ($content =~ /"$domain"/i) {
+                if ($content =~ m/id\=$rule$/i ) {
+                    print "It appears that rule $rule is already whitelisted for $domain\n";
+                    $already_whitelisted='true';
+                    last;
+                }
+            }
+      }
+        if ($already_whitelisted =~ /false/) {
+            whitelist_rules($rule);
+            apache_restart();
+        }
+    } else {
+        print "It looks like you attempted to whitelist an invalid mod_security rule.\nIf $rule is a valid mod_security rule, please let us know by filing a bug report\n\n";
+        exit;
+    }
+    exit;
+}
+
+
+sub check_domain {
+    open(my $DOMAIN_CHECK, "<", $domain_check) or croak "Cannot open file $domain_check. $OS_ERROR\n";
+    if (scalar(grep /^$domain:/ixms, <$DOMAIN_CHECK>) < 1) {
+      print "Domain does not appear to exist on the server.\nPlease make sure that $domain is the correct domain name.\n\n\n" or confess($OS_ERROR);
+      exit;
+    } else {
+      print "\nUsing $domain:\n";
+    }
+
+    close($DOMAIN_CHECK) or confess($OS_ERROR);
+    return;
+}
+
+sub get_action_id { #This is to allow for Mod_Security 2.7
+
+    open(my $WHITELIST_FILE, "<", $mod_sec_conf)
+        or die "Cannot open file $mod_sec_conf. $OS_ERROR\n";
+    my @WHITELIST_FILE = <$WHITELIST_FILE>;
+    close ($WHITELIST_FILE) or confess($OS_ERROR);
+
+    my @temp_action;
+
+    my $count=0;
+    my $line_count=scalar(@WHITELIST_FILE);
+    my $temp_rule=$RULE_ID;
+
+    foreach my $row(@WHITELIST_FILE) {
+        if ($row =~ m/,id:(99[\d]{3})$/ixms) {
+            my $temp=$1;
+
+            if ($temp < 100000 && $temp > 99000) {
+
+                $count++;
+                if ($temp_rule < $1 ) {$temp_rule=$1;}
+            }
+        }
+    }
+
+
+    if ($line_count != $count && $line_count > $count) {
+        print "\n\nOld rule structure detected...please wait a moment while ";
+        update_whitelist_conf();
+    }
+    if ($line_count==$count) {$RULE_ID=$temp_rule;}
+}
+
+sub force_update_whitelist_conf {
+    print "\n\nAs requested, ";
+    update_whitelist_conf();
+    exit;
+}
+
+sub update_whitelist_conf {
+
+    print "updating /opt/mod_security/whitelist.conf...";
+
+    open(my $WHITELIST_FILE, "<", $mod_sec_conf) or die "Cannot open file $mod_sec_conf. $OS_ERROR\n";
+    my @WHITELIST_FILE = <$WHITELIST_FILE>;
+    close ($WHITELIST_FILE) or confess($OS_ERROR);
+
+    my @temp_action;
+
+    copy("$mod_sec_conf","$mod_sec_conf.tempBackup-".time) or croak "Copy failed: $OS_ERROR";
+    truncate($mod_sec_conf,0);
+    foreach my $line(@WHITELIST_FILE) {
+        chomp($line);
+        $line =~ s/,id:[\d]+$//;
+        push @temp_action,$line
+    }
+
+    foreach my $row (@temp_action) {
+        open ($WHITELIST_FILE, ">>",$mod_sec_conf);
+        if ( $row =~ m/^SecRule.*/ixms ) {$row .= ',id:'.++$RULE_ID;}
+        print $WHITELIST_FILE $row."\n";
+        close($WHITELIST_FILE) or confess($OS_ERROR);
+    }
+    print "done!\n\n"
+}
+
+sub get_whitelisted {
+  open(my $WHITELIST_FILE, "<", $mod_sec_conf) or die "Cannot open file $mod_sec_conf. $OS_ERROR\n";
+  my @temp_whitelisted;
+
+  #load the data from the whitelist file
+  my @already_whitelisted = <$WHITELIST_FILE>;
+
+  #closing the file to prevent it from staying open
+  close ($WHITELIST_FILE) or confess($OS_ERROR);
+
+  #get highest variable for Rule ID
+
+  #every time the domain appears, get the mod_sec rule that has been whitelisted.
+  foreach my $already_whitelisted(@already_whitelisted) {
+    if ($already_whitelisted =~ /"$domain"/ixms) {
+      my $ruleid;
+      if ($already_whitelisted =~ m/id\=([\d]+)/ixms) {
+        $ruleid = $1;
+        push @temp_whitelisted,$ruleid
+      }
+    }
+  }
+  @whitelisted = uniq(@temp_whitelisted);
+  return @whitelisted;
+}
+
+
+sub print_whitelisted {
+
+    my $i = 0;
+
+    if (scalar(@whitelisted) > 0) {
+        print "\nRules that are currently whitelisted for $domain\n" or confess ($OS_ERROR);
+
+        foreach my $whitelisted(@whitelisted) {
+            if ($i == 0) {
+                print "$pretty_border" or confess ($OS_ERROR);
+                $i=1;
+            }
+            my $blank_space = ($pretty_print - length $whitelisted);
+            print $left_side or confess ($OS_ERROR);
+            print color("blue"),$whitelisted,color("reset") or confess ($OS_ERROR);
+            for my $s (0..$blank_space) {
+                print $right_space or confess ($OS_ERROR);
+                $s++;
+            }
+            print $right_side or confess ($OS_ERROR);
+
+        }
+        if ( $i==1 ) {
+            print $pretty_border or confess ($OS_ERROR);
+        }
+    }
+    return; #Explicitly returning nothing
+}
+
+sub get_rule_ID {
+  my @temp_whitelist;
+
+  open(my $ERROR_LOG, "<", $apache_error_log) or die "Cannot open Apache error log ($apache_error_log). $OS_ERROR\n";
+  my $whitelist_domain = '';
+  my $error_size = (-s $apache_error_log);
+  print "\n\nGetting Rules to whitelist...this may take a few seconds...\n\n";
+
+  #Get the list of rule ID's that have not been whitelisted.
+  my $progress=-1;
+  my $istty = (-t STDOUT);
+
+  while (my $to_whitelist = <$ERROR_LOG>) {
+    #prevent a billion slow i/o calls
+    if (int((tell($ERROR_LOG)/$error_size) * 100 ) > $progress) {
+      $progress = int((tell($ERROR_LOG)/$error_size) * 100 );
+      print $istty;
+      if ($istty) {
+        printf "\r               \rProgress: %2d%%", $progress;#replace prev line with new progress
+      } else {
+        if (($progress == 0) || ($progress % 10 == 0)) {
+          print "$progress%";
+        } else {
+          print ".";
+        }
+      }
+    }
+
+    if ($to_whitelist =~ /"$domain"/xms && $to_whitelist =~ "ModSecurity" && $to_whitelist =~ "Access denied with code 403" ) {
+      my $rule;
+      if ($to_whitelist =~ m/id \"([\d]+)\"/s) {
+        $rule = $1;
+        push @temp_whitelist,$rule
+      }
+    }
+  }
+  @whitelist = uniq(@temp_whitelist);
+  close($ERROR_LOG) or confess($OS_ERROR);
+
+  return @whitelist;
+}
+
+sub compare_rule_and_whitelisted {
+    foreach my $rule(@whitelist) {
+        if ( none { $_ eq $rule } @whitelisted ) {
+            push @rules_to_whitelist, $rule;
+        }
+    }
+
+    return @rules_to_whitelist;
+}
+
+sub print_rules_to_whitelist {
+
+    my $i = 0;
+
+    my $number = scalar(@rules_to_whitelist);
+    if ($number > 0) {
+        print "\nThere " or confess ($OS_ERROR);
+        if ($number == 1) {
+            print "is $number rule" or confess($OS_ERROR);
+        } else {
+            print "are $number rules" or confess($OS_ERROR);
+        }
+
+        print " available to whitelist:\n"  or confess ($OS_ERROR);
+
+        foreach my $rule(@rules_to_whitelist) {
+
+            if ($i == 0) {
+                print "$pretty_border";
+                $i=1;
+            }
+
+            my $blank_space = ($pretty_print - length($rule));
+            print $left_side or confess($OS_ERROR);
+
+            if ( none { $_ eq $rule } @blacklisted )
+            {
+                print color("green"),$rule, color("reset") or confess($OS_ERROR);
+            } else {
+                print color("red"),$rule, color("reset") or confess($OS_ERROR);
+            }
+
+            for my $s (0..$blank_space) {
+                print $right_space or confess($OS_ERROR);
+                $s++;
+            }
+
+            print $right_side or confess($OS_ERROR);
+
+        }
+
+        if ($i == 1) {
+            print "$pretty_border" or confess($OS_ERROR);
+        }
+
+        prompt_to_whitelist();
+
+    } else {
+        print "\nNo mod_security rules detected that are not already whitelisted.\n\nWould you like to manually whitelist some rules? (y/n)  " or confess($OS_ERROR);
+        prompt_to_manually_whitelist();
+    }
+    return; #Nothing to return, so returning nothing
+}
+
+
+sub prompt_to_whitelist {
+    print "\n\nRules listed in red WILL NOT be whitelisted.\nDo you want to whitelist the rules listd in green? (y/n)  " or confess($OS_ERROR);
+
+    #Setting the variable answer to be empty
+    my $answer = '';
+
+    chomp($answer = <STDIN>);
+
+    if ($answer =~ /y(es)?/ixms) {
+
+        print "\n\nWhitelisting rules:\n" or confess($OS_ERROR);
+        if ($user) {
+            foreach $rule(@rules_to_whitelist) {
+            whitelist_temp_url_rules($rule);
+            }
+        } else {
+            foreach my $rule(@rules_to_whitelist) {
+            whitelist_rules($rule);
+            }
+        }
+
+        apache_restart();
+        exit;
+    } elsif ($answer =~ /n(o)?/ixms) {
+        exit;
+    } else {
+        undef $answer;
+        prompt_to_whitelist();
+    }
+    return;
+}
+
+sub whitelist_rules {
+
+$rule=$_[0];
+
+    if ( none { $_ eq $rule } @blacklisted ) {
+         open (my $WHITELIST_FILE, ">>",$mod_sec_conf)
+            or croak "Cannot open file to whitelist rules. $OS_ERROR";
+#        $RULE_ID=$RULE_ID+1;
+        print $WHITELIST_FILE "SecRule SERVER_NAME \"$domain\" phase:1,nolog,pass,ctl:ruleRemoveByID=$rule,id:".++$RULE_ID."\n";
+        close($WHITELIST_FILE) or confess($OS_ERROR);
+        print "Whitelisted rule ".color("green")."$rule".color("reset")." for $domain\n" or confess($OS_ERROR);
+        return;
+    } else {
+        print "Rule ".color("red")."$rule".color("reset")." will not be whitelisted as it is on the list of rules that can be very detrimental to an account if whitelisted!\n";
+        if ($ARGV[1]) {
+            exit;
+        }
+
+    }
+}
+
+sub whitelist_temp_url_rules {
+
+$rule=$_[0];
+
+    if ( none { $_ eq $rule } @blacklisted ) {
+        open (my $WHITELIST_FILE, ">>",$mod_sec_conf)
+            or croak "Cannot open file to whitelist rules. $OS_ERROR";
+#        $RULE_ID=$RULE_ID+1;
+        print $WHITELIST_FILE "SecRule REQUEST_URI \"\/~$domain/\*\" phase:1,nolog,pass,ctl:ruleRemoveByID=$rule,id:".++$RULE_ID."\n";
+        close($WHITELIST_FILE) or confess($OS_ERROR);
+        print "Whitelisted rule ".color("green")."$rule".color("reset")." for $domain\n" or confess($OS_ERROR);
+        return;
+    } else {
+        print "Rule ".color("red")."$rule".color("reset")." will not be whitelisted as it is on the list of rules that can be very detrimental to an account if whitelisted!\n";
+        if ($ARGV[1]) {
+            exit;
+        }
+    }
+}
+
+sub prompt_to_manually_whitelist {
+
+    my $answer;
+    chomp($answer = <STDIN>);
+
+    if ($answer =~ /y(es)?/ixms) {
+        while ($total_number !~ /[0-9]+/xs) {
+            print "\n\nHow many mod_sec rules would you like to whitelist? " or confess($OS_ERROR);
+            chomp($total_number=<STDIN>);
+        }
+
+        #m is for manual
+        $m=1;
+        manual_entry_sanity_check();
+
+    } elsif ($answer =~ /n(o)?/ixms) {
+        exit;
+    } else {
+        undef $answer;
+        prompt_to_manually_whitelist();
+    }
+    return;
+}
+
+
+sub manual_entry_sanity_check {
+
+    my @temp_manual;
+
+    while ($m <= $total_number) {
+        print "Mod_sec rule $m to whitelist:" or confess($OS_ERROR);
+        chomp (my $manual = <STDIN>);
+        if ($manual =~ /[a-z]+/ixms) {
+            print "\n\nThe mod_sec rule you entered contained characters that were not numbers. Lets try this again...\n\n" or confess($OS_ERROR);
+            manual_entry_sanity_check();
+        } else {
+            push @temp_manual, $manual;
+            ++$m;
+        }
+    }
+
+    @manual=uniq(@temp_manual);
+
+    manually_whitelist();
+    return;
+}
+
+sub manually_whitelist {
+
+    my $WHITELIST_FILE;
+
+    my $i=0; #because i should always be rational
+
+    print "\n\nYou have entered ".scalar(@manual)." rule";
+        if (scalar(@manual) > 1) {
+            print 's';
+        }
+
+    print " to whitelist manually.\nAre these the correct mod_sec rules you want to whitelist:";
+
+    foreach my $rule (uniq(@manual)) {
+        if ($i == 0) {
+            print "\n$pretty_border" or confess($OS_ERROR);
+            $i=1;
+        }
+            my $blank_space = ($pretty_print - length($rule));
+            print "$left_side"."$rule" or confess($OS_ERROR);
+            for my $s (0..$blank_space) {
+                print $right_space or confess($OS_ERROR);
+                $s++;
+            }
+            print $right_side or confess($OS_ERROR);
+        }
+
+        if ($i == 1) {
+            print $pretty_border or confess($OS_ERROR);
+        }
+
+    print "\n\n\nAre you sure you want to whitelist these rules? (y/n)  " or confess($OS_ERROR);
+
+    my $answer = "";
+    chomp($answer = <STDIN>);
+
+    if ($answer =~ /y(es)?/ixms) {
+        foreach my $rule(uniq(@manual)) {whitelist_rules($rule);}
+         apache_restart();
+         exit;
+    } elsif ($answer =~ m/n(o)?/xmsi) {
+        exit;
+    } else {
+        undef $answer;
+        manually_whitelist();
+    }
+    return;
+}
+
+sub apache_restart {
+  if ($restart =~ m/n(o)?/imxs) {
+    print "\n\n\nAs requested, I am not restarting Apache.\n\n" or confess($OS_ERROR);
+  } else {
+    if ($conf_size != (-s $mod_sec_conf || $restart =~ m/y(es)?/imxs)) {
+      #If the size of the configuration file has changed..restart apache
+      print "\n\n\nRestarting Apache...\n\n" or confess($OS_ERROR);
+
+      # Get CentOS version
+      my ($centver) = do { local ( @ARGV, $/ ) = '/etc/redhat-release'; <> } =~ /(?:(\d+).(?:\d+))/;
+
+      # Check if our httpd.conf is okay
+      if ( qx(/usr/sbin/httpd -t 2>&1) =~ /Syntax OK/ ) {
+        if ( $centver <= '6' ) {
+          system('/etc/init.d/httpd graceful') and croak "Apache could not be restarted...\n$OS_ERROR";
+        } else {
+          system('/usr/sbin/apachectl -k graceful') and croak "Apache could not be restarted...\n$OS_ERROR";
+        }
+        print "Done\n\nApache restarted succesfully.\n\n\n" or confess($OS_ERROR);
+        exit;
+      } else {
+        print "\n\n\nhttpd config syntax not okay. Not restarting." or confess($OS_ERROR);
+        exit;
+      }
+    } else {
+      print "\n\n\nIt appears that no items were whitelisted." or confess($OS_ERROR);
+    }
+  }
+}
+
+sub rule_lookup {
+  print "We are still developing this.  Please try again later\n";
+}
+
+sub temp_url_whitelist {
+
+    $domain=$user;
+
+    @whitelisted = get_whitelisted();
+
+    print_whitelisted();
+
+    @whitelist = get_rule_ID();
+
+    @rules_to_whitelist = compare_rule_and_whitelisted();
+
+    print_rules_to_whitelist();
+
+}
+
+sub uniq {
+    my %seen;
+    return grep {!$seen{$_}++} @_;
+}
+
+exit;

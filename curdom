@@ -1,0 +1,698 @@
+#!/usr/bin/env python
+
+###########
+# curdom
+# """ Process Apache domain access log(s) for the given user, log file, stdin reads."""
+# url to wiki
+# https://stash.endurance.com/projects/HGADMIN/repos/curdom/
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+
+
+import os
+import sys
+import logging
+import re
+import time
+import datetime
+from collections import defaultdict
+from socket import gethostbyaddr
+from optparse import OptionParser
+from operator import itemgetter
+from heapq import nlargest
+from itertools import repeat, ifilter
+os.nice(20)
+
+logging.basicConfig(
+    format='%(levelname)s :: %(message)s',
+    level=logging.WARN
+    )
+
+try:
+    import regex as re
+except ImportError:
+    import re
+
+try:
+    set
+except NameError:
+    from sets import Set as set
+
+def bytes2human(n):
+    """
+    >>> bytes2human(10000)
+    '9K'
+    >>> bytes2human(100001221)
+    '95M'
+    """
+
+    symbols = ('K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
+
+    prefix = {}
+
+    for i, s in enumerate(symbols):
+        prefix[s] = 1 << (i+1)*10
+
+    for s in reversed(symbols):
+        if n >= prefix[s]:
+            value = int(float(n) / prefix[s])
+            return '%s%s' % (value, s)
+
+    return "%sB" % n
+
+class Counter(dict):
+    '''Dict subclass for counting hashable objects.  Sometimes called a bag
+    or multiset.  Elements are stored as dictionary keys and their counts
+    are stored as dictionary values.
+
+    >>> Counter('zyzygy')
+    Counter({'y': 3, 'z': 2, 'g': 1})
+
+    '''
+
+    def __init__(self, iterable=None, **kwds):
+        '''Create a new, empty Counter object.  And if given, count elements
+        from an input iterable.  Or, initialize the count from another mapping
+        of elements to their counts.
+
+        >>> c = Counter()                           # a new, empty counter
+        >>> c = Counter('gallahad')                 # a new counter from an iterable
+        >>> c = Counter({'a': 4, 'b': 2})           # a new counter from a mapping
+        >>> c = Counter(a=4, b=2)                   # a new counter from keyword args
+
+        '''
+        self.update(iterable, **kwds)
+
+    def __missing__(self, key):
+        return 0
+
+    def most_common(self, n=None):
+        '''List the n most common elements and their counts from the most
+        common to the least.  If n is None, then list all element counts.
+
+        >>> Counter('abracadabra').most_common(3)
+        [('a', 5), ('r', 2), ('b', 2)]
+
+        '''
+        if n is None:
+            return sorted(self.iteritems(), key=itemgetter(1), reverse=True)
+        return nlargest(n, self.iteritems(), key=itemgetter(1))
+
+    def elements(self):
+        '''Iterator over elements repeating each as many times as its count.
+
+        >>> c = Counter('ABCABC')
+        >>> sorted(c.elements())
+        ['A', 'A', 'B', 'B', 'C', 'C']
+
+        If an element's count has been set to zero or is a negative number,
+        elements() will ignore it.
+
+        '''
+        for elem, count in self.iteritems():
+            for _ in repeat(None, count):
+                yield elem
+
+    # Override dict methods where the meaning changes for Counter objects.
+
+    @classmethod
+    def fromkeys(cls, iterable, v=None):
+        raise NotImplementedError(
+            'Counter.fromkeys() is undefined.  Use Counter(iterable) instead.')
+
+    def update(self, iterable=None, **kwds):
+        '''Like dict.update() but add counts instead of replacing them.
+
+        Source can be an iterable, a dictionary, or another Counter instance.
+
+        >>> c = Counter('which')
+        >>> c.update('witch')           # add elements from another iterable
+        >>> d = Counter('watch')
+        >>> c.update(d)                 # add elements from another counter
+        >>> c['h']                      # four 'h' in which, witch, and watch
+        4
+
+        '''
+        if iterable is not None:
+            if hasattr(iterable, 'iteritems'):
+                if self:
+                    self_get = self.get
+                    for elem, count in iterable.iteritems():
+                        self[elem] = self_get(elem, 0) + count
+                else:
+                    dict.update(self, iterable) # fast path when counter is empty
+            else:
+                self_get = self.get
+                for elem in iterable:
+                    self[elem] = self_get(elem, 0) + 1
+        if kwds:
+            self.update(kwds)
+
+    def copy(self):
+        'Like dict.copy() but returns a Counter instance instead of a dict.'
+        return Counter(self)
+
+    def __delitem__(self, elem):
+        'Like dict.__delitem__() but does not raise KeyError for missing values.'
+        if elem in self:
+            dict.__delitem__(self, elem)
+
+    def __repr__(self):
+        if not self:
+            return '%s()' % self.__class__.__name__
+        items = ', '.join(map('%r: %r'.__mod__, self.most_common()))
+        return '%s({%s})' % (self.__class__.__name__, items)
+
+    # Multiset-style mathematical operations discussed in:
+    #       Knuth TAOCP Volume II section 4.6.3 exercise 19
+    #       and at http://en.wikipedia.org/wiki/Multiset
+    #
+    # Outputs guaranteed to only include positive counts.
+    #
+    # To strip negative and zero counts, add-in an empty counter:
+    #       c += Counter()
+
+    def __add__(self, other):
+        '''Add counts from two counters.
+
+        >>> Counter('abbb') + Counter('bcc')
+        Counter({'b': 4, 'c': 2, 'a': 1})
+
+
+        '''
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for elem in set(self) | set(other):
+            newcount = self[elem] + other[elem]
+            if newcount > 0:
+                result[elem] = newcount
+        return result
+
+    def __sub__(self, other):
+        ''' Subtract count, but keep only results with positive counts.
+
+        >>> Counter('abbbc') - Counter('bccd')
+        Counter({'b': 2, 'a': 1})
+
+        '''
+        if not isinstance(other, Counter):
+            return NotImplemented
+        result = Counter()
+        for elem in set(self) | set(other):
+            newcount = self[elem] - other[elem]
+            if newcount > 0:
+                result[elem] = newcount
+        return result
+
+    def __or__(self, other):
+        '''Union is the maximum of value in either of the input counters.
+
+        >>> Counter('abbb') | Counter('bcc')
+        Counter({'b': 3, 'c': 2, 'a': 1})
+
+        '''
+        if not isinstance(other, Counter):
+            return NotImplemented
+        _max = max
+        result = Counter()
+        for elem in set(self) | set(other):
+            newcount = _max(self[elem], other[elem])
+            if newcount > 0:
+                result[elem] = newcount
+        return result
+
+    def __and__(self, other):
+        ''' Intersection is the minimum of corresponding counts.
+
+        >>> Counter('abbb') & Counter('bcc')
+        Counter({'b': 1})
+
+        '''
+        if not isinstance(other, Counter):
+            return NotImplemented
+        _min = min
+        result = Counter()
+        if len(self) < len(other):
+            self, other = other, self
+        for elem in ifilter(self.__contains__, other):
+            newcount = _min(self[elem], other[elem])
+            if newcount > 0:
+                result[elem] = newcount
+        return result
+
+
+if __name__ == '__main__':
+    import doctest
+    print doctest.testmod()
+
+
+
+class Timezone(datetime.tzinfo):
+
+    def __init__(self, name="+0000"):
+        self.name = name
+        seconds = int(name[:-2])*3600+int(name[-2:])*60
+        self.offset = datetime.timedelta(seconds=seconds)
+
+    def utcoffset(self, dt):
+        return self.offset
+
+    def dst(self, dt):
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return self.name
+
+
+HTTPCodeDescription = defaultdict(list, {400: 'Bad Request', 401: 'Unauthorized', 402: 'Payment Required', 403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed', 406: 'Not Acceptable', 407: 'Proxy Authentication Required', 408: 'Request Time-out', 409: 'Conflict', 410: 'Gone', 411: 'Length Required', 412: 'Precondition Failed', 413: 'Request Entity Too Large', 414: 'Request-URI Too Large', 415: 'Unsupported Media Type', 416: 'Requested Range Not Satisfiable', 417: 'Expectation Failed', 300: 'Multiple Choices', 301: 'Moved Permanently', 302: 'Moved Temporarily', 303: 'See Other', 304: 'Not Modified', 305: 'Use Proxy', 306: 'Unused', 307: 'Temporary Redirect', 200: 'OK', 201: 'Created', 202: 'Accepted', 203: 'Non-Authoritative Information', 204: 'No Content', 205: 'Reset Content', 206: 'Partial Content', 100: 'Continue', 101: 'Switching Protocols', 500: 'Internal Server Error', 501: 'Not Implemented', 502: 'Bad Gateway', 503: 'Service Unavailable', 504: 'Gateway Time-out', 505: 'HTTP Version not supported'})
+
+WeekDayKeyStore = defaultdict(list, {0: 'Monday', 1: 'Tuesday', 2: 'Wednesday', 3: 'Thursday', 4: 'Friday', 5: 'Saturday', 6: 'Sunday'})
+
+
+class ProcessHandler:
+
+    def __init__( self, log_file=None, stdin=None ):
+
+        self.access_log_parts = [
+            r'(?P<host>.+)\s',                   # host %h
+            r'\S+\s',                             # indent %l (unused)
+            r'(?P<user>[^[]+?)\s',                   # user %u
+            r'\[(?P<time_raw>.+)\]\s',            # time %t
+            r'(?P<request>\".*\")\s',               # request "%r"
+            r'(?P<status>[0-9]+)\s',              # status %>s
+            r'(?P<size>\S+)\s*',                   # size %b (careful, can be '-')
+            r'((?P<referer>".*")\s(?P<agent>".*"))', # referer "%{Referer}i" and user agent "%{User-agent}i"
+            r'(\s?(?P<domain>[\w\d\.-]+)?\s?(?P<ip>(\d{1,3}[.]){3}\d{1,3})?)', # for rock servers capture domain and account ip
+        ]
+        self.access_log_pattern = re.compile(r''.join(self.access_log_parts)+r'\s*\Z')
+        self.crawlers = set([
+                                'googlebot',
+                                'bingbot',
+                                'msnbot',
+                                'yandexbot',
+                                'mj12bot',
+                                'baiduspider'
+                            ])
+
+        self.string_wpcron = 'doing_wp_cron'
+
+        self.line_count = 0
+        self.collection_host = Counter()
+        self.collection_requestperhour = Counter()
+        self.collection_request = Counter()
+        self.collection_bwperrequest = Counter()
+        self.collection_protocol = Counter()
+        self.collection_useragent = Counter()
+        self.collection_referer = Counter()
+        self.collection_response = Counter()
+        self.collection_method = Counter()
+        self.collection_crawlers = Counter()
+        self.collection_authusers = Counter()
+        self.collection_weekday = Counter()
+        self.collection_hour = Counter()
+
+        self.collection_string_wpcron = 0
+        self.counter_bandwidth = 0
+
+        self.read_size = 0
+
+        try:
+
+           if log_file:
+
+               if not os.path.exists( log_file ):
+                   logging.critical("Apache Access Log Not Found : %s " % log_file)
+                   return
+
+               self.file_size_min = 4096 # Minimum size in bytes
+
+               self.file_size = os.path.getsize( log_file )
+
+               if self.file_size <= self.file_size_min:
+                   logging.warn("Apache Access Log does not meet minimum file size requirement [%s], skipping: %s\n" % ( bytes2human(self.file_size_min), log_file ) )
+                   return
+
+               self.mtime = os.path.getmtime( log_file )
+               self.atime = os.path.getatime( log_file )
+
+               for line in open(log_file):
+                   try:
+                       self.read_size += len(line)
+                       self.line_count += 1
+
+                       parsed_line = self.process_log_line(line)
+
+                       if self.line_count == 1:
+                           print "%15s: %s" % ('First Entry', parsed_line['time_raw'][:-6] )
+                           print "%15s: %4s" % ('Last Entry', time.strftime("%d/%b/%Y:%H:%M:%S", time.localtime( self.mtime ) ) )
+                           print "%15s: %s [%010d B]" % ('Log File Size', bytes2human(self.file_size), self.file_size )
+
+                       if self.line_count % 100 == 0:
+                           print "Lines processed: %010d [%4s/%010d B]" % ( self.line_count, bytes2human(self.read_size), self.read_size ), '\r',
+
+                   except Exception, e:
+                      logging.warn("Unable to parse line : %s :: DESC : %s " % ( line, e ) )
+
+           elif stdin:
+
+               logging.debug("Attempting to read from stdin")
+               line = stdin
+
+               while 1:
+
+                   try:
+
+                       self.line_count += 1
+                       self.read_size += len(line)
+
+                       parsed_line = self.process_log_line(line)
+
+                       if self.line_count == 1:
+                           print "%15s: %s" % ('First Entry', parsed_line['time_raw'][:-6] )
+
+                       if self.line_count % 100 == 0:
+                           print "Lines processed: %010d [%4s/%010d B]" % ( self.line_count, bytes2human(self.read_size), self.read_size ), '\r',
+
+                   except Exception, e:
+                      logging.warn("Unable to parse line : %s :: DESC : %s " % ( line, e ) )
+                   
+
+                   line = sys.stdin.readline()
+
+                   if not line:
+                       print "%15s: %s" % ('Last Entry', parsed_line['time_raw'][:-6] )
+                       break
+
+           print "Lines processed: %010d [%4s/%010d B]" % ( self.line_count, bytes2human(self.read_size), self.read_size )
+
+        except KeyboardInterrupt: pass
+
+        self.report_details()
+
+    def report_details(self):
+        print ' '
+        print "%45s: %10d" % ( 'Total number of unique IP addresses', len(self.collection_host) )
+        print "%45s: %10d" % ( 'Total number of requests', self.line_count )
+        print "%45s: %10d" % ( 'Total number of unique request strings', len(self.collection_request) )
+        print "%45s: %10d" % ( 'Total number of unique referers', len(self.collection_referer) )
+        print "%45s: %10d" % ( 'Total number of unique user agents', len(self.collection_useragent) )
+        print "%45s: %10s [%10dB]" % ( 'Total bandwidth sent in responses', bytes2human(self.counter_bandwidth), self.counter_bandwidth )
+
+        print "\n       Top 10 requesting IP Addresses based on count:"
+        for ip in self.collection_host.most_common(10):
+            try:
+                _host = gethostbyaddr(ip[0])
+                host = _host[0]
+            except:
+                host = 'Unknown Host'
+            print "%22s %8d / %05.2f%%  IP: %15s  HOST: %s" % ( 'COUNT:', ip[1], self.percentage_of_linecount(ip[1]), ip[0], host )
+
+        print "\n       Request count distribution per hour of the day:"
+        for hour, count in sorted(self.collection_hour.items()):
+            print "%20s: %4s %10s: %7s / %05.2f%%" % ( 'Hour', hour, 'Count', count, self.percentage_of_linecount(count) )
+
+        print "\n       Request count distribution per day of the week:"
+        for day, count in sorted(self.collection_weekday.items()):
+            print "%20s: %15s %10s: %7s / %05.2f%%" % ( 'Day', WeekDayKeyStore.get(day), 'Count', count, self.percentage_of_linecount(count) )
+
+        print "\n       Request count per hour:"
+        for hour, count in sorted(self.collection_requestperhour.items()):
+            print "%20s: %15s %10s: %7s / %05.2f%%" % ( 'Hour', hour, 'Count', count, self.percentage_of_linecount(count) )
+
+        print "\n       Top 10 Request Strings:"
+        for request, count in self.collection_request.most_common(10):
+            print "%20s: %8s / %05.2f%%  %10s: %s" % (  'Count', count , self.percentage_of_linecount(count) , 'Request', request)
+
+        print "\n       HTTP Response Codes:"
+        for code, count in sorted(self.collection_response.items()):
+            print "%20s: %8s / %05.2f%%  %10s: %4d - %s" % (  'Count', count , self.percentage_of_linecount(count) , 'Code', code, HTTPCodeDescription.get(code) )
+
+        print "\n       Top 10 Referers:"
+        for referer, count in self.collection_referer.most_common(10):
+            print "%20s: %8s / %05.2f%%  %10s: %s" % (  'Count', count , self.percentage_of_linecount(count) , 'Referer', referer)
+
+        print "\n       Top 10 User Agents:"
+        for agent, count in self.collection_useragent.most_common(10):
+            print "%20s: %8s / %05.2f%%  %10s: %s" % (  'Count', count , self.percentage_of_linecount(count) , 'User Agent', agent)
+
+        if len(self.collection_crawlers) != 0:
+            print "\n       Top 10 Web Crawlers:"
+            for crawler, count in self.collection_crawlers.most_common(10):
+                print "%20s: %8s / %05.2f%%  %10s: %s" % (  'Count', count, self.percentage_of_linecount(count), 'Crawler', crawler)
+
+        if self.collection_string_wpcron != 0:
+            print "\n       WordPress Cron Entries: %5d" % self.collection_string_wpcron
+
+        if len(self.collection_method) != 0:
+            print "\n       Count per request method:"
+            for method, count in self.collection_method.most_common(10):
+                print "%20s: %8s / %05.2f%%  %10s: %s" % (  'Count', count, self.percentage_of_linecount(count), 'Method', method)
+
+        if len(self.collection_protocol) != 0:
+            print "\n       Count per HTTP protocol:"
+            for protocol, count in sorted(self.collection_protocol.items()):
+                print "%20s: %15s %10s: %5s / %05.2f%%" % ( 'Protocol', protocol, 'Count', count, self.percentage_of_linecount(count) )
+
+        if len(self.collection_authusers) != 0:
+            print "\n       HTTP Authenticated Users:"
+            for user, count in self.collection_authusers.most_common(10):
+                print "%20s: %8s / %05.2f%%  %10s: %s" % (  'Count', count, self.percentage_of_linecount(count), 'User', user)
+
+        if len(self.collection_bwperrequest) != 0:
+            print "\n       Top 10 Bandwidth Consuming Request Arguments:"
+            for request, bandwidth in self.collection_bwperrequest.most_common(10):
+                print "%20s: %6s / %05.2f%%  %10s: %5s" % ( 'Bandwidth', bytes2human(bandwidth), self.percentage_of_bandwidth(bandwidth), 'Request', request )
+
+
+    def percentage_of_linecount(self, value):
+        return ( value/ float(self.line_count) ) * 100
+
+    def percentage_of_bandwidth(self, value):
+        try:
+            return ( value / float(self.counter_bandwidth) ) * 100
+        except ZeroDivisionError:
+            return 0.0
+
+    def process_log_line(self, line):
+
+        match_Obj = self.access_log_pattern.match(line)
+
+        if not match_Obj:
+            logging.warn("Unable to regex match line : %s" % line )
+
+        result = match_Obj.groupdict()
+
+        _tt = time.strptime(result["time_raw"][:-6], "%d/%b/%Y:%H:%M:%S")
+        _tt = list(_tt[:6]) + [ 0, Timezone(result["time_raw"][-5:]) ]
+        result["time"] = datetime.datetime(*_tt)
+
+        if result["user"] == "-" or result["user"] == "":
+            result["user"] = None
+
+        result["status"] = int(result["status"])
+
+        if result["size"] == "-":
+            result["size"] = 0
+        else:
+            result["size"] = int(result["size"])
+
+        if result["referer"] == "-" or result["referer"] == "":
+            result["referer"] = None
+
+        if result["request"].endswith('HTTP/1.0'):
+            result["protocol"] = 'HTTP/1.0'
+            result["request"] = result["request"][:-9]
+        elif result["request"].endswith('HTTP/1.1'):
+            result["protocol"] = 'HTTP/1.1'
+            result["request"] = result["request"][:-9]
+        else:
+            # Assume HTTP/1.1
+            result["protocol"] = 'HTTP/1.1'
+
+        result["request"].split()[0]
+
+        # Store a collection of requesting per hosts/IP addresses
+        self.collection_host[result['host']] = self.collection_host.get(result['host'], 0) + 1
+
+        # Store a collection of authenticated users
+        if result["user"]:
+            self.collection_authusers[result['user']] = self.collection_authusers.get(result['user'], 0) + 1
+
+        # Store a collection of requests per hour
+        self.collection_requestperhour[result['time_raw'][:14]] = self.collection_requestperhour.get(result['time_raw'][:14], 0) + 1
+
+        # Store a collection of request strings
+        self.collection_request[result['request']] = self.collection_request.get(result['request'], 0) + 1
+
+        # Store a count of the HTTP protocol used
+        self.collection_protocol[result['protocol']] = self.collection_protocol.get(result['protocol'], 0) + 1
+
+        # Store a count of the status code responses
+        self.collection_response[result['status']] = self.collection_response.get(result['status'], 0) + 1
+
+        # Store a collection of referers
+        self.collection_referer[result['referer']] = self.collection_referer.get(result['referer'], 0) + 1
+
+        # Store a collection of request methods
+        result["method"] = result["request"].split()[0]
+        self.collection_method[result['method']] = self.collection_method.get(result['method'], 0) + 1
+
+        # Store a collection of requesting user agents
+        self.collection_useragent[result['agent']] = self.collection_useragent.get(result['agent'], 0) + 1
+
+        # Store a collection of the bandwidth used per request argument
+        self.collection_bwperrequest[result['request']] = self.collection_bwperrequest.get(result['request'], 0) + result['size']
+        self.counter_bandwidth += result['size']
+
+        # Store a collection of requests by weekday
+        self.collection_weekday[result['time'].weekday()] = self.collection_weekday.get(result['time'].weekday(), 0) + 1
+
+        # Store a collection of requests by hour
+        self.collection_hour[result['time'].hour] = self.collection_hour.get(result['time'].hour, 0) + 1
+
+        # Store a collection of requesting crawlers
+
+        result["crawler"] = self.crawlers.intersection(
+                                    map(
+                                        lambda x: re.sub("/.*","",x),
+                                        result["agent"].lower().split()
+                                        )
+                                    )
+
+        if result["crawler"]:
+            _crawler = list(result['crawler'])[0]
+            self.collection_crawlers[_crawler] = self.collection_crawlers.get(_crawler, 0) + 1
+
+        if self.string_wpcron in result["request"]:
+            self.collection_string_wpcron += 1
+
+        return result
+
+
+
+
+
+
+def get_domain_info(user=None, apache_conf='/usr/local/apache/conf/httpd.conf'):
+    """
+    lookup the given user domains and provide information about them
+
+    Returns a list of domain lists
+
+    A domain list looks like this: ['domain.com', ['alias.org1', 'alias.org2'], docroot, logfile]
+
+    Parses httpd.conf by grabbing all vhosts, then pulling out the necessary directives with another re.findall call.
+    """
+
+    if not os.path.exists(apache_conf): raise IOError("Apache Configuration Not Found")
+    if user: userdir = os.path.realpath("/home/%s" % user)
+
+    aConfigFD=open('/usr/local/apache/conf/httpd.conf','r')
+    aConfig=aConfigFD.read()
+    aConfigFD.close()
+    vHosts=re.findall("(<VirtualHost.*?/VirtualHost>)",aConfig,flags=re.S)
+
+    dirPat = re.compile("((ServerName|ServerAlias|DocumentRoot|CustomLog|# Include)\s(.*))")
+    domains = []
+
+    for h in vHosts:
+       try:
+          domain={}
+          for line in dirPat.findall(h):
+             domain[line[1]]=line[2] #odd due to the way that re does subgroups. 1 is the directive. 2 is .* after.
+          domain["ServerAlias"]=domain["ServerAlias"].split(" ")
+          domain["CustomLog"] = "/etc/apache2/logs/domlogs/"+user+"/"+domain["# Include"].split("/")[8] #hacky, but alternative is manually parsing the splitlog format into real paths.
+          if user is None or userdir in domain["DocumentRoot"]:
+             domains.append([domain["ServerName"], domain["ServerAlias"], domain["DocumentRoot"], domain["CustomLog"]])
+       except:
+          pass
+
+    return domains
+
+
+
+
+def get_user():
+
+   l_cwd = os.getenv('PWD').split('/')
+
+   if len(l_cwd) >= 3 and 'home' in l_cwd[1]:
+       return (l_cwd[2], '/'.join(l_cwd[0:3]))
+
+   else:
+       raise Exception("Hmm... Doesn't look like you are in a home directory")
+
+
+def parse_options():
+    usage = """
+    usage: %prog [options]
+    """
+    version = "CurDom 0.2 by Joshua Holmes <jholmes@hostgator.com>"
+    description = """ Process Apache domain access log(s) for the given user, log file, stdin reads."""
+    parser = OptionParser( usage=usage, version=version, description=description)
+    parser.add_option("-u", "--user",
+                        action="store", dest="user", default=None,
+                        help="user of interest")
+    parser.add_option("-l", "--logfile",
+                        action="store", dest="logfile", default=None,
+                        help="log file of interest")
+    (options, args) = parser.parse_args()
+    return options, args
+
+
+def process_user(user):
+
+    domains = get_domain_info(user)
+
+    if len(domains) == 0:
+        logging.critical("Unable to capture domain info.")
+        sys.exit(1)
+
+    for domain in domains:
+        print " "
+        print "%15s: %s" % ( 'Domain Name', domain[0] )
+        print "%15s: %s" % ( 'Aliases', ' '.join(domain[1]) )
+        print "%15s: %s" % ( 'Document Root', domain[2] )
+        print "%15s: %s" % ( 'Access Logfile', domain[3] )
+        ProcessHandler(log_file=domain[3])
+
+
+
+if __name__ == '__main__':
+
+    options, parser = parse_options()
+
+    if not os.isatty(0):
+        stdin_data = sys.stdin.readline()
+
+    else:
+        stdin_data = None
+
+    if stdin_data:
+        ProcessHandler( stdin=stdin_data )
+
+    #if stdin_data and stdin_data[0].isdigit():
+    #    ProcessHandler( stdin=stdin_data )
+
+    #elif stdin_data and stdin_data[0].startswith('/'):
+    #    for file in stdin_data:
+    #        ProcessHandler( log_file=file )
+
+    elif options.user:
+        _dir = "/home/%s" % options.user
+        if not os.path.exists(_dir):
+            logging.critical("Unable to confirm user provided exists.")
+            sys.exit(1)
+        process_user(options.user)
+
+    elif options.logfile:
+        ProcessHandler( log_file=options.logfile )
+
+    elif get_user():
+        options.user, homedir = get_user()
+        process_user(options.user)
+
+

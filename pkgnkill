@@ -1,0 +1,728 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# Pkgnkill - Packages a cpanel account and removes it from the server.
+# Conf: https://confluence.endurance.com/display/HGS/MigrationsPkgnkill 
+# Git: https://stash.endurance.com/projects/HGADMIN/repos/pkgnkill/browse
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2013 - HostGator.com, LLC
+###########
+
+use strict;
+use Getopt::Long qw (:config pass_through);
+use Term::ANSIColor;
+use XML::Simple;
+use File::Find ();
+use File::Path;
+use File::Copy;
+use POSIX qw(strftime);
+use Cwd;
+use JSON;
+use Cpanel::Version;
+
+my $help;
+my $force;
+my $workingdir;
+my $noprompt;
+
+GetOptions(
+	'help'      => \$help,
+	'workdir=s' => \$workingdir,
+	'force'     => \$force,
+	'noprompt'  => \$noprompt
+);
+
+if ($help) {
+	help();
+}
+
+pre_checks();
+
+if ($#ARGV != 0) {
+	print "[!] Unknown option passed. Please see --help\n";
+	exit 1;
+}
+
+#log to file
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+my $logfile = "pkgnkill-" . sprintf("%4d%02d%02d",$year+1900,$mon+1,$mday). ".log";
+my $logfile_fh;
+eval {
+	if (not -d "/var/log/hgtransfer") {
+		mkdir "/var/log/hgtransfer";
+	}
+	open $logfile_fh, '>>', "/var/log/hgtransfer/$logfile";
+} or do {
+	print "Error opening the log file: /var/log/hgtransfer/$logfile";
+	exit 1;
+};
+
+sub logg {
+	#printonly = 0 -> print to stdout and log
+	#printonly = 1 -> print to stdout only
+	#printonly = 2 -> print only to log
+
+	my $print = shift;
+	my $printonly = shift;
+	if ($printonly != 2) {
+		print $print;
+	}
+	my $timestamp = POSIX::strftime("%m/%d/%Y %H:%M:%S - ", localtime);
+	if ($printonly != 1) {
+		#remove color codes for log manually cause colorstrip isn't available in the version of ansicolor on the farm.
+		$print =~ s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g;
+		$print =~ s/^\n//;
+		chomp $print;
+		print $logfile_fh "$timestamp$print\n";
+	}
+	return 0;
+}
+
+logg("[*] Logging to /var/log/hgtransfer/$logfile\n", 1);
+
+my $currversion = Cpanel::Version::getversionnumber();
+my $token;
+my $token_name;
+my $json;
+
+if ( $currversion >= 11.64 ){
+	#Clean up the API Token before exit
+	END{
+		if($token_name){
+			`whmapi1 api_token_revoke token_name=$token_name`
+		}
+	}
+	#Remove stale tokens
+	stale_tokens();
+	{
+		my $revoked;
+		$SIG{INT} = sub { 
+			unless ($revoked) {
+				$revoked = 1;
+				fork or exec('whmapi1', 'api_token_revoke', "token_name=$token_name");
+			}
+			die "Interrupted"
+		};
+	}
+	#Generate the token
+	$token_name = "pkgnkill_".time();
+	$json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+	$token = from_json($json)->{'data'}{'token'};
+}
+
+if ( !-s "/root/.accesshash" && !defined($token) ) {
+	$ENV{'REMOTE_USER'} = 'root';
+	system('/usr/local/cpanel/bin/realmkaccesshash');
+}
+
+my $apic;
+
+if ( $currversion >= 11.64 ){
+	$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0', api_token => $token );
+} else {
+	$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+}
+
+main();
+
+sub main {
+
+	logg("\n[+] Start time: $hour:$min:$sec\n", 2);
+
+	my @usernames = parse_args($ARGV[0]);
+	if (!scalar(@usernames)) {
+		logg ("[!] No valid usernames provided. Nothing to do. Exiting.\n", 0);
+		exit 1;
+	}
+
+	if (defined $workingdir) {
+		$workingdir .= substr($workingdir, -1) eq "/" ? "" : "/";
+	} elsif ( -l '/home/hgtransfer') {
+		$workingdir = (readlink '/home/hgtransfer')."/pkgnkill_backups/";
+	} else {
+		$workingdir = '/home/hgtransfer/pkgnkill_backups/';
+	}
+
+	if (not -d $workingdir) {
+		logg ("[!] '".colorify($workingdir, "red")."' does not exist on the server. Creating it...\n", 0);
+		mkpath($workingdir, 0, 0700) or logg ("[!] Failed to create '".colorify($workingdir, "red")."'. Bailing!\n", 0) && exit 1;
+	}
+	logg ("[*] Working directory where all packaging will happen is '".colorify($workingdir, "green")."'\n", 0);
+
+	my %quotas = quota_check(@usernames);
+	my %df = get_df();
+
+	my $counter = 1;
+	my $warning;
+	foreach my $user (sort keys %quotas) {
+		if (scalar(@{$quotas{$user}}) != 4) {
+			logg ("\n[!] Failed to parse the quota information for '$user'. Skipping\n", 0);
+			next;
+		}
+
+		my $owner = $quotas{$user}[0];
+		my $du = $quotas{$user}[1];
+		my $isEmpty = $quotas{$user}[2];
+		my $isReseller = $quotas{$user}[3];
+		my @subaccounts;
+
+		if ($isReseller) {
+			@subaccounts = process_reseller($user);
+		}
+		
+		if (domcheck_user($user)) {
+			$isEmpty = 0;
+		}
+
+		if ( emptycheck($user, $isEmpty) ) {
+
+			my $homedir = homedir($user);
+			if (not $homedir) {
+				logg("\n[!] '".colorify($user, "red")."' FAILED to detect homedir. Skipping account - process this manually!\n", 0);
+				next;
+			}
+			if (-d $homedir.'/.codeguard' or -d $homedir.'/.ssh') {
+				$warning .= "[!] '".colorify($user, "red")."' appears to have a codeguard subscription. Please be sure to check their billing account.\n";
+			}
+
+			my $mountp = mountinfo($workingdir);
+			my $freecheck;
+			if (exists $df{$mountp}) {
+				$freecheck = freecheck($df{$mountp}, $du);
+			} else {
+				$freecheck = freecheck($df{'/'}, $du);
+			}
+
+			my $toobig = ($du < 4096)? 0 : 1;
+			if ($toobig) {
+				logg("\n[!] '".colorify($user, "red")."' is TOO BIG to pkgnkill the full package. ($counter/".scalar(keys %quotas).")\n", 0);
+				if ($freecheck) {
+					my $movedir = "$workingdir$user-".sprintf("%4d%02d%02d",$year+1900,$mon+1,$mday)."-$hour$min$sec/";
+					logg("[*] Moving homedir - '".colorify("$homedir/", "red")."' to '".colorify($movedir, "green")."'...\n", 0);
+					move("$homedir/", $movedir) or (logg("\n[!] '".colorify($user, "red")."' FAILED to move homedir. Process this manually!\n", 0) and next);
+					logg("[*] Changing ownership of files in '$movedir' to root...\n", 0);
+					system("chown -R root. \"$movedir\"");
+				} else {
+					logg("\n[!] '".colorify($user, "red")."' Not enough free space to save the homedir content. Process this manually.\n", 0);
+					next;
+				}
+			}
+
+			if ($freecheck) {
+				pkgnkill($user, $counter, scalar(keys %quotas));
+				if ($isReseller) {
+					$warning .= "[!] '".colorify($user, "red")."' was a reseller account that owned the following ".colorify(scalar(@subaccounts), "green")." account(s):\n";
+					foreach (@subaccounts) {
+						$warning .= "\t".colorify($_, "yellow")."\n";
+					}
+				}
+			} else {
+				logg("\n[!] Not enough free space on '".colorify($mountp, "red")."' to safely package and kill '$user'. Please clear some space and try again ($counter/".scalar(keys %quotas).").\n", 0);
+				next;
+			}
+		}
+		$counter++;
+	}
+	if ($warning) {
+		logg("\n".colorify('#### IMPORTANT INFO ####', 'red')."\n\n", 0);
+		logg("$warning\n", 0);
+		logg(colorify("#### IMPORTANT INFO ####\n\n", 'red'), 0);
+	}
+}
+
+sub help {
+
+	print "Usage: pkgnkill <username> or <filename that contains usernames>\n\n";
+	print "Additional options:\n";
+	print "--workdir          => Specify the workdir where you want the packaging process and the backup files saved to.\n";
+	print "                      Default: /home/transfer_backups/\n";
+	exit 1;
+}
+
+sub pkgnkill {
+
+	my ($user, $counter, $total) = @_;
+
+	logg("[+] Backing up and removing '$user' cPanel account. ($counter/$total)\n", 0);
+
+	my $test;
+	$test = pkgacct($user);
+	if (!$test) {
+		logg ("[!] pkgacct came back with errors. Abandoning '$user', please review the log before retrying.\n", 0);
+		return 1;
+	}
+
+	$test = killacct($user);
+	if (!$test) {
+		logg ("[!] killacct came back with errors. Abandoning '$user', please review the log before retrying.\n", 0);
+		return 1;
+	}
+
+	return 0;
+}
+
+sub killacct {
+
+	my $user = shift;
+	my $homedir = homedir($user);
+
+	logg ("[+] Killing '".colorify($user, "red")."' now...\n", 0);
+	my $output = `/scripts/removeacct --force $user 2>&1`;
+	logg ("\tCommand ran => '/scripts/removeacct --force $user 2>&1'\n", 2);
+	logg ("\n\n###### START killacct OUTPUT ######\n", 2);
+	logg ($output, 2);
+	logg ("\n\n###### STOP killacct OUTPUT ######\n", 2);
+
+	if ((($? >> 8) > 0) or userexists($user)) {
+		logg ("[!] removeacct FAILED! Please review the failed removeacct's output in the logfile!\n", 0);
+		logg ("$output\n", 2);
+		return 0;
+	} elsif (leftoverdata($user, $homedir)) {
+		logg ("[!] While the account was removed in cPanel, some data was not fully removed by removeacct. Please review the information above to ensure all remnants of ".colorfiy($user, "green")." are removed.\n", 0);
+		return 1;
+	} else {
+		logg ("[+] Successfully killed '".colorify($user, "green")."'!\n", 0);
+		return 1;
+	}
+}
+
+sub pkgacct {
+
+	my $user = shift;
+
+	my $bfile = $workingdir."cpmove-${user}.tar.gz";
+	if (-e $bfile) {
+		logg ("[!] Backup file '$bfile' already exists! Please move this file to another location before proceeding.\n", 0);
+		return 0;
+	}
+
+	logg ("[+] Packaging '".colorify($user, "green")."' now...\n", 0);
+	my $output = `/scripts/pkgacct $user \"$workingdir\" 2>&1`;
+	logg ("\tCommand ran => '/scripts/pkgacct $user \"$workingdir\" 2>&1'\n", 2);
+	logg ("\n\n###### START pkgacct OUTPUT ######\n", 2);
+	logg ($output, 2);
+	logg ("\n\n###### STOP pkgacct OUTPUT ######\n", 2);
+
+	if (($? >> 8) > 0) {
+		logg ("[!] Packaging FAILED! Please review the failed pkgacct's output in the logfile!\n", 0);
+		logg ("$output\n", 2);
+	} else {
+		logg ("[*] Pkgacct has completed. Testing to make sure that the file generated is good... ", 0);
+	}
+
+	# Eris' backup file check idea
+	if (not -e $bfile) { 
+		logg ("[!] It appears that no backup file was created by the pkgacct process. Please check this account manually.\n", 0);
+		return 0;
+	}
+
+	my $test = `gunzip -c \"$bfile\" \| tar t > /dev/null`;
+	if (($? >> 8) > 0) {
+		logg("FAILED! pkgacct created a corrupt backup file. Please review the log for details.\n", 0);
+		logg("$test\n", 2);
+		return 0;
+	} else {
+		logg("Done!\n", 0);
+	}
+
+	# Add a timestamp to the file name and put the name is standard cpanel name format.
+	my $timestr = sprintf("%04d%02d%02d%02d%02d%02d", $year+1900, $mon+1, $mday, $hour, $min, $sec);
+	my $nfile = $workingdir."cpmove-${user}-${timestr}.tar.gz";
+	rename ($bfile, $nfile) or logg("[!] Unable to rename $bfile to $nfile\n", 0) && return 0;
+
+	logg("[+] Packaged account and saved it to '".colorify($nfile, "green")."'!\n", 0);
+	return 1;
+}
+
+sub emptycheck {
+
+	my $user = shift;
+	my $isEmpty = shift;
+
+	if ($isEmpty) {
+		logg ("\n[+] '".colorify($user, "green")."' is an empty account with no live domains.\n", 0);
+		return 1;
+	} elsif($noprompt) {
+		return 1;
+	} else {
+		logg ("\n[!] '".colorify($user, "red")."' has live content. Please enter the following random string, if you wish to proceed with the process.\n", 0);
+		my $string = randoms(16);
+		logg ("[#] String to enter is: '$string' (no quotes).\n", 0);
+		logg ("Proceed? ", 0);
+		my $answer = <STDIN>;
+		chomp $answer;
+
+		logg ("Admin entered '$answer' to the prompt.\n", 2);
+		if ($answer eq $string) {
+			return 1;
+		} else {
+			return 0;
+		}
+	} 
+}
+
+sub domcheck_user {
+
+	my $user = shift;
+	our $domains = {};
+	my $dnschecker;	
+
+	if( $currversion >= 11.64 ){
+		$dnschecker = Dnschecker::helpers->new(1, \&processdnsoutput, $token);
+	} else {
+		$dnschecker = Dnschecker::helpers->new(1, \&processdnsoutput);
+	}
+	my ($total, $good, $bad) = $dnschecker->processuser($user, 1);
+	if ($good) {
+		logg ("\n[!] '".colorify($user, "yellow")."': The following domains are live on the account:\n", 0);
+		foreach my $domain (keys %{$domains}) {
+			logg ("\t'".colorify($domain, "red")."' - $domains->{$domain}\n", 0);
+		}
+		return $good;
+	}
+
+	sub processdnsoutput {
+
+		my $line = shift;
+		if ($line =~ m/^\[\+\]/) {
+			my ($domain, $ip) = $line =~ m/^\[\+\]\s([\w\.]+)\s.*IP:\s([\w\.]+)$/;
+			$domains->{$domain} = $ip;
+		}
+	}
+}
+
+sub freecheck {
+
+	my $freespace = shift;
+	my $du = shift;
+	$du = $du * 1024;
+
+	if ($freespace < 2*$du) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+
+sub mountinfo {
+
+	my $dir = shift;
+	my $mountpoint = (split(/\//, $dir))[1];
+	return "/$mountpoint";
+}
+
+sub userexists {
+
+	#use getpwnam like Eris does
+
+	my $user = shift;
+	my ($name, $passwd, $uid, $gid, $quota, $comment, $gcos, $dir, $shell) = getpwnam ($user);
+
+	if (($name) and (($dir) and (-d $dir)) and (-s "/var/cpanel/users/$user")) {
+		return 1;
+	}
+	return 0;
+}
+
+sub leftoverdata {
+	my $user = shift;
+	my $homedir = shift;
+	my $fail = 0;
+	my $cpuserfile = "/var/cpanel/users/$user";
+	my ($name, $passwd, $uid, $gid, $quota, $comment, $gcos, $dir, $shell) = getpwnam ($user);
+
+	# Common files that are leftover during removeacct.
+	my @dbfiles = (
+		"/var/cpanel/databases/$user.json", 
+		"/var/cpanel/databases/$user.cache", 
+		"/var/cpanel/databases/grants_$user.yaml", 
+		"/var/cpanel/databases/grants_$user.cache"
+	);
+
+	# Make sure the user doesn't exist in cPanel, to an extent. This should have already been checked by userexists(), 
+	# which was called before ths subroutine is ran. This is just an extra check to make sure it still doesn't exist.
+	if (! -s $cpuserfile) {
+		if ($name) {
+			logg ("[!] User still exists in /etc/passwd! Removing with userdel.\n", 0);
+
+			if (-d $homedir) {
+				my $test = `userdel -r $user &>/dev/null`;
+			} else {
+				my $test = `userdel $user &>/dev/null`;
+			}
+
+			if (($? >> 8) > 0) {
+				# If userdel failed then we log a separate message and set $fail to indicate that it failed and removeacct was not 100% successful.
+				logg ("[!] Something went wrong and userdel failed. Please look into this and remove the extraneous data from /etc/passwd and /etc/shadow.\n", 0);
+				$fail = 1;
+			}
+		}
+
+		if (-d $homedir) {
+			logg ("[!] $user home directory still exists and was not removed by removeacct. This could indicate a TOS violation. Please look into this.\n", 0);
+			$fail = 1;
+		}
+
+		foreach my $dbfile (@dbfiles) {
+			if (-f $dbfile) {
+				logg ("[!] Found $dbfile after removeacct. Removing.\n", 0);
+				unlink $dbfile or logg("[!] Failed to remove $dbfile\n", 0);
+			}
+		}
+	}
+
+	return $fail;
+}
+
+sub randoms {
+
+	my $limit = shift;
+	my $possible = 'abcdefghijklmnopqrstuvwxyz';
+	my $string = "";
+	while (length($string) < $limit){
+		$string .= substr( $possible, ( int( rand( length($possible) ) ) ), 1 );
+	}
+
+	return $string;
+}
+
+sub get_df {
+
+	my %df;
+	my @output = grep(/^\/dev/, `df -Pl`);
+	foreach my $dev (@output) {
+		my @splitz = split(/\s+/, $dev);
+		my $mount = lc $splitz[5];
+		my $free  = lc $splitz[3];
+		$df{$mount} = $free;
+	}
+
+	return %df;
+}
+
+sub process_reseller {
+
+	my $reseller = shift;
+	my $resregex = "^$reseller\$";
+	my $response = $apic->whm_api('listaccts', { 'searchtype' => "owner", 'search' => $resregex }, 'json');
+	my $output = from_json($response);
+	my @subaccounts;
+
+	if (ref($output->{'data'}{'acct'}) eq 'ARRAY') {
+		foreach my $obj (@{$output->{'data'}{'acct'}}){
+			my $tempu = $obj->{'user'};
+			if (!($reseller eq $tempu)) {
+				push (@subaccounts, $tempu);
+			}
+		}
+	} else {
+		return @subaccounts;
+	}
+
+	@subaccounts = sort @subaccounts;
+
+	return @subaccounts;
+}
+
+sub homedir {
+
+	my $user = shift;
+	my ($name, $passwd, $uid, $gid, $quota, $comment, $gcos, $homedir, $shell) = getpwnam ($user);
+	if ($homedir and -d "$homedir") {
+		return $homedir;
+	}
+	return 0;
+}
+
+sub colorify {
+        my $string = shift;
+	my $color = shift;
+	return color("$color").$string.color("reset");
+}
+
+sub quota_check {
+
+	my @usernames = @_;
+	my %quotas;
+
+	foreach my $user (@usernames) {
+		my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'StatsBar', 'func' => 'stat', 'user' => $user, }, { 'display' => 'addondomains|subdomains|parkeddomains|ftpaccounts|sqldatabases|emailaccounts|emailforwarders|emailfilters|mailinglists|diskusage' }, 'json');
+		my $output = from_json($response);
+
+		if ( exists($output->{'cpanelresult'}->{'data'}[0]{'result'}) ) {
+			logg ("[!] Failed to fetch information for '$user' on the server.\n", 0);
+			$quotas{$user} = [];
+			next;
+		}
+
+		my $isEmpty = 1;
+
+		my $addons = $output->{'cpanelresult'}->{'data'}[0]{'count'};
+		my $subs = $output->{'cpanelresult'}->{'data'}[1]{'count'};
+		my $parks = $output->{'cpanelresult'}->{'data'}[2]{'count'};
+		my $ftps = $output->{'cpanelresult'}->{'data'}[3]{'count'};
+		my $sqldbs = $output->{'cpanelresult'}->{'data'}[4]{'count'};
+		my $emails = $output->{'cpanelresult'}->{'data'}[5]{'count'};
+		my $emailforwards = $output->{'cpanelresult'}->{'data'}[6]{'count'};
+		my $emailfilters = $output->{'cpanelresult'}->{'data'}[7]{'count'};
+		my %maillists = 0;
+		my $maillists = 0;
+		if (exists ( $output->{'cpanelresult'}->{'data'}[8]) ) {
+			if (ref($output->{'cpanelresult'}->{'data'}[8]{'count'}) eq 'HASH') { 
+				%maillists = %{$output->{'cpanelresult'}->{'data'}[8]{'count'}};
+				$maillists = scalar(keys %maillists);
+			} else {
+				$maillists = $output->{'cpanelresult'}->{'data'}[8]{'count'};
+			}
+		}
+
+		if ($addons || $subs || $parks || $ftps || $sqldbs || $emails || $emailforwards || $emailfilters || $maillists) {
+			$isEmpty = 0;
+		}
+
+		my $diskused = $output->{'cpanelresult'}->{'data'}[9]{'count'};
+		my $duunit = $output->{'cpanelresult'}->{'data'}[9]{'units'};
+		my $diskusage;
+		if ($duunit eq "MB") {
+			$diskusage = $diskused;
+		} elsif ($duunit eq "GB") {
+			$diskusage = $diskusage * 1024;
+		} else {
+			$diskusage = 0;
+		}
+
+		if ($diskusage > 1) {
+			$isEmpty = 0;
+		}
+
+		$response = $apic->whm_api('accountsummary', { 'user' => $user }, 'json');
+		$output = from_json($response);
+
+		my $owner = $output->{'data'}->{'acct'}[0]{'owner'};
+		my $isreseller = 0;
+
+		if ($owner eq $user) {
+			$isreseller = 1;
+		}
+
+		$quotas{$user} = [$owner, $diskusage, $isEmpty, $isreseller];
+	}
+
+	return %quotas;
+}
+
+sub parse_args {
+
+	my $arg = shift;
+	my @usernames;
+
+	if (-s $arg && !-d $arg) {
+		open my $usernames_fh, '<', $arg;
+		while (<$usernames_fh>) {
+			my $user = $_;
+			chomp $user;
+			check_user($user, \@usernames);
+		}
+		close $usernames_fh;
+	} else {
+		check_user($arg, \@usernames);
+	}
+	return @usernames;
+}
+
+sub check_user {
+
+	my $user      = shift;
+	my $usernames = shift;
+
+	if (userexists($user)) {
+		my $logged_in = user_logged_in($user);
+		if ( not $force and $logged_in ) {
+			if ($logged_in == 2) {
+				logg("[!] '".colorify($user, 'red')."' is currently logged in. Skipped...\n", 0);
+			} else {
+				logg("[!] '".colorify($user, 'red')."' is currently PWtemped. Skipped...\n", 0);
+			}
+			print "[!]\t\tSpecify '--force' if you wish this to be ignored.\n";
+		} else {
+			logg("[*] Added '".colorify($user, 'green')."' to be processed...\n", 0);
+			push @{$usernames}, $user;
+		}
+	} else {
+		logg("[!] '".colorify($user,'red')."' was not added, as it does not exist on the server.\n", 0);
+	}
+}
+
+sub user_logged_in {
+
+	my $user = shift;
+	if (-e "/root/.hgtogglehash/$user") {
+		return 1;
+	} elsif (</var/cpanel/sessions/raw/${user}:*>) {
+		return 2;
+	}
+	return;
+}
+
+sub pre_checks {
+
+	if (!-s "/usr/local/cpanel/cpanel") {
+		print "[!] No cPanel detected on the server. None of the functions will work.\n";
+		exit 1;
+	}
+
+	if (not check_dnschecker() ) {
+		print "[!] DNSchecker does not exist or is out of date on the server. Please make sure that the latest version is installed by running the following:\n";
+		print "\tyum update ESO-utils\n";
+		exit 1;
+	}
+	use lib "/usr/local/share/perl5";
+	if (eval {require cPanel::PublicAPI;}) {
+		use cPanel::PublicAPI;
+		if ( $currversion>=11.64 && $cPanel::PublicAPI::VERSION < 2.2 ) {
+			die "[!] cPanel::PublicAPI out of date, please ensure 2.2 or greater for API Token support";
+		}
+	} else {
+		print "[!] Failed to load the necessary modules for this script to function properly. Please install cPanel::PublicAPI via '/scripts/perlinstaller cPanel::PublicAPI'\n";
+		exit 1;
+	}
+}
+
+sub check_dnschecker {
+	if (-e "/root/bin/dnschecker") {
+		require "/root/bin/dnschecker";
+		if (defined ($Dnschecker::helpers::VERSION) and $Dnschecker::helpers::VERSION >= "3.3") {
+			return 1;
+		}
+	}
+	return;
+}
+
+sub stale_tokens {
+	my $token_list = `whmapi1 api_token_list --output=json`;
+	my $listjson = from_json($token_list);
+	my $current_time = time(); 
+	if ($currversion >= 11.68){ 
+		foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+			if( $token_name =~ /dnschecker_/ ){
+				my $token_time = $token_name;
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_name`;
+				}
+			}
+		}
+	} else {
+		foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+			if( $token_data->{'name'} =~ /dnschecker_/ ){
+				my $token_time = $token_data->{'name'};
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+				}
+			}
+		}
+	}
+}

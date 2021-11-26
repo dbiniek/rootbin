@@ -1,0 +1,76 @@
+#!/bin/bash
+#
+#+ Swiss Army Knife -- Joomla GUI Library
+#|
+#| @author Jon South <jsouth@hostgator.com>
+#| @package Bash-JOS
+#- @subpackage GUI
+
+##################################################################
+##################################################################
+#
+# Joomla Specific Menus
+#
+
+#+ Main Joomla menu.
+#| sak_menu_jos_opts INDEX
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_jos_opts() {
+  local i="$i" RET
+
+  IFS=$'\t' read -r vuln soft path ver <<< "${SAK_SOFTWARE[$i]}"
+
+  sak_jos_cache_config "$i" || return 1
+
+  RET=`"${SAK_DIALOG[@]}" \
+    --cancel-label "Back" \
+    --title "Joomla Operations" \
+    --menu "Joomla $ver\n$path" \
+    0 55 0 \
+    C "Create Backups..." \
+    R "Replace Core Install Files" \
+    D "Show File Differences" \
+    O "Show Orphaned Files"`
+
+  case "$?" in
+    0) ;;
+    127)
+      sak_sigwincheck && return 0
+      sak_fatal_backtrace $SAK_ERR_UNK "Error displaying menu, please report this." ;;
+    255) sak_escaped ;;
+    *) return 1 ;;
+  esac
+
+  while :; do
+    case "$RET" in
+#      E) sak_menu_jos_edit "$i"; break ;;
+#      U) sak_menu_jos_users "$i" || break ;;
+#      P) sak_menu_jos_plugins "$i" || break ;;
+#      Q) sak_menu_jos_diags "$i" || break ;;
+      C) sak_menu_backups "$i" "$SAK_JOS_DB" || break ;;
+      R) sak_menu_core_replace "$i" || break ;;
+      D) sak_menu_core_diff "$i" || break ;;
+      O) sak_menu_core_orphans "$i" && break ;;
+      *) break ;;
+    esac
+  done
+
+  return 0
+}
+
+#+ Allows editing of basic blog settings.
+#| sak_menu_jos_edit INDEX
+#| @todo Unfinished function.
+#| @param int $index    Software install index.
+#- @return bool True to return to this menu. False to return to previous.
+sak_menu_jos_edit() {
+  local i="$1" modified=0 save found info cfile RET IFS \
+        blogname siteurl homeurl stylesheet template theme permalink temp \
+        cache=() back=$'--cancel-label\tBack'
+
+  sak_jos_cache_config "$i" || return 1
+  cfile="$(sak_jos_cache_file BASICS)"
+
+return 1
+}

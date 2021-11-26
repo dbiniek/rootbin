@@ -1,0 +1,155 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+
+my ($username, $uid, $gid, $hta_path, $uri_host, $uri_path, $path_regex, $rewrite, $rw_regex);
+my $rw_uri_path  = '';
+my $hta_con      = '';
+my $ticketid     = '';
+my $uri_arg      = '';
+my $block        =  0;
+my $unblock      =  0;
+my $blocked      =  0;
+my $ticket_regex = '^[A-Z]{3}-\d{3}-?\d{2}-?\d{3}$';
+my $uri_regex    = '^(https?:\/\/)?(www\.)?'.
+                   '([a-zA-Z0-9\-\.]+\.[A-Za-z0-9\-\.]+)(:[0-9]+)?'.
+                   '(\/)?([a-zA-Z0-9\-\.\/]+)?(\?.*)?$';
+
+GetOptions ('block'             => \$block,
+            'unblock'           => \$unblock,
+            'ticket|ticketid=s' => \$ticketid,
+            'uri|url=s'         => \$uri_arg,
+            'help'              => \&help);
+
+if ($block + $unblock != 1) {
+    print "[!] Requires valid action (--block|--unblock)\n";
+    usage();
+} elsif ($ticketid !~ m/$ticket_regex/) {
+    print "[!] Requires valid ticket ID (--ticket [ticketid])\n";
+    usage();
+} elsif ($uri_arg !~ m/$uri_regex/) {
+    print "[!] Requires valid URI (--uri [uri/url])\n";
+    usage();
+} else {
+    parseurl();
+}
+
+if ($block == 1 && $blocked == 0) {
+    block();
+} elsif ($unblock == 1 && $blocked == 1) {
+    unblock();
+} elsif ($block == 1 && $blocked == 1) {
+    die "[!] EXISTING BLOCK\nURI: $uri_host/$uri_path\nTicket: $ticketid\nhtaccess: $hta_path\n";
+} elsif ($unblock == 1 && $blocked == 0) {
+    die "[!] BLOCK NOT FOUND\nURI: $uri_host/$uri_path\nTicket: $ticketid\nhtaccess: $hta_path\n";
+}
+
+# ESOP-2826 - Purge cache when a block or unblock occurs
+if ( -f "/root/bin/purgecache" && -f "/etc/nginx/conf.d/proxyips" ) {
+    print "[*] This server has caching enabled. Attempting to clear the cache for this URI\n";
+    system("/root/bin/purgecache", "$uri_host");
+}
+
+sub usage {
+    die "[!] Usage (--help for more info): $0 (--block|--unblock) --ticket [ticketid] --uri [uri/url]\n";
+}
+
+sub parseurl {
+    $uri_arg =~ /$uri_regex/;
+    $uri_host = $3;
+    $rw_uri_path = $6 if (defined $6);
+    $uri_path = $rw_uri_path;
+    $rw_uri_path =~ s/^(.*[^\/]|)$/$1\//; # add trailing / if doesn't exist
+    $path_regex = quotemeta($rw_uri_path);
+    domdata();
+}
+
+sub domdata {
+    my $udd_match;
+    open( my $fh, "/etc/userdatadomains" );
+    while(<$fh>) {
+        $udd_match = $_ if ($_ =~ /^$uri_host:/);
+        if ($udd_match) {
+            my @host_data = split(/==|:\s/,$udd_match);
+            $username = $host_data[1];
+            $uid = getpwnam($username);
+            $gid = getgrnam($username);
+            $hta_path = $host_data[5] . "/.htaccess";
+            blockcheck();
+            last;
+        }
+    }
+    if ( not defined $udd_match) {
+        die "[!] Error: Failed to retrieve user data for $uri_host.\n";
+    }
+    close $fh;
+    return ($username, $uid, $gid, $hta_path);
+
+}
+
+sub blockcheck {
+    if (-e $hta_path) {
+        $hta_con = slurp($hta_path);
+        $blocked = 1 if ($hta_con =~ /^##\sStartBlock\s$ticketid((?!EndBlock).)*\^$path_regex\?.*?$ticketid\s##$/gsm);
+    }
+}
+
+sub block {
+    $rewrite = <<"EOF";
+## StartBlock $ticketid ##
+RewriteEngine On
+RewriteCond %{HTTP_HOST} ^(www\.)?$uri_host\$ [NC]
+RewriteRule ^$rw_uri_path?\$ - [R=503,L]
+## EndBlock $ticketid ##
+EOF
+    if (-e $hta_path) {
+        system("/usr/bin/chattr", "-ia", $hta_path);
+        rename($hta_path, "$hta_path.bak." . time());
+    }
+    burp($hta_path, $rewrite, $hta_con);
+    chown $uid, $gid, $hta_path;
+    evalattr();
+    print "[!] New Block Added\nURI: $uri_host/$uri_path\nTicket: $ticketid\nhtaccess: $hta_path\n";
+}
+
+sub unblock {
+    $hta_con =~ s/^##\sStartBlock\s$ticketid((?!EndBlock).)*\^$path_regex\?.*?$ticketid\s##\n//gsm;
+    system("/usr/bin/chattr", "-ia", $hta_path);
+    burp($hta_path, $hta_con);
+    print "[!] Block Removed\nURI: $uri_host/$uri_path\nTicket: $ticketid\nhtaccess: $hta_path\n";
+    evalattr();
+}
+
+sub evalattr {
+    if (-e $hta_path) {
+        $hta_con = slurp($hta_path);
+        if ($hta_con =~ /^##\sStartBlock\s/gsm) {
+            system("/usr/bin/chattr", "+ia", $hta_path);
+        } else {
+            system("/usr/bin/chattr", "-ia",$hta_path);
+        }
+    }
+}
+
+sub help {
+    print q(
+bluri - Block a URI/URL using mod_rewrite rules.
+
+USAGE
+    bluri --block --ticket ABC-123-12345 --uri example.com/path/page.php
+    bluri --unblock --ticket ABC-123-12345 --uri example.com/path/page.php
+
+OPTIONS
+    --help         Print help message.
+    --block        Block provided uri using mod_rewrite/htaccess.
+    --unblock      Remove rewrite rules blocking provided uri.
+    --ticket       Ticket ID involving the blocked uri.
+    --uri, --url   URI/URL to be block/unblocked.
+);
+    exit 0;
+}
+
+sub slurp     {local$/=<>if local@ARGV=@_}
+sub burp      {my($file_name)=shift;open(my $fh,">$file_name")||die "can't create $file_name $!";print $fh @_;}

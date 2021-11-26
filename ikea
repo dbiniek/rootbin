@@ -1,0 +1,39 @@
+#!/usr/bin/python
+#
+# Bootstrap the script and get the latest version
+#
+
+import os.path, sys, shutil, tempfile
+#, tarfile
+from urllib import urlretrieve, urlcleanup
+
+#URL = "http://git.hgfix.net/ikea/ikea.latest"
+
+if __name__ == "__main__":
+    # Do some simple checks and setup the staging area for the script
+    print "[\033[94m!\033[0m] Ikea Version 3.0 ..."
+    print "[\033[94m!\033[0m] Please report all bugs via HL JIRA service desk, assigned to Michael Sutherland."
+    try:
+        try:
+#            tmpdir = tempfile.mkdtemp()
+#            dest = tmpdir + "/latest.tar.gz"
+#            urlcleanup()
+#            urlretrieve(URL, dest)
+#            tar = tarfile.open(dest, "r:gz")
+#            for fname in tar.getnames():
+#                tar.extract(fname, tmpdir)
+#            tmpmdir = "%s/%s" % (tmpdir, "ikeamodules")
+            sys.path.insert(0, '/root/bin/ikeamodules')
+            for file in os.listdir('/root/bin/ikeamodules/'):
+                mod, ext = os.path.splitext(file)
+                if ext == ".py":
+                    exec "import ikeamodules." + mod
+            import ikea
+            ikea.main()
+        except (KeyboardInterrupt, SystemExit):
+            print "[\033[94m!\033[0m] Exiting...!"
+            pass
+            os._exit(1)
+    finally:
+#        shutil.rmtree(tmpdir)
+        pass

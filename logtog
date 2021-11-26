@@ -1,0 +1,414 @@
+#!/bin/bash
+################################################################################
+################################################################################
+#+ logtog - Toggle cPanel archived logging
+#|
+#| Will enable or disable cPanel log archiving for the given user/uid or guess
+#| based on current directory
+#|
+#| @package   logtog
+#| @author    Jon South <jsouth@hostgator.com> (Current maintainer)
+#| @copyright 2011,2012 HostGator.com, LLC
+#| @link http://git.toolbox.hostgator.com/logtog/pages/Home   Home
+#- @link http://git.toolbox.hostgator.com/logtog              GIT Repository
+################################################################################
+################################################################################
+
+LT_VER="1.1"
+LT_TS="20150413.A"
+LT_BASENAME="${0##*/}"
+
+#@ Version banner.
+lt_version() { printf '%s version %s (%s)\n' "$LT_BASENAME" "$LT_VER" "$LT_TS"; LT_BANNER=1; }
+
+#@ Quick usage output.
+lt_usage() {
+  exec >&2; lt_version
+  printf 'Usage: %s [OPTION]... [USER]...\n' "$LT_BASENAME"
+}
+
+#@ Print full help and usage.
+lt_help() {
+  lt_usage; echo "\
+
+Enables archived logging for specified user or the user which owns the current
+directory if no user is specified. Can also disable archived logging.
+
+Miscellaneous:
+  -h, --help    Print this handy help output and exit.
+  --version     Print the version and exit.
+
+  --on          Force logging on. (Default)
+  --off         Force logging off.
+
+Targets:
+  --all           Enables archived logging for all cPanel accounts.
+
+  -u, --user=LIST       Comma separated list of users to toggle.
+  -s, --skip=LIST       Comma separated list of users to skip.
+  -r, --reseller=LIST   Comma separated list of users (including resold
+                        accounts) to toggle.
+
+Output:
+  -c, --color     Force colors in output.
+  -n, --no-color  Disable ANSI color codes in output. Default when output is
+                  redirected (e.g piped to another command).
+
+  -v, --verbose   Increase message output.
+  -q, --quiet     Decrease message output.
+
+Examples:
+  logtog user1
+  logtog user7,user8
+  logtog --reseller twolegit --user twoquit
+  logtog --all --off -qns vipacct
+
+Bug reports and feature requests: https://bugzilla.labs.hostgator.com/
+"
+}
+
+#+ Print quick messages.
+#- @param int $level Log level. Default is 0 (Informational).
+_m() {
+  local l=0 type="$INF"
+  case "$1" in
+   -1) l=1;  type="$VRB"; shift;;   0) l=0;  type="$INF"; shift;;
+    1) l=-1; type="$WRN"; shift;;   2) l=-2; type="$ERR"; shift;;
+  esac
+  (( LT_VERBOSE < l )) && return 0
+  printf '%b %s%b\n' "$type" "$*" "$OFF"
+}
+
+#+ Print an error and exit script.
+#- @param string $message Error message to display.
+_e() { printf '%b %s%b\n' "$ERR" "$*" "$OFF"; exit 1; }
+
+#@ Disables colors.
+_no_colors() { ERR='[!!]'; WRN='[==]'; INF='[++]'; VRB='[??]'; OFF=''; }
+
+#@ Enables colors.
+_yes_colors() {
+  ERR='\e[37;1m[\e[31m!!\e[37m]'      # Error
+  WRN='\e[37;1m[\e[33m==\e[37m]\e[0m' # Warning
+  INF='\e[37;1m[\e[32m++\e[37m]\e[0m' # Information
+  VRB='\e[37;1m[\e[36m??\e[37m]\e[0m' # Verbose
+  OFF='\e[0m' # Stop colors
+}
+
+#@ Cache valid users on start-up.
+lt_cache_users() {
+  local user x uid gid info home shell IFS
+  while IFS=: read -r user x uid gid info home shell; do
+    [[ "$uid" -lt "500" || "${#user}" -gt "16" || "${user:0:1}" == "#" ]] &&
+      continue
+    LT_U_NAM[$uid]="$user"  # UID -> username
+    LT_U_GID[$uid]="$gid"   # UID -> GID
+    LT_U_HOM[$uid]="$home"  # UID -> $HOME
+  done < "/etc/passwd"
+}
+
+#@ Cache valid resellers on-demand.
+lt_cache_resellers() {
+  local oid reseller uid user
+  [[ "$LT_RCACHE" == "1" ]] && return 0
+  [[ ! -f "/etc/trueuserowners" ]] &&
+    _e "Could not read /etc/trueuserowners for reseller information."
+  while IFS=: read -r user reseller; do
+    [[ "${user:0:1}" == "#"  || "$reseller" == " root" ]] && continue
+    reseller="${reseller# }"
+    oid="$(lt_user_to_uid "$reseller")" &&
+      uid="$(lt_user_to_uid "$user")" || continue
+    LT_R_UID[$oid]+=" $uid"
+  done < "/etc/trueuserowners"
+}
+
+#+ Convert a username to uid from cache.
+#| @param string $username Username to convert to id.
+#- @return int|bool UID on success. False otherwise.
+lt_user_to_uid() {
+  local i user="$1"
+  [[ "$user" =~ ^[0-9]+$ && -n "${LT_U_NAM[$user]}" ]] &&
+    printf "$user" && return 0  # Already a UID
+  for i in "${!LT_U_NAM[@]}"; do
+    [[ "${LT_U_NAM[$i]}" == "$user" ]] && printf "$i" && return 0
+  done
+  return 1
+}
+
+#+ Check for cPanel.
+#- Will cause script to exit if cPanel not detected.
+lt_check_cpanel() {
+  [[ "$LT_CPANEL" == "1" ]] && return 0
+  local add="."
+  if [[ ! -f "/usr/local/cpanel/version" ]]; then # Plesk is no bueno
+    [[ -f "/usr/local/psa/version" ]] && add='; this appears to be a plesk system.'
+    lt_version
+    _e "Can only toggle archived logging on cPanel${add}"
+  elif [[ -f "/usr/local/psa/version" ]]; then
+    _e "This system is confused, detected both cPanel and Plesk. Divide by zero."
+  fi
+  LT_CPANEL=1; _m -1 "Verified this is a cPanel system."
+}
+
+#+ Check for valid targets and add them to our array.
+#| Users are validated as they are added and script will exit with error if any
+#| invalid users are listed. Blacklisted users (root, nobody, etc) are simply
+#| ignored.
+#- @param string $targets Comma or space delimited list of targets.
+lt_add_targets() {
+  local n t tt uid IFS=' ,'
+  lt_check_cpanel
+  for tt; do for t in $tt; do
+    case "$t" in
+      "") _m -1 "Empty username passed. Ignoring it."; continue ;;
+      mailman|mailnull|nobody|root|rvadmin|zabbix) _e "You are not allowed to toggle this user: $t" ;;
+    esac
+    uid="$(lt_user_to_uid "$t")" || _e "Not a valid user or id: $t"
+    [[ -n "${LT_U_SKP[$uid]}" ]] &&
+      _m -1 "User is on skip list: $t" && continue
+    [[ -n "${LT_TARGETS[$uid]}" ]] && continue # Already added
+    [[ -f "/var/cpanel/users/${LT_U_NAM[$uid]}" ]] &&
+      LT_TARGETS[$uid]=1 &&
+      _m -1 "Added user to targets: ${LT_U_NAM[$uid]} ($uid)" ||
+      _e "Not a valid cPanel account: $t"
+  done; done
+}
+
+#+ Add valid reseller owned accounts including the reseller.
+#| @see lt_add_targets
+#- @param string $targets Comma or space delimited list of targets.
+lt_add_rtargets() {
+  local n t owned tt uid IFS=' ,'
+  lt_check_cpanel
+  for tt; do for t in $tt; do
+    case "$t" in
+      "") _m -1 "Empty username passed. Ignoring it."; continue ;;
+      mailman|mailnull|nobody|root|rvadmin|zabbix) _e "You are not allowed to specify this user: $t" ;;
+    esac
+    uid="$(lt_user_to_uid "$t")" || _e "Not a valid user or id: $t"
+    owned="${LT_R_UID[$uid]}"
+    [[ -z "$owned" ]] && _e "This account is not a reseller: $t"
+    _m -1 "Adding all accounts owned by: ${LT_U_NAM[$uid]}"
+    lt_add_targets "$owned" # Add resold account UIDs
+    lt_add_targets "$uid"   # We manually add reseller uid just in case
+  done; done
+}
+
+#+ Adds users to the skip list.
+#| Limited validation is done, as this works in tandem with the blacklist.
+#- @param string $targets Comma or space delimited list of targets.
+lt_add_skip_targets() {
+  local t tt uid IFS=' ,'
+  for tt; do for t in $tt; do
+    uid="$(lt_user_to_uid "$t")" || _e "Not a valid user or id: $t"
+    [[ -n "${LT_U_SKP[$uid]}" ]] && continue # Already added
+    LT_U_SKP[$uid]=1
+  done; done
+}
+
+#+ Toggles all valid users for a server.
+#- Preliminary checks will cause this to fail if called on a shared system.
+lt_nuclear_option() {
+  local uid user host="$(hostname 2>/dev/null)"
+
+  [[ "$host" =~ ^gator[0-9]*\.hostgator\.(com|in)(.br|.tr)?$ ||
+     "$host" =~ ^.*\.(websitewelcome\.com|minidedicated\.com|prodns\.com\.br|websitedns\.in|webhostsunucusu\.com|ehost(s)?\.com|ideahost\.com|hostclear\.com)$ ||
+     "$host" =~ ^(br|in|tr|gibo)[0-9]*\.hostgator\.(com|in)(.br|.tr)?$ ||
+     "$host" =~ minidedi[0-9]\.hostgator\.com$ ]] &&
+    _e "You cannot use --all on any shared, reseller, or SEO server."
+  for uid in "${!LT_U_NAM[@]}"; do
+    (( uid < 500 )) && continue
+    user="${LT_U_NAM[$uid]}"
+    [[ "$user" =~ ^(|mail(man|null)|nobody|root|rvadmin|zabbix)$ ]] && continue
+    [[ -f "/var/cpanel/users/${LT_U_NAM[$uid]}" ]] &&
+      LT_TARGETS[$uid]=1 && _m -1 "Added user to targets: ${LT_U_NAM[$uid]} ($uid)"
+  done
+}
+
+#+ Guess an account to toggle from the current directory owner.
+#- @uses lt_add_targets
+lt_guess_target() {
+  local user="$(/usr/bin/stat -c %U . 2>/dev/null || echo "NOSTAT")"
+  case "$user" in
+    NOSTAT) _e "Error trying to stat the current directory. Please manually specify a user." ;;
+    nobody) # Possible DSO mode, we need to be more clever
+      [[ ! "$PWD" =~ ^/home[0-9]*/ ]] &&
+        _e "Cannot guess user you're trying to toggle. Please specify one."
+      user="${PWD#/home*/}"; user="${user%%/*}";
+      _m -1 "Autodetected user extracted from path: $user" ;;
+    root) lt_version; _e "Current directory is owned by root. What's up with that?" ;;
+    *) _m -1 "Autodetected user extracted directory owner: $user" ;;
+  esac
+  lt_add_targets "$user"
+}
+
+#+ Perform a toggle.
+#| When user is toggled, an entry is sent to the system log.
+#| @param int $uid User ID to toggle.
+#- @return True. All errors result in script exit.
+lt_toggle_user() {
+  local uid="$1" config exist=0 file name user value status=0 \
+        word=("DISABLED" "ENABLED")
+
+  user="${LT_U_NAM[$uid]}"; home="${LT_U_HOM[$uid]}"
+  file="${home}/.cpanel-logs"
+  _m -1 "[$user] Processing user $user ($uid)"
+  if [[ -f "$file" ]]; then   # If file exists, check the setting
+    [[ ! -r "$file" ]] && _e "Unable to read config file: $file"
+    exist=1; _m -1 "[$user] Config file already exists: $file"
+    while IFS='=' read -r name value; do
+      if [[ "$name" == "archive-logs" ]]; then
+        status="$value"
+        if [[ "$value" == "1" ]]; then
+          [[ "$LT_TOG_ON" == "1" ]] &&  # Already correct, we can skip
+            _m "[$user] Logging is already enabled; skipping." && return 0
+          _m -1 "[$user] Logging is currently enabled."
+        elif [[ "$value" != "0" ]]; then
+          _m 1 "[$user] Logging is currently set to unknown value: $value"
+        fi
+        break # We already know the value
+      fi
+    done < "$file"
+    if [[ "$status" == "0" ]]; then
+      [[ "$LT_TOG_ON" == "0" ]] &&  # Already correct, we can skip
+        _m "[$user] Logging is already disabled; skipping." && return 0
+      _m -1 "[$user] Logging is currently disabled."
+    fi
+    [[ ! -w "$file" ]] && _e "Config file is not writable: $file"
+  else # No config and not enabled
+    [[ ! -w "$home" ]] && _e "Directory is not writable: $home"
+    _m -1 "[$user] Config file does not exists."
+  fi
+
+  value=0
+  if [[ "$exist" == "1" ]]; then
+    while read -r line; do
+      if [[ "${line:0:12}" == "archive-logs" ]]; then
+        value=1
+        [[ "$LT_TOG_ON" == "0" ]] && continue # Disable
+        config+="archive-logs=1"              # Enable
+      else
+        config+="${line}"                     # Other lines
+      fi
+      config+=$'\n'
+    done < "$file"
+  fi
+
+  [[ "$value" == "0" && "$LT_TOG_ON" == "1" ]] &&
+    config+="archive-logs=1" && config+=$'\n'
+
+  logger -t "logtog" "Archived logging ${word[$LT_TOG_ON]} for $user (uid=${uid})." 2>/dev/null
+  printf '%s' "$config" > "$file" || _e "Error writing to config file: $file"
+  chown "$user": "$file" || _m 1 "Could not change owner of config file."
+
+  [[ "$LT_TOG_ON" == "1" ]] &&
+    _m "[$user] Logging enabled." ||
+    _m "[$user] Logging disabled."
+  return 0
+}
+
+#+ Main function.
+#| Handles arguments and switches, then performs all necessary actions.
+#| @uses lt_add_targets
+#| @uses lt_add_rtargets
+#| @uses lt_add_skip_targets
+#| @param mixed $args Arguments.
+#- @return bool True on success. False otherwise.
+lt_main() {
+  local args user
+
+  # Format our arguments with getopt
+  ! args=$(getopt -n "$LT_BASENAME" -o "chnqr:s:u:v" \
+  -l "all,color,help,off,no-color,on,quiet,reseller:,skip:,user:,verbose,version" \
+  -- "$@") &&
+    lt_help &&
+    exit 1
+
+  eval set -- $args
+
+  # Parse our arguments
+  while true; do
+    case "$1" in
+      -u|--user)      LT_TEMP_T+=" $2"; shift ;;
+      -r|--reseller)  LT_TEMP_R+=" $2"; shift ;;
+      -s|--skip)      LT_TEMP_S+=" $2"; shift ;;
+
+      --all)  LT_TOG_ALL=1 ;;
+      --off)  LT_TOG_ON=0 ;;
+      --on)   LT_TOG_ON=1 ;;
+
+      -c|--color)    _yes_colors ;;  # TEH PRETTY COLORS! ^_^
+      -n|--no-color) _no_colors ;;   # Noooo! Not the pretty colors! >:|
+
+      -v|--verbose) ((LT_VERBOSE++)) ;;
+      -q|--quiet)   ((LT_VERBOSE--)) ;;
+
+      -h|--help)  lt_help;    exit ;;
+      --version)  lt_version; exit ;;
+
+      --) shift; break ;;
+      *) printf "%s: unrecognized option \`%s'\n" "$LT_BASENAME" "$1"
+         lt_help; exit 1 ;;
+    esac
+    shift
+  done
+
+  [[ "$LT_VERBOSE" -gt "3" ]] && LT_VERBOSE=3
+  [[ "$LT_VERBOSE" -gt "1" ]] && lt_version && echo
+  [[ -n "$LT_TEMP_S" ]] && lt_add_skip_targets "${LT_TEMP_S# }"
+
+  if [[ "$LT_TOG_ALL" == "0" ]]; then
+    # Grab our users and resellers
+    [[ -n "$LT_TEMP_T" ]] && lt_add_targets "${LT_TEMP_T# }"
+    [[ -n "$LT_TEMP_R" ]] && lt_cache_resellers && lt_add_rtargets "${LT_TEMP_R# }"
+    [[ -n "$*" ]] && lt_add_targets "$@"
+    # No users specified, grab owner of cwd
+    [[ "${#LT_TARGETS[@]}" == "0" ]] && lt_guess_target
+  else
+    lt_nuclear_option   # Just nuke'em all
+  fi
+
+  [[ "${#LT_TARGETS[@]}" -ne "1" && "$LT_BANNER" == "0" ]] && lt_version && echo
+  [[ "${#LT_TARGETS[@]}" -eq "0" ]] &&
+    _m "Nothing to do, all targets were skipped." && return 0
+  [[ "$LT_TOG_ON" == "1" ]] && _m -1 "Toggle mode: ON" || _m -1 "Toggle mode: OFF"
+
+  for user in "${!LT_TARGETS[@]}"; do
+    lt_toggle_user "$user"  # Do it to it
+  done &&
+    return 0 ||
+    return 1
+}
+
+#### pre-pre-init() ############################################################
+
+[[ "$1" == "-d" || "$1" == "--debug" ]] && PS4='+[\t] ' && shift && set -x
+
+#### pre-init() ################################################################
+
+LT_BANNER=0   # Set when version is displayed
+LT_CPANEL=0   # cPanel
+LT_RCACHE=0   # Resellers cached
+LT_TOG_ON=1   # Toggle mode (ON)
+LT_TOG_ALL=0  # When a single WMD will just not do
+LT_VERBOSE=0  # Verbose level
+
+LT_TEMP_R=""  # Temporary reseller list
+LT_TEMP_S=""  # Temporary skip list
+LT_TEMP_T=""  # Temporary user list
+LT_TARGETS=() # Target array
+
+LT_U_NAM=()   # UID to username array
+LT_U_GID=()   #  "  "  GID array
+LT_U_HOM=()   #  "  "  $HOME array
+LT_R_UID=()   # Reseller array of owned UIDs
+
+LT_U_SKP=()   # Array of UID's to skip
+
+[[ -t "1" ]] && _yes_colors || _no_colors
+
+#### init() ####################################################################
+
+lt_cache_users  &&  # Cache users
+lt_main "$@"    &&  # Enter main loop
+  exit 0 || exit 1

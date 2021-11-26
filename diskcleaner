@@ -1,0 +1,652 @@
+#! /usr/bin/perl
+use strict;
+use warnings;
+
+BEGIN {
+    die "$0: cPanel required\n" unless -d "/var/cpanel/users";
+
+    eval {
+        require File::Find::Rule;
+        require File::Find;
+        require File::Spec;
+        require Log::Log4perl;
+        require Getopt::Long::Descriptive;
+    };
+    if ($@) {
+        print "[!] Missing some perl modules. Installing...\n";
+        for (qw(File::Find::Rule File::Find File::Spec
+             Log::Log4perl Getopt::Long::Descriptive)) {
+            system "/scripts/perlinstaller $_"
+        }
+        print "[*] Installation of new modules complete. Please re-run your command.\n";
+        exit 1;
+    }
+}
+
+use lib '/usr/local/cpanel';
+
+our $VERSION = '1.152530';
+
+use File::Find::Rule;
+use File::Find;
+use File::Spec;
+use Log::Log4perl qw(get_logger);
+# use Getopt::Long qw(GetOptionsFromArray);
+use Getopt::Long::Descriptive;
+
+use Cpanel::PwCache ();
+# Cpanel::PwCache::getuid()
+# Cpanel::PwCache::gethomedir()
+
+use Cpanel::DiskLib ();
+# Cpanel::DiskLib::get_disk_used_percentage()
+
+use Cpanel::Filesys ();
+# Cpanel::Filesys::get_disk_mounts()
+
+our ( $logger, $filesys_info );
+
+# Create Pretty Motion
+my @motion = ( '|', '/', '-', '\\' );
+
+my $motionset = @motion;
+my $motionchar = 0;
+my ( $option, $usage, $repquota );
+
+$|++;
+
+my $logging_config = \q(
+    ###################################################################
+    log4perl.rootLogger=DEBUG, ROOTLOG, ROOTSCREEN
+    log4perl.appender.ROOTLOG=Log::Log4perl::Appender::File
+    log4perl.appender.ROOTLOG.filename = /root/diskclean.log
+    log4perl.appender.ROOTLOG.layout=PatternLayout
+    log4perl.appender.ROOTLOG.layout.ConversionPattern = %d - %-5p - %c - %m%n
+    #------------------------------------------------------------------
+    log4perl.appender.ROOTSCREEN = Log::Log4perl::Appender::ScreenColoredLevels
+    log4perl.appender.ROOTSCREEN.color.WARN = bold yellow
+    log4perl.appender.ROOTSCREEN.color.ERROR = bold red
+    log4perl.appender.ROOTSCREEN.layout = PatternLayout
+    log4perl.appender.ROOTSCREEN.layout.ConversionPattern = [%d] [%-5p] %m%n
+);
+
+Log::Log4perl->init($logging_config);
+
+sub swirl {
+    printf("%s\r", ' ' x 15);
+    if ( $motionchar < $motionset ) {
+        printf("Working: %s  ", $motion[$motionchar++]);
+    } else {
+        $motionchar = 0;
+        swirl();
+    }
+}
+
+sub new {
+    my $class = shift;
+    $class = ref $class if ref $class;
+
+    $logger ||= get_logger();
+
+    my $self = {
+        commands => {
+            diskclean => {
+                package     => __PACKAGE__,
+                description => "Clean out un-needed files.",
+            },
+        },
+    };
+
+    bless $self, $class;
+    return $self;
+}
+
+sub help { diskclean(undef, undef, '-h') }
+sub logger { $logger }
+sub server { return shift->{server} }
+
+sub diskclean {
+    my ( $self, undef, @params ) = @_;
+    local @ARGV = (-a => @params);
+
+    ( $option, $usage ) = Getopt::Long::Descriptive::describe_options(
+        "\n%c %o [disk]",
+        [],
+        [ 'Standard Options:' ],
+        [ 'dryrun|D', "go through the movements, but don't actually remove anything" ],
+        [ 'user|u=s', 'scan the home directory of a single user' ],
+        [ 'all|a', 'attempt to clean all disks' ],
+        [ 'debug|d', 'print more verbose output' ],
+        [ 'help|h', 'print usage message and exit' ],
+        [],
+        [ 'Advanced Options:' ],
+        [ 'percent|p=i', 'maximum percentage of space used', { default => 90 } ],
+        [ 'priority=i', 'cpu priority of this operation', { default => 16 } ],
+        [],
+    );
+    my @dirs = @ARGV;
+
+    print($usage->text), exit if ( $option->help );
+
+    if ($option->user && !getpwnam($option->user)) {
+        $logger->fatal("This user doesn't seem to exist: ".$option->user);
+        exit;
+    }
+
+    for (@dirs) {
+        if (!-d $_) {
+            $logger->fatal("Target doesn't exist or isn't a directory: $_");
+            exit;
+        }
+        if ($_ ne get_mount_point($_)) {
+            $logger->fatal("Target isn't a mount point: $_");
+            exit;
+        }
+    }
+
+    $SIG{INT} = sub {
+        print "\r";
+        exit(1);
+    };
+
+    my $target = $option->all  ? { type => 'all' } :
+                 $option->user ? { type => 'user', name => $option->user } :
+                 @dirs         ? { type => 'dir', dirs => \@dirs } : undef ;
+
+    if ( ! $target ) {
+        $logger->error('Target not defined.');
+        print "\n";
+        print($usage->text), exit;
+    }
+
+    renice($option->priority);
+
+    if ( $target->{type} eq 'user' ) {
+        $target->{location} = Cpanel::PwCache::gethomedir($target->{name});
+        $self->clean_user($target);
+        print "\r";
+    } else {
+        $self->{queue} = ['/home'];
+        foreach my $entry ( @{ $self->{queue} } ) {
+            $logger->info(sprintf("Cleaning: '%s'", $entry));
+            $self->clean_no_uid($entry);
+            $self->clean_restorepl_backups($entry);
+            $self->clean_hg($entry);
+            $self->quickclean($entry);
+            print "\r";
+            $self->clean_files($entry);
+        }
+    }
+}
+
+sub remove_trailing_slash {
+    my $str = shift || return;
+    $str =~ s{/\s*$}{};
+    return $str;
+}
+
+sub get_user_report {
+    my ( $self, $data, $count ) = @_;
+    my $gig = 1024 ** 3;
+    my @report;
+
+    foreach my $user ( sort { $data->{$b}->{space} <=> $data->{$a}->{space} } keys %{$data} ){
+        last unless $count--;
+        push @report, {
+            user => $user,
+            space => ( $data->{$user}->{space} / $gig ),
+        };
+    }
+    return \@report;
+}
+
+sub get_repquota {
+    my ($self, $disk, $refresh ) = @_;
+
+    if ( ! defined $disk ) {
+        $logger->error('Disk not specified for user usage report.');
+        return;
+    }
+
+    $disk = $1 if qx(df -h $disk) =~ m,%\s+(/\S*),;
+
+    if ( $refresh || ! ( defined $repquota && ref $repquota eq 'HASH' ) ) {
+        $logger->debug("Refreshing repquota information for: $disk") if $option->debug;
+        if ( open my $repquota_fh, '-|', qq(repquota -p $disk) ) {
+            while (<$repquota_fh>){
+                next if( m/^(root|mysql)\s/xms );
+                if ( m/^(\w+)\s+ [+-]{2} \s+(\d+)/xms ) {
+                    my $real = ($2 * 1024);
+                    my $user = $1;
+                    $repquota->{$user}->{user} = $user;
+                    $repquota->{$user}->{space} = $real;
+                }
+            }
+            close $repquota_fh;
+        } else {
+            $logger->error("Unable to invoke repquota: $!");
+        }
+    }
+
+    return $repquota;
+}
+
+sub quickclean {
+    my ($self, $disk) = @_;
+
+    if ( ! -e $disk ) {
+        $logger->error("'$disk' does not exist.");
+        return;
+    }
+
+    $self->clean_home_base($disk);
+    $self->clean_xfers($disk);
+    $self->remove_cpanel_tmpfiles($disk);
+    $self->take_out_trash($disk);
+    $self->clean_top_users($disk, 10);
+}
+
+sub clean_user {
+    my ( $self, $user ) = @_;
+    my $gig = 1024 ** 3;
+
+    $user->{space} = $self->get_repquota(get_mount_point($user->{location}))->{$user->{name}}->{space} / $gig;
+
+    $logger->info(sprintf("Checking user: %s ( %.2f )", $user->{name}, $user->{space} ));
+    $logger->info(sprintf("Cleaning: '%s'", $user->{location}));
+
+    my $items_checked = 0;
+    File::Find::Rule->exec(
+        sub {
+            my ( $shortname, $path, $fullname ) = @_;
+            swirl() if ( !($items_checked++ % 100));
+            if ( is_junk($fullname) ) {
+                $self->remove_item($shortname, $path, $fullname);
+            }
+        }
+    )->in($user->{location});
+
+    print "\r";
+    $user->{space} = $self->get_repquota(get_mount_point($user->{location}), 1)->{$user->{name}}->{space} / $gig;
+    print "\n";
+    $logger->info(sprintf("Current space used for '%s' is %.2fG", $user->{name}, $user->{space} ));
+    print "\n";
+}
+
+sub clean_top_users {
+    my ($self, $disk, $count) = @_;
+    $count ||= 10;
+
+    my $data = $self->get_repquota($disk, 1);
+    my $list = $self->get_user_report($data, $count);
+
+    foreach my $entry (@{$list}) {
+        my $user = $entry->{user};
+        my $space = $entry->{space};
+        print "\r";
+        $logger->info(sprintf("Checking user: %s ( %.2f )", $user, $space ));
+        my $items_checked = 0;
+        File::Find::Rule->exec(
+            sub {
+                my ( $shortname, $path, $fullname ) = @_;
+                swirl() if ( !($items_checked++ % 100));
+                if ( is_junk($fullname) ) {
+                    $self->remove_item($shortname, $path, $fullname);
+                }
+            }
+        )->in("$disk/$user");
+    }
+}
+
+sub renice {
+    my $new_priority = shift || return;
+    my $priority = getpriority( 0, 0 );
+    if ( defined $priority ) {
+        $logger->info("Current priority is: $priority");
+        if ( $priority < $new_priority ) {
+            $logger->info(
+                "Attemping to renice to: " . $new_priority );
+            setpriority( 0, 0, $new_priority );
+            if ( getpriority( 0, 0 ) == $new_priority ) {
+                $logger->info('Renice: successful');
+            }
+            else {
+                $logger->warn('Renice: FAILED');
+            }
+        }
+    }
+    else {
+        $logger->warn('Unable to determine current priority.');
+    }
+
+}
+
+sub get_mounts {
+    my @mounts = map { $_->{mount} } values %{get_filesys_usage()};
+    return wantarray ? @mounts : \@mounts;
+}
+
+sub clean_no_uid {
+    my ( $self, $location ) = @_;
+    print "\r";
+    if ( !-e $location ) {
+        $logger->error("'$location' does not exist.");
+        return;
+    }
+
+    $logger->info("Clearing old userdata for accounts that no longer exist.");
+    my $items_checked = 0;
+    File::Find::Rule->maxdepth(1)->mindepth(1)->exec(
+        sub {
+            my ( $shortname, $path, $fullname ) = @_;
+            swirl() if ( !($items_checked++ % 100));
+            $self->remove_item( $shortname, $path, $fullname )
+                unless getpwuid( ( stat($fullname) )[4] );
+        }
+    )->in($location);
+}
+
+sub remove_cpanel_tmpfiles {
+    my ( $self, $target ) = @_;
+
+    if ( ! defined $target ) {
+        $logger->error('Target to remove cPanel tmp files from not defined.');
+        return;
+    }
+
+    if ( !-d $target ) {
+        $logger->error("'$target' does not exist.");
+        return;
+    }
+
+    $logger->debug("Locating cPanel temp files in '$target'") if $option->debug;
+    my @files = glob "$target/*/tmp/Cpanel_Form_file.upload*";
+
+    foreach my $file ( @files ) {
+        $self->remove_item(undef,undef,$file);
+    }
+}
+
+sub take_out_trash {
+    my ( $self, $target ) = @_;
+
+    if ( ! defined $target ) {
+        $logger->error('Target to remove .trash files from not defined.');
+        return;
+    }
+
+    if ( !-d $target ) {
+        $logger->error("'$target' does not exist.");
+        return;
+    }
+
+    $logger->debug("Locating .trash in '$target'") if $option->debug;
+    my @files = glob "${target}/*/.trash/*";
+
+    foreach my $file ( @files ) {
+        $self->remove_item(undef,undef,$file);
+    }
+}
+
+sub clean_home_base {
+    my ( $self, $location ) = @_;
+    my $current_location = $location;
+
+    if ( !-e $current_location ) {
+        $logger->error("'$current_location' does not exist.");
+        return;
+    }
+
+    my $timestamp = time - 86400;
+    print "\r";
+    $logger->info("Cleaning the base of $current_location.");
+    $logger->debug("Checking: $current_location") if $option->debug;
+    my $items_checked = 0;
+    File::Find::Rule->maxdepth(1)->mindepth(1)->exec(
+        sub {
+            my ( $shortname, $path, $fullname ) = @_;
+            swirl() if ( !($items_checked++ % 100));
+            if ( is_junk($fullname) ) {
+                $self->remove_item($shortname, $path, $fullname);
+            }
+        }
+    )->in($current_location);
+
+    print "\r";
+}
+
+sub clean_xfers {
+    my ( $self, $location ) = @_;
+    my $current_location = $location;
+
+    if ( !-e $current_location ) {
+        $logger->error("'$current_location' does not exist.");
+        return;
+    }
+
+    my $timestamp = time - 30 * 86400;
+    print "\r";
+    $logger->info('Clearing old account transfers');
+    $logger->debug("Checking: $current_location") if $option->debug;
+    my $items_checked = 0;
+    File::Find::Rule->maxdepth(1)->mindepth(1)->name('cpmove-*')->mtime("<=$timestamp")->exec(
+        sub {
+            swirl() if ( !($items_checked++ % 100));
+            $self->remove_item(@_);
+        }
+    )->in($current_location);
+
+    $current_location = sprintf( "%s/cprestore", $location );
+    print "\r";
+    $logger->debug("Verifying that '$current_location' is a directory.")
+        if $option->debug;
+    if ( -d $current_location ) {
+        $logger->debug("Checking: $current_location") if $option->debug;
+        File::Find::Rule->maxdepth(1)->mindepth(1)->name('*')->exec(
+            sub {
+                swirl() if ( !($items_checked++ % 100));
+                $self->remove_item(@_);
+            }
+        )->in($current_location);
+    }
+
+    if ( -d "$location/hgtransfer" ) {
+        File::Find::Rule->maxdepth(1)->mindepth(1)->mtime("<=$timestamp")->exec(
+            sub {
+                swirl() if ( !($items_checked++ % 100));
+                $self->remove_item(@_);
+            }
+        )->in("$location/hgtransfer");
+    }
+    print "\r";
+}
+
+sub clean_restorepl_backups {
+    my ( $self, $location ) = @_;
+    print "\r";
+    if ( !-e $location ) {
+        $logger->error("'$location' does not exist.");
+        return;
+    }
+
+    my $cur_ts    = time;
+    my $timestamp = $cur_ts - 90 * 86400;
+
+    $logger->info('Checking for old restore.pl backups');
+    File::Find::Rule->mindepth(1)->maxdepth(1)->name(qr/[a-zA-Z0-9]{4,9}\.back-[0-9]{10}/xms)->exec(
+        sub {
+            my ( $shortname, $path, $fullname ) = @_;
+            $logger->info("Account Backup found: $shortname");
+            $self->remove_item( $shortname, $path, $fullname );
+        }
+    )->in($location);
+    print "\r"
+}
+
+sub clean_hg {
+    my ( $self, $location ) = @_;
+    print "\r";
+    if ( !-e $location ) {
+        $logger->error("'$location' does not exist.");
+        return;
+    }
+
+    my $timestamp = time - 30 * 86400;
+
+    $logger->info("Clearing old HG stuff that is no longer needed");
+    my $items_checked = 0;
+    File::Find::Rule->maxdepth(1)->mindepth(1)->name(
+        qr{
+            hg_php5_sql_backup |
+            mysqlcleanup |
+            MySQL-install |
+            a2migration |
+            myinnodbs |
+            my51upgrade |
+            myrailsfreeze |
+            myIDB.06-15-10 |
+            cpeasyapache |
+            hgrsync
+        }xmsi
+    )->exec(
+        sub {
+            swirl() if ( !($items_checked++ % 100));
+            $self->remove_item(@_);
+        }
+    )->in($location);
+
+    File::Find::Rule->maxdepth(1)->mindepth(1)->file->name('backup-*')->mtime("<=$timestamp")->exec(
+        sub {
+            swirl() if ( !($items_checked++ % 100));
+            $self->remove_item(@_);
+        }
+    )->in($location);
+
+    if ( -d "$location/hgsync_backups" ) {
+        File::Find::Rule->maxdepth(1)->mindepth(1)->mtime("<=$timestamp")->exec(
+            sub {
+                swirl() if ( !($items_checked++ % 100));
+                $self->remove_item(@_);
+            }
+        )->in('$location/hgsync_backups');
+    }
+    print "\r";
+}
+
+sub clean_files {
+    my ( $self, $location ) = @_;
+    if ( !-e $location ) {
+        $logger->error("'$location' does not exist.");
+        return;
+    }
+
+    $logger->info("Starting disk clearing of error_log, core dumps, pureftpd-uplod* files");
+
+    my $dir = File::Spec->rel2abs($location);
+
+    $logger->debug("Scanning: $dir") if $option->debug;
+    my $items_checked = 0;
+    no warnings 'File::Find';
+    find(
+        {   no_chdir => 1,
+            wanted   => sub {
+                swirl() if ( !($items_checked++ % 100));
+
+                if ( $File::Find::name =~ m{^/home\d*/virtfs/}xms || m{^/home\d*/SERVER_BACKUP-}xms ) {
+                    $File::Find::prune = 1;
+                    return;
+                }
+
+                if ( is_junk($File::Find::name) ) {
+                    my $fabs = File::Spec->rel2abs( $File::Find::name, $dir );
+                    $self->remove_item( undef, undef, $fabs );
+                }
+            }
+        },
+        $dir
+    );
+}
+
+sub remove_item {
+    my $self = shift;
+    my ( $shortname, $path, $fullname ) = @_;
+
+    print "\r";
+
+    if ( -d $fullname ) {
+        $logger->info("Removing directory: $fullname");
+        return if $option->dryrun;
+        return(system("rm -rf '$fullname'") >> 8);
+        return;
+    }
+
+    $logger->info("Removing file: $fullname ( @{[human_size(-s $fullname)]} )");
+    return if $option->dryrun;
+    return unlink $fullname;
+}
+
+sub human_size {
+    my $bytes = shift;
+    my $decimals = @_ ? shift : 1;
+
+    if ($bytes > 1024*1024*1024) { sprintf "%.${decimals}fG", $bytes/1024/1024/1024 }
+    elsif ($bytes > 1024*1024) { sprintf "%.${decimals}fM", $bytes/1024/1024 }
+    elsif ($bytes > 1024) { sprintf "%.${decimals}fK", $bytes/1024 }
+    else { $bytes."B" }
+}
+
+sub is_junk {
+    my $file = shift;
+
+    if ( -f $file ) { # regular file checks
+
+        # not trying to remove anything from virtfs
+        return if ( $file =~ m/^\/home\d*\/virtfs\/.*/xms );
+
+        # broken zip files
+        return 1 if ( $file =~ m/.*\.zip\.(tmp\.)?[a-zA-Z0-9]{6}$/xms );
+        return 1 if ( $file =~ m/.*\/zi[a-zA-Z0-9]{6}$/xms );
+
+        # core files
+        return 1 if ( $file =~ m/.*\/core\.[0-9]{1,5}$/xms );
+
+        # pureftp-upload files
+        return 1 if ( $file =~ m/.*\/[.]pureftpd-upload.*$/xms );
+
+        # Error_Logs
+        return 1 if ( $file =~ m{.*/error_log$}xms && ( stat($file) )[7] > 26214400 );
+
+        # WordPress Backup tmp files
+        return 1 if ( $file =~ m{/home\d*/.*?/wp-content/backup/far.*}xms );
+
+        # Cache Files
+        return 1 if ( $file =~ m{.*/cache_xml/.*?[^/]\.txt$}xms );
+
+        # BoxTrapper Logs
+        return 1 if ( $file =~ m{.*/boxtrapper/log/.*[^/]\.log$}xms && ( stat($file) )[7] > 26214400 );
+
+        # smartbackup tmp files
+        return 1 if ( $file =~ m{.*\/smartbackup\/temp\/
+                                 (?: [^/]+- )?                    # optional site prefix
+                                 smartbkp[a-zA-Z0-9]{6}\.tmp$}xms && ( stat($file) )[7] > 26214400 );
+    }
+    elsif ( -d $file ) { # directory checks
+        # Backupbuddy temp files
+        return 1 if ( $file =~ m/.*\/wp-content\/uploads\/backupbuddy_backups\/temp_zip_([a-zA-Z0-9]){10}$/xms );
+        return 1 if ( $file =~ m/.*\/wp-content\/uploads\/backupbuddy_temp\/([a-zA-Z0-9]){10}$/xms );
+
+        # cPanel backup temporary directories
+        return 1 if ( $file =~ m/^\/home\d*\/backup-\d+\.\d+\.\d{4}_\d{2}-\d{2}-\d{2}_[A-Za-z0-9]{3,8}(?:\.\d)?/xms && ( time - ( stat($file) )[9] ) > 86400 );
+
+        # additional cPanel backup temporary directories
+        return 1 if ( $file =~ m,^/home\d*/\d+\.BIN_ADMIN_CPANEL_BACKUP_PL__\.[a-zA-Z0-9]{16}\.tmp$,xms && ( time - ( stat($file) )[9] ) > 86400 );
+    }
+
+    # Passed all junk checks
+    return;
+}
+
+new('main')->diskclean($0, @ARGV);
+print "\r";
+$logger->info("done");
+system df => '-h';

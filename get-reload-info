@@ -1,0 +1,431 @@
+#!/bin/bash
+################################################################################
+# get-reload-info
+# Script to get information for OS Reloads.
+# Confluence: https://confluence.endurance.com/display/HGS2/OS+Reload+Policies 
+# Repo: https://stash.endurance.com/projects/HGADMIN/repos/get-reload-info/browse 
+# Please submit all bug reports at bugs.hostgator.com
+# (C) 2011 - HostGator.com, LLC
+# For Internal Use Only. Not Published.
+################################################################################
+
+SCRIPTNAME="Get Reload Info Script"
+COPYR="2012"
+AUTHOR="Hostgator.Com, LLC."
+MAJ_VER="4"
+MIN_VER="2"
+LUPDATE="20181018"
+FORCEFAIL="0"
+#####################################################
+
+. /etc/init.d/functions
+
+LOG="/backup/RELOADINFO.$(date +%A"__"%F).log"
+touch ${LOG}
+
+basicinfo() {
+#Initial info as well as important info fitting no specific category
+	echo "INITIAL CONFIGURATION INFORMATION:"
+	echo  "Hostname: $(hostname)"
+	echo  "Primary IP: $(hostname -i)"
+	echo  "OS Version: $(< /etc/redhat-release)"
+	echo  "Arch: $(uname -mpi)"
+	echo  "Kernel: $(uname -r)"
+	if [ -f /etc/wwwacct.conf ]
+	then
+		echo "Primary Email: $(grep CONTACTEMAIL /etc/wwwacct.conf | awk '{print $2}')"
+	else
+		echo "/etc/wwwacct.conf DOES NOT EXIST"
+	fi
+	echo "SSH Port: $(sshd -T | grep ^port)"
+	sshkey="ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAvatGle9+LkGfgZt5Qr8Wo/Gsvhs44XLalDE7sL47K5p7BmO8QlohBVXVdiiPxrqIZHLdWDgGi6Hrs5eZHiH1yDaxsqukKBISiyn291Rq0qfCy1URv+m18GQwM4aqotyaaKqWfgonZ4/5qqqgEHmMfSFcok2/zMMEDH35ZfysMmqgG2v3KGIDKb9msj3AXnBRsfjunoLgoc+W+0bNgw5d4/IXdOWVxI5HD9hpQIetZAvZ/MZcnBf5WIQ9ZjHAe8BkiuqD+tFkWcvQCYbHyiOIWGpz9+mUa+CHWFqr5SmCId8EFsT5LPCTtnCKYjE52XKnBWysn+oVEFxZGHrC+S+CcQ=="
+	if grep -v "$sshkey" /root/.ssh/authorized_keys > /dev/null 2>&1
+	then
+		echo 'Custom SSH key(s) exist!'
+	fi
+	if [ -f /usr/local/cpanel/version ]
+	then
+        	echo "cPanel Version: $(cat /usr/local/cpanel/version)"
+	elif [ -d /usr/local/psa ]
+	then
+		echo "SERVER HAS PLESK"
+	fi
+	echo "Localdomains:"
+	if [ -f /etc/localdomains ]
+	then
+		cat /etc/localdomains
+	else
+		echo "/etc/localdomains does not exist"
+	fi
+	echo "Remotedomains:"
+	if [ -f /etc/remotedomains ]
+	then
+		cat /etc/remotedomains
+	else
+		echo "/etc/remotedomains does not exist"
+	fi
+	if [ -d /etc/csf ]
+	then
+	        echo "SERVER HAS CSF INSTALLED"
+	elif [ -d /etc/apf ]
+	then
+		echo "SERVER HAS APF INSTALLED"
+	fi
+	echo "====================================================================="
+	return 0
+}
+
+ipinfo() {
+#Assigned IPs, Nameservers, contents of related files.  
+	echo "Number of Assigned IPs: $(ip addr |grep inet|awk '{print $2}'|grep -Ev "inet6|127.0.0.|^10.|192.168.|::"|wc -l)"
+	echo "DETAILED IP INFORMATION:"
+	ip addr
+	echo "Full IP output is provided only for documentation purposes"
+	echo "Parsed IP addresses"
+	ifconfig|grep inet|egrep -v "inet6|addr:127."|cut -d: -f2|cut -d" " -f1;
+	printf "\n\n"
+	echo "Nameservers: "
+	egrep -i "^ns\ |^ns[0-9]" /etc/wwwacct.conf | awk '$2 {print $2}'
+	echo "Contents of /etc/ips: "
+	if [ -f /etc/ips ]
+	then
+        	cat /etc/ips
+	else
+	       echo "/etc/ips DOES NOT EXIST. IP INFORMATION MAY BE INCOMPLETE."
+	fi
+	echo "RESOLVERS: "
+	if [ -f /etc/resolv.conf ]
+	then
+		grep nameserver /etc/resolv.conf
+	else
+		echo "/etc/resolv.conf does not exist"
+	fi
+		echo "User IPs:"
+	if [ -d /var/cpanel/users ]
+	then
+		/bin/ls /var/cpanel/users/|while read acct
+		do
+	        	echo "${acct} $(grep -i ^ip /var/cpanel/users/${acct}|cut -d= -f2)"
+		done
+	else
+        	echo "/var/cpanel/users/ does not exist"
+	fi
+	if [ -f /etc/reservedips ]
+	then
+        	echo "RESERVED IPS:"
+	        cat /etc/reservedips
+	else
+        	echo "/etc/reservedips DOES NOT EXIST."
+	fi
+	echo "CONTENTS OF SSLDOMAINS:"
+	if [ -f /etc/ssldomains ]
+	then
+		cat /etc/ssldomains
+	else
+		echo "/etc/ssldomains DOES NOT EXIST."
+	fi
+	echo "MAIL IPS:"
+	if [ -f  /etc/mailips ]
+	then
+		cat /etc/mailips
+	else
+	        echo "/etc/mailips DOES NOT EXIST."
+	fi
+	if [ -f /var/cpanel/users/system ]
+	then
+		echo "Domain DNS owned by system instead of a user:"
+		awk -F= '/^DNS/ && $2 {print $2}' /var/cpanel/users/system
+	fi
+	echo "=====================================================================" 
+	return 0
+}
+
+apacheinfo() {
+	echo "APACHE CONFIGURATION:"
+	httpd -V
+	httpd -l
+	httpd -M
+	echo "=====================================================================" 
+	return 0
+}
+
+phpinfo() {
+	echo "PHP CONFIGURATION:"
+	/usr/local/cpanel/bin/rebuild_phpconf --current
+
+	php -v
+	php -m
+	if [ -f /etc/cpanel/ea4/is_ea4 ]
+	then
+		echo "OPT PHP INSTALLS:" $(ls -d /opt/cpanel/ea-php[57][0-9] | awk -F'/' '{print $NF}')
+		for i in $(ls -d /opt/cpanel/ea-php[57][0-9] | awk -F'/' '{print $NF}')
+		do
+			/opt/cpanel/$i/root/usr/bin/php -v
+			/opt/cpanel/$i/root/usr/bin/php -m
+		done
+	else [ -f /opt/php*/bin/php ]
+		echo "OPT PHP INSTALLS:" $(ls -d /opt/php[457][0-9] | awk -F'/' '{print $NF}')
+		for i in $(ls -d /opt/php[457][0-9] | awk -F'/' '{print $NF}')
+		do
+			/opt/$i/bin/php -v
+			/opt/$i/bin/php -m
+		done
+	fi
+
+	echo "====================================================================="
+	return 0
+}
+
+chilisoft() {
+	ps aufx | grep asp-server|grep -v grep 2>&1>/dev/null
+	if [ "$?" -eq "0" ]
+	then
+		echo "SERVER HAS CHILISOFT RUNNING"
+	elif [ -d /opt/casp/ ]
+	then
+		echo "SERVER HAS CHILISOFT ASP DIRECTORY BUT IT IS NOT RUNNING"
+	fi
+	printf "\n\n"
+	return 0
+}
+
+firewallinfo() {
+#Contents of CSF/APF/hgfirewall files if they exist.  
+	if [ -d /etc/csf ]
+	then
+		declare CSF=1
+	else
+		declare CSF=0
+	fi
+	if [ -d /etc/apf ]
+	then
+        	declare APF=1
+	else
+        	declare APF=0
+	fi
+	if [ "${CSF}" -eq "1" ]
+	then
+	        echo "CSF IS INSTALLED"
+		declare -a CSF_CONFS=( csf.conf csf.allow csf.deny csf.ignore )
+	        for FILE in ${CSF_CONFS[*]}
+        	do
+	                if [ -f /etc/csf/${FILE} ]
+                	then
+                	        echo "CONTENTS OF ${FILE}:"
+        	                cat /etc/csf/${FILE}
+	                else
+                        	echo "/etc/csf/${FILE} DOES NOT EXIST"
+                	fi
+        	done
+	fi
+	if [ "${APF}" -eq "1" ]
+	then
+		echo "APF IS INSTALLED"
+		declare -a APF_CONFS=( conf.apf )
+    		for FILE in ${APF_CONFS[*]}
+	    	do
+        		if [ -f /etc/apf/${FILE} ]
+        		then
+	            		echo "CONTENTS OF ${FILE}:"
+        	    		cat /etc/apf/${FILE}
+	        	else
+            			echo "/etc/apf/${FILE} DOES NOT EXIST"
+        		fi
+    		done
+	fi
+	if [ -d "/etc/firewall" ]
+	then
+		for FILE in INCLUDE GLOBAL_DROP IPDROP_GLOBAL INPUT OUTPUT
+		do
+			if [ -s /etc/firewall/${FILE} ]
+			then
+				echo "Contents of /etc/firewall/${FILE}:"
+				cat /etc/firewall/${FILE}
+				printf "\n"
+			fi
+		done
+	fi
+	echo "=====================================================================" 
+	return 0
+}
+
+cpbackups() {
+#Output conents of cpbackup then disable cpanel backups if /etc/cpbackup.conf exists
+        if [ -s /var/cpanel/backups/config ]
+        then
+                echo "Contents of /var/cpanel/backups/config"
+                cat /var/cpanel/backups/config
+                echo "Disabling cPanel Backups"
+                sed -i.config-$(date +%s) "s/BACKUPENABLE: yes/BACKUPENABLE: no/" /var/cpanel/backups/config
+                echo 'Backups Disabled!'
+        else
+                echo "/var/cpanel/backups/config is empty or does not exist"
+        fi
+        echo "====================================================================="
+	if [ -s /etc/cpbackup.conf ]
+	then
+		echo "Contents of /etc/cpbackup.conf" 
+	        cat /etc/cpbackup.conf
+		echo "Disabling cPanel Backups"
+		sed -i.backup-$(date +%s) "s/BACKUPENABLE yes/BACKUPENABLE no/" /etc/cpbackup.conf
+		echo 'cPanel Backups Disabled!'
+	else
+	        echo "/etc/cpbackup.conf is empty or does not exist" 
+	fi
+	echo "====================================================================="
+	return 0
+}
+
+checkcustomstuff() {
+#Check for common things we install. 
+	printf "\n"
+	#ffmpeg
+	if [[ -d /usr/local/hgffmpeg/ ]]
+	then
+		echo "HG FFMPEG INSTALLATION EXISTS  [ /usr/local/hgffmpeg/ ] "
+	#red5
+	elif [[ -d /opt/red5 ]]
+	then
+		echo "HG RED5 INSTALLATION EXISTS [ /opt/red5 ] "
+	#tomcat
+	elif [[ -d /usr/local/apache-tomcat-* ]] || [[ -d /usr/local/jakarta ]]
+	then
+		echo 'TOMCAT APPEARS TO BE INSTALLED!'
+	else
+		echo "Don't see any hg stuff. That doesn't mean there isnt anything though...."
+	fi
+	printf "\n\n"
+	return 0
+}
+
+checkfornonhome() {
+#Checking for users with homedirs outside /home/
+	for NONHOMEUSER in "$(/bin/ls -A /var/cpanel/users |while read line; do grep ${line}: /etc/passwd|sed "s/:/ /g"|awk '{print $1 " " $5}'; done |grep -v /home/)"
+	do
+		if [[ ! -z ${NONHOMEUSER} ]]
+		then
+			echo "[ USER NOT USING /HOME ]: ${NONHOMEUSER}"
+		fi
+	done
+ 	for UNAME in $(/bin/ls -A1 /home)
+	do
+		if [[ -h /home/${UNAME} ]]
+		then
+			echo "SYMBOLIC LINK DETECTED IN /HOME: /home/${UNAME} => $(readlink -e /home/${UNAME})"
+		fi
+	done
+	printf "\n\n"
+	return 0
+}
+
+
+mysqlinfo() {
+#MySQL version, data directory, and users using old passwords.  
+	declare -rx MYSQL=$(which mysql)
+	echo "MySQL Version: $(mysql -V)"
+	if [[ -f /root/.my.cnf ]]
+	then
+		cat /root/.my.cnf
+	        ${MYSQL} --defaults-file=/root/.my.cnf -Bse 'show variables' 2>&1>/dev/null
+        	if grep -q "^old_passwords.*1" /etc/my.cnf
+	        then
+        	        echo 'old_passwords enabled in /etc/my.cnf!!'
+	        else
+        	        echo "old_passwords not enabled"
+	        fi
+        	if [[ "$?" -eq "0" ]]
+	        then
+                	declare -rx MYSQLDATADIR=$(mysql --defaults-file=/root/.my.cnf -Bse 'show variables'|grep datadir|awk '{print $2}'|sed "s/\/$//g") 2>&1>/dev/null
+        	        #Check for old passwords and output users.
+	                if [ ! $(mysql --defaults-file=/root/.my.cnf -BNe 'SELECT COUNT(User) FROM mysql.user WHERE length(Password) <= 16') -eq 0 ]
+        	        then
+                	        echo "Old Passwords found:"
+                        	mysql -BNe 'SELECT User FROM mysql.user WHERE length(Password)<=16' | sort | uniq
+	                else
+        	                echo Old Passwords Not Found
+                	fi
+        	        sleep 5
+	        else
+        	        echo "UNABLE TO CONNECT TO MYSQL - ERROR CODE $? "
+	        fi
+	else
+        	echo "/root/.my.cnf DOES NOT EXIST"
+		${MYSQL} -Bse 'show variables' 2>&1>/dev/null
+	        if [[ "$?" -eq "0" ]]
+        	then
+                	MYSQLDATADIR=$(mysql -Bse 'show variables'|grep datadir|awk '{print $2}'|sed "s/\/$//g") 2>&1>/dev/null
+	                #Check for old passwords and output users.
+        	        if [ ! $(mysql -BNe 'SELECT COUNT(User) FROM mysql.user WHERE length(Password) <= 16') -eq 0 ]
+                	then
+                        	echo "Old Passwords found:"
+	                        mysql -BNe 'SELECT User FROM mysql.user WHERE length(Password)<=16' | sort | uniq
+        	        else
+                        echo Old Passwords Not Found
+                	fi
+                	echo "MySQL Data Directory: ${MYSQLDATADIR}"
+	                sleep 5
+        	else
+                	echo "UNABLE TO CONNECT TO MYSQL - ERROR CODE $? "
+	        fi
+	fi
+	if [[ -h ${MYSQLDATADIR} ]]
+	then
+		echo 'MYSQL DATA DIRECTORY IS A SYMBOLIC LINK!' [$(readlink -e ${MYSQLDATADIR})]
+	fi
+	echo "=====================================================================" 
+	return 0
+}
+
+running_services() {
+	printf "The following Daemons appear to be running. Please take note:\n\n"
+	netstat -npta | awk 'NR>2{print $4 " " $7}' | sed "s/[0-9]*\///g" | sed "s/[0-9].*://g" | grep ^[0-9] |  awk '$0!~"-" {print $1 "\t\t\t" $2}'
+	echo "=====================================================================" 
+	return 0
+}
+
+#Call functions here.
+basicinfo | tee -a ${LOG}
+ipinfo | tee -a ${LOG}
+ainfo=$(apacheinfo) 
+echo "$ainfo" | tee -a ${LOG}
+pinfo=$(phpinfo)
+echo "$pinfo" | tee -a ${LOG}
+chilisoft | tee -a ${LOG}
+checkcustomstuff | tee -a ${LOG}
+cpbackups | tee -a ${LOG}
+checkfornonhome | tee -a ${LOG}
+firewallinfo >> ${LOG} #Because of the amount of data in these files, it is output to the file and not the terminal
+running_services | tee -a ${LOG}
+mysqlinfo | tee -a ${LOG}
+
+#Last step is to make sure the log has been written to as it contains info that was not output to terminal.
+if ! [ -s ${LOG} ]
+then
+	printf "${LOG} COULD NOT BE WRITTEN TO\nIF CSF OR ASP IS INSTALLED, RETRIEVE SETTINGS MANUALLY"
+else 
+	echo "Info logged to ${LOG}"
+fi
+echo 'Notes:'
+printf "  Reload Reason: 
+  
+ OS Reload Form: 
+       HAL Link: 
+ DC Ticket/Task: 
+ GatorBill Link: 
+ Customer Email: 
+    Customer IP: 
+     Package ID: 
+  
+           Node: 
+        Host IP: 
+       Hostname: $(hostname)
+     Primary IP: $(hostname -i)
+  Secondary IPs: $(ifconfig|grep inet|egrep -v "inet6|127."|cut -d: -f2|cut -d" " -f1 | tail -n +2 | awk '{printf $0" "}')
+  Local Backups: $(for user in $(\ls /var/cpanel/users| grep -v system);do find /backup -maxdepth 4 -iname "*$user.tar.gz";done | awk '{printf $0" "}')
+ Remote Backups: 
+     Apache/PHP: $(echo "$ainfo" | awk -F': ' '/Server version/{print $2}') :: $(echo "$pinfo" | awk '/DEFAULT/{print $NF}')
+  Alternate PHP: $(echo "$pinfo" | awk -F': ' '/INSTALLS:/{print $2}')
+  MySQL Version: $(mysql -V | awk -F',' '{print $1}') 
+Custom Software: 
+Get-Reload-Info: 
+          Notes:\n"

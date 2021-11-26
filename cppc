@@ -1,0 +1,2032 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# cPPc - cPanel Privileges and Package Changer
+# 
+# https://confluence.endurance.com/display/HGS2/Migrations%3A+cppc 
+# https://stash.endurance.com/projects/HGADMIN/repos/cppc/browse
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2011 - HostGator.com, LLC
+###########
+#
+# cppc - Assign/Create Packages, set ownership for accounts, etc on cPanel servers
+#
+
+use strict;
+use Getopt::Long qw (:config pass_through);
+use Sys::Hostname;
+use Term::ANSIColor;
+use File::stat;
+use Data::Dumper;
+use Cpanel::Version;
+use JSON;
+
+#
+# Start
+#
+
+my $sethgpkg;
+my $setseopkg;
+my @setreseller;
+my $setpkg;
+my $definepkg;
+my $owner;
+my $quotacheck;
+my $resdetails;
+my @usernames;
+my $help;
+my $remres;
+my $renameuser;
+my $jailshell;
+my $disableshell;
+my $changedomain;
+my $assignrips;
+my $checkips;
+my @setquota;
+my $hostname = Sys::Hostname::hostname;
+my $tokensupport;
+my $token_name;
+my $json;
+my $token;
+my $apic;
+my $currversion = Cpanel::Version::getversionnumber();
+
+#SEO IPs
+my @shared_ips;
+my %rips = ();
+my @free_ips;
+
+#colors
+my $RED = color("red");
+my $YELLOW = color("yellow");
+my $GREEN = color("green");
+my $RESET = color("reset");
+
+GetOptions (
+	'definepkg=s'           => \$definepkg,
+	'setseopkg=i'           => \$setseopkg,
+	'sethgpkg=s'            => \$sethgpkg,
+	'setpkg=s'              => \$setpkg,
+	'customreseller=s{2}'   => \@setreseller,
+	'setquota=s{2}'         => \@setquota,
+	'setowner=s'            => \$owner,
+	'performqc'             => \$quotacheck,
+	'resdetails'            => \$resdetails,
+	'dereseller'            => \$remres,
+	'renameuser=s'          => \$renameuser,
+	'jailshell'             => \$jailshell,
+	'disableshell'          => \$disableshell,
+	'changedomain=s'        => \$changedomain,
+	'seoify'                => \$assignrips,
+	'checkips'              => \$checkips,
+	'help'                  => \$help
+);
+
+if ($help) {
+	help();
+}
+
+#
+# Simple checks
+#
+if (!-s "/usr/local/cpanel/cpanel") {
+	print "[!] No cPanel detected on the server. None of the functions will work.\n";
+	exit 1;
+}
+
+#cPanel ships with PublicAPI 2.2 in v70+;shared farm is now v70+
+if (($currversion < 11.64 || $currversion >= 11.70) && eval {require cPanel::PublicAPI;} ){
+	require cPanel::PublicAPI;
+	if ( $currversion > 11.64 && $cPanel::PublicAPI::VERSION < 2.2 ) {
+		die "[!] cPanel::PublicAPI out of date, please ensure 2.2 or greater for API Token support";
+	}
+} elsif (eval {require '/usr/local/share/perl5/cPanel/PublicAPI.pm';}) {
+	require '/usr/local/share/perl5/cPanel/PublicAPI.pm';
+	if ( $currversion > 11.64 && $cPanel::PublicAPI::VERSION < 2.2 ) {
+		die "[!] cPanel::PublicAPI out of date, please ensure 2.2 or greater for API Token support";
+	}
+} else {
+	print "[!] Failed to load the necessary modules for this script to function properly. Please install cPanel::PublicAPI via '/scripts/perlinstaller cPanel::PublicAPI'\n";
+	exit 1;
+}
+
+sub help {
+	print "${RED}c${RESET}${GREEN}PP${RESET}${RED}c${RESET} - cPanel Privileges and Package Changer v1.6\n\n";
+	print "Usage: cppc [with a combination of the switches below]:\n\n";
+	print <<END;
+HG options:
+
+${RED}--sethgpkg${RESET}          ${GREEN}Set${RESET} the account(s) to a Hostgator package. Required Args:
+					[special|aluminum|copper|silver|gold|diamond|(cloud_)hatchling|(cloud_)baby|(cloud_)business] <username or filename> (file should contain a list of users)
+					Note: Using this with hatching/baby/business packages will automatically update the ownership to root.
+
+${RED}--setseopkg${RESET}         ${GREEN}Set${RESET} the account(s) to a SEOhosting package. Required Args:
+					[X] <username or filename> (file should contain a list of users)  
+					Where '[X]' is the number of C-Class IPs the package is for.${RESET}
+
+Custom/non-hg options:
+
+${RED}--customreseller${RESET}    ${GREEN}Assign${RESET} the account(s) reseller privileges with the specified limits. Required Args:
+					[Disk space limit]M/G [Bandwidth limit]M/G <username to assign reseller privileges to>.
+					Note: There is no 'unlimited' option on this.
+
+${RED}--setpkg${RESET}            ${GREEN}Assign${RESET} the account(s) to the specified package. Required Args:
+					[Package on the server. Can be any valid package within /var/cpanel/packages/] <username or filename> (file should contain a list of users) 
+
+Other options:
+
+${RED}--setowner${RESET}          ${GREEN}Assign${RESET} the account(s) to the specified owner. Required Args:
+					[Username of the new owner of the account] <username or filename> (file should contain a list of users) 
+
+${RED}--performqc${RESET}         ${GREEN}Perform${RESET} a Quota-check on the account(s). Required Args:
+					[username or filename] (file should contain a list of users) 
+${RED}--resdetails${RESET}        ${GREEN}Displays${RESET} details about all of the accounts under a reseller account. Required Args:
+					[Reseller username or filename] (file should contain a list of reseller username)
+${RED}--setquota${RESET}          ${GREEN}Resets${RESET} the quota limits on the specified user. If a reseller username is provided,
+					it will prompt you to reset all of the account under that reseller. Required Args:
+					[Disk space limit]M/G [Bandwidth limit]M/G <username or filename> (file should contain a list of users)
+					
+
+Advanced:
+
+${RED}--definepkg${RESET}         ${YELLOW}Define${RESET} a package with the limits specified. The arguments must be passed in a single quote enclosed string.
+					"name=<package name>,bwlimit=<number>,quota=<number>,[various other package options]" (They must be comma seperated)
+					The bwlimit and quota are specified in MB.
+					PLEASE be sure to read over the full documentation for this switch if you are not sure of the options.
+
+${RED}--dereseller${RESET}        ${YELLOW}Remove${RESET} the reseller privileges from the specified account(s).
+					[username or filename] (file should contain a list of users) 
+
+${RED}--renameuser${RESET}        ${YELLOW}Change${RESET} the username on an account to the new username given. This switch is limited to work on single usernames - if a list is passed, it will error out. Required Args:
+					[New username] <current username>
+
+${RED}--changedomain${RESET}      ${YELLOW}Change${RESET} the primary domain on an account to the domain given. This switch is limited to work on single usernames - if a list is passed, it will error out. Required Args:
+					[New domain] <username being changed>
+
+${RED}--jailshell${RESET}         ${YELLOW}Enables${RESET} jailshell on the accounts. Note: Unlike the chatshell command, this does not toggle the access (i.e., it won't disable jailshell on an account that has it enabled already, etc). Required Args:
+					[username or filename] (file should contain a list of users)
+
+${RED}--disableshell${RESET}      ${YELLOW}Disables${RESET} shell access on the accounts. Required Args:
+					[username or filename] (file should contain a list of users)
+					
+SEO options:
+
+
+${RED}--checkips${RESET}          ${GREEN}Checks${RESET} the "reserved" ips on an SEO and Reseller servers. Reports any IPs are that are assigned to accounts that have been suspended for more than 30 days, have expired SSL certificates or simply don't exist.
+					[No Arguments]
+${RED}--seoify${RESET}            ${GREEN}Assigns${RESET} random IPs to accounts under the specified reseller account(s). It tries to not assign accounts to the same IPs, 
+					but this is not always possible due to the number of IPs available on the server. Required Args:
+					[Reseller username or filename] (file should contain a list of reseller username)
+					NOTE: This will process all users under an account, so if you are trying only update a specific subset of the users, then make the changes manually.
+
+See the full documentation here: https://confluence.endurance.com/display/HGS/Script%3A+cppc 
+END
+	exit 1;
+}
+
+if (not ($definepkg or $checkips) && ($#ARGV != 0)) {
+	#only time a user or userlist isn't required is when they are defining a package or checking seo ips
+	print "[!] Unknown option passed. Please see --help\n";
+	exit 1;
+}
+
+#setup the cpanel api connection
+#Remove stale tokens and generate the API Token if cPanel and >= 64.
+if ( $currversion >= 11.64 ){
+	#Remove stale tokens
+	stale_tokens();
+	#Clean up the API Token before exit
+	END{
+		if($token_name){
+			`whmapi1 api_token_revoke token_name=$token_name`
+		}
+	}
+	my $token_list = `whmapi1 api_token_list --output=json`;
+	my $listjson = from_json($token_list);
+	my $current_time = time();
+	$token_name = "cppc_".time();
+	$json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+	$token = from_json($json)->{'data'}{'token'};
+	$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0', 'api_token' => $token );
+	my $revoked;
+	$SIG{INT} = sub { 
+		unless ($revoked) {
+			$revoked = 1;
+			fork or exec('whmapi1', 'api_token_revoke', "token_name=$token_name");
+		}
+		die "Interrupted"
+	};
+} elsif ( $currversion < 11.64 && !-s "/root/.accesshash" ) {
+	$ENV{'REMOTE_USER'} = 'root';
+	system('/usr/local/cpanel/bin/realmkaccesshash');
+	$apic = $apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+} else {
+	$apic = $apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+}
+
+#Define package is special, so check for it first. If it isn't passed, then just call main for the rest of the options.
+if ($definepkg) {
+	definepkg($definepkg);
+}
+
+if ($checkips) {
+	checkips();
+}
+main();
+
+sub main {
+
+	if (!scalar(@ARGV)) {
+		return;
+	}
+
+	if (-s $ARGV[0] && !-d $ARGV[0]) {
+		#if the argument passed is a file then read it and load up the usernames.
+		open my $userlist, '<', $ARGV[0];
+		while (my $user = readline $userlist) {
+			chomp $user;
+			if (-s "/var/cpanel/users/$user") {
+				print "[*] Added '$GREEN$user$RESET' to be processed...\n";
+				push (@usernames, $user);
+			} else {
+				print "[!] '$RED$user$RESET' was not added, as it does not exist on the server.\n";
+			}
+		}
+		close $userlist;
+	} else {
+		#lonely push
+		my $user = $ARGV[0];
+		chomp $user;
+		if (-s "/var/cpanel/users/$user") {
+			print "[*] Added '$GREEN$user$RESET' to be processed...\n";
+			push (@usernames, $user);
+		} else {
+			print "[!] '$RED$user$RESET' was not added, as it does not exist on the server.\n";
+		}
+	}
+
+	print "\n";
+
+	if ($sethgpkg) {
+		sethgpkg($sethgpkg);
+	}
+
+	if ($setseopkg) {
+		setseopkg($setseopkg);
+	}
+
+	if (scalar(@setreseller) == 2) {
+
+		for (my $i = 0; $i < 2; $i++) {
+			if (not $setreseller[$i] = convert_quota($setreseller[$i])) {
+				print "[!] Improper Input.\n";
+				return;
+			}
+		}
+		setresellercustom(@setreseller);
+	}
+
+	if (scalar(@setquota) == 2) {
+
+		for (my $i = 0; $i < 2; $i++) {
+			if (not $setquota[$i] = convert_quota($setquota[$i])) {
+				print "[!] Improper Input.\n";
+				return;
+			}
+		}
+		setquota(@setquota);
+	}
+
+	if ($assignrips) {
+		assignrandomips();
+	}
+
+	if ($setpkg) {
+		setpkg($setpkg);
+	}
+
+	if ($owner) {
+		setowner($owner);
+	}
+
+	if ($jailshell) {
+		jailshell();
+	}
+
+	if ($disableshell) {
+		disableshell();
+	}
+
+	if ($resdetails) {
+		resdetails();
+	}
+
+	if ($quotacheck) {
+		quotacheck();
+	}
+
+	if ($remres) {
+		remres();
+	}
+
+	if ($renameuser) {
+		renameuser($renameuser);
+	}
+
+	if ($changedomain) {
+		changedomain($changedomain);
+	}
+}
+
+sub stale_tokens {
+	my $token_list = `whmapi1 api_token_list --output=json`;
+	my $listjson = from_json($token_list);
+	my $current_time = time(); 
+	if ($currversion >= 11.68){ 
+		foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+			if( $token_name =~ /cppc_/ ){
+				my $token_time = $token_name;
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_name`;
+				}
+			}
+		}
+	} else {
+		foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+			if( $token_data->{'name'} =~ /cppc_/ ){
+				my $token_time = $token_data->{'name'};
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+				}
+			}
+		}
+	}
+}
+
+sub definepkg {
+	
+	my $string = shift;
+	my %parsed   = split (/,|=/, $string);
+
+	my %opts = (
+		'name'             => 'none',
+		'featurelist'      => 'default',
+		'quota'            => '100M',
+		'ip'               => '0',
+		'cgi'              => '1',
+		'frontpage'        => '1',
+		'cpmod'            => 'x3',
+		'language'         => '',
+		'maxftp'           => 'unlimited',
+		'maxsql'           => 'unlimited',
+		'maxpop'           => 'unlimited',
+		'maxlists'         => 'unlimited',
+		'maxsub'           => 'unlimited',
+		'maxpark'          => 'unlimited',
+		'maxaddon'         => 'unlimited',
+		'hasshell'         => '0',
+		'bwlimit'          => 'unlimited'
+	);
+
+	if (not exists($parsed{'name'}))    { print "[!] No 'name' passed for the Package. This is required.\n"; return; }
+	if (not exists($parsed{'bwlimit'})) { print "[!] No 'bwlimit' passed for the Package. This is required.\n"; return; }
+	if (not exists($parsed{'quota'}))   { print "[!] No 'quota' passed for the Package. This is required.\n"; return; } 
+
+	while( my ($k,$v) = each(%parsed) ) {
+		if (exists($opts{$k})) {
+			$opts{$k} = $v;
+		} else {
+			print "[!] Unknown option passed '$k'... skipping.\n";
+			next;
+		}
+	}
+
+	my $response = $apic->whm_api('addpkg', \%opts, 'json');
+	my $output = from_json($response);
+	if ($output->{'metadata'}->{'result'} == 1) {
+		print "[+] Package successfully created: '$GREEN". $output->{'result'}->{'pkg'} . "$RESET'\n";
+		return 1;
+	} else {
+		print "[!] Failed to created package. cPanel said:\n";
+		print $output->{'metadata'}->{'reason'}."\n";
+		return;
+	}
+}
+
+sub resdetails {
+
+	foreach my $user (@usernames) {
+		if (not isreseller($user)) {
+			print "[!] '$RED$user$RESET' does not have reseller priviliges assigned.\n";
+			next;
+		}
+		print "Reseller Information for '$GREEN$user$RESET'\n";
+		my $totalbwused;
+		my $totaldsused;
+		my @subaccounts = process_reseller($user);
+		push @subaccounts, $user;
+		format STDOUT_TOP =
+|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Username    |          Package          |     BW Used    |     BW Limit    |   Disk Used     |    Disk Limit     |     Primary Domain            |               IP Address |
+|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+.
+
+		foreach my $sub (@subaccounts) {
+			my $userinfo = accountsummary($sub);
+			my $bwused  = "$userinfo->{'bwused'} $userinfo->{'bwunit'}";
+			if ($userinfo->{'bwunit'} eq 'MB') {
+				$totalbwused += $bwused;
+			} elsif ($userinfo->{'bwunit'} eq 'GB') {
+				$totalbwused += $bwused * 1024;
+			}
+			
+			my $bwlimit = "$userinfo->{'bwlimit'} $userinfo->{'bwunit'}";
+			my $user_color;
+			if ($userinfo->{'bwused'} >= $userinfo->{'bwlimit'}) {
+				$user_color = $RED;
+			} else {
+				$user_color = $GREEN;
+			}
+
+			my $diskused = $userinfo->{'diskused'};
+			$diskused =~ s/\D//;
+			my $disklimit = $userinfo->{'disklimit'};
+			$disklimit =~ s/\D//;
+			$totaldsused += $diskused;
+
+			if ((not ($disklimit eq 'unlimited' or $disklimit == 0)) and $diskused > $disklimit) {
+				$user_color = $RED;
+			}
+			my $ip = $userinfo->{ip};
+			if (isdedicatedip($ip)) {
+				$ip = "(Dedi) $ip";
+			}
+
+			my $domain = $userinfo->{'domain'};
+			if ($userinfo->{'suspended'}) {
+				$domain = "(Suspended) $domain";
+			}
+
+format STDOUT =
+|@* @<<<<<<<<< @* | @|||||||||||||||||||||||| |  @|||||||||||| | @|||||||||||||| | @|||||||||||||  |  @||||||||||||    |  @||||||||||||||||||||||||||| | @>>>>>>>>>>>>>>>>>>>>>>> |
+$user_color,$sub,$RESET,$userinfo->{'plan'},$bwused,$bwlimit,$userinfo->{'diskused'},$userinfo->{'disklimit'},$domain,$ip
+.
+			write;
+		}
+		my @rquota = resellerquota($user); 
+		print "|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|\n";
+		print "| Reseller Stats: $GREEN$user$RESET\tBW Used: $GREEN$totalbwused$RESET MB, BW allocated: $RED$rquota[3]$RESET MB, BW Limit: $GREEN$rquota[2]$RESET MB \tDisk used: $GREEN$totaldsused$RESET MB, Disk allocated: $RED$rquota[1]$RESET MB, Disk Limit: $GREEN$rquota[0]$RESET MB\n";
+		print "|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|\n";
+	}
+}
+
+sub remres {
+
+	foreach my $user (@usernames) {
+		if (isreseller($user)) {
+			my @subaccounts = process_reseller($user);
+			my $response    = $apic->whm_api('unsetupreseller', { 'user' => $user }, 'json');
+			my $output      = from_json($response);
+			if ($output->{'metadata'}->{'result'} == 1) {	
+				print "[+] Reseller priviliges successfully removed from '$GREEN$user$RESET'.\n";
+				if (scalar(@subaccounts)) {
+					print "[!] '$GREEN$user$RESET' owned the followed the accounts:\n";
+					foreach my $user (@subaccounts) {
+						print "\t".$RED.$user.$RESET."\n";
+					}
+				}
+			} else {
+				print "[!] Failed to remove reseller priviliges from $user. Please check why, here is the raw reason cPanel gave:\n\n";
+				print $output->{'metadata'}->{'reason'}."\n\n";
+			}
+		}
+	}
+}
+
+sub process_reseller {
+
+	my $reseller = shift;
+	my $resregex = "^$reseller\$";
+	my $response = $apic->whm_api('listaccts', { 'searchtype' => "owner", 'search' => $resregex }, 'json');
+	my $output   = from_json($response);
+	my @subaccounts;
+
+	if (ref($output->{'data'}->{'acct'}) eq 'ARRAY') {
+		foreach my $obj (@{$output->{'data'}->{'acct'}}){
+			my $tempu = $obj->{'user'};
+			if (!($reseller eq $tempu)) {
+				push (@subaccounts, $tempu);
+			}
+		}
+	} else {
+		return @subaccounts;
+	}
+
+	@subaccounts = sort @subaccounts;
+
+	return @subaccounts;
+}
+
+sub quotacheck {
+	my %overquota;
+
+	foreach my $user (@usernames) {
+		my $ret = quotachecker($user, 2);
+		if ($ret == 2) {
+			$overquota{$user} = 'Disk Quota Exceeded';
+		} elsif ($ret == 3) {
+			$overquota{$user} = 'Bandwidth Quota Exceeded';
+		} elsif ($ret == 5) {
+			$overquota{$user} = 'Disk and Bandwidth Quotas Exceeded.';
+		}
+	}
+
+	if (scalar(keys %overquota)) {
+		print "\n[!] Accounts that are over quota (disk/bandwidth):\n";
+		foreach my $u (sort keys %overquota) {
+			print "\t${RED}$u${RESET} - $overquota{$u}\n";
+		}
+	}
+}
+
+sub quotachecker {
+
+	my $user = shift;
+	my $processowner = shift;
+	my $srvtype = servertype();
+
+	if ($user =~ m/^root$/i) {
+		print "[+] ${GREEN}Root${RESET} does not have quotas.\n";
+		return 0;
+	}
+
+	my $userinfo = accountsummary($user);
+	if (not $userinfo) {
+		print "[!] Failed to fetch account details for '$RED$user$RESET'\n";
+		return 0;
+	}
+
+	my $disklimit = $userinfo->{'disklimit'};
+	my $diskused  = $userinfo->{'diskused'};
+	my $owner     = $userinfo->{'owner'};
+	my $plan      = $userinfo->{'plan'};
+	my $overquota = ($diskused > $disklimit) ? 1 : 0;
+
+	#some checks
+	if ($disklimit eq 'unlimited' or $disklimit == 0) {
+		$disklimit = 99999999;
+		$overquota = 0;
+	}
+
+	my $quotacheck = 100 - (($diskused/$disklimit) * 100);
+	my $quotacolor;
+	if ($quotacheck > 75) { $quotacolor = $GREEN; } else { $quotacolor = $YELLOW; }
+	if ($quotacheck < 25) { $quotacolor = $RED; }
+
+	#quota check
+	my $retstatus = 0;
+	if ($processowner != 1) {
+		if ($overquota) {
+			print "\n[!] Disk Quota: $RED$user$RESET is OVER quota: $diskused/$disklimit.\n";
+			$retstatus += 2;
+		} else {
+			print "\n[+] Disk Quota: $GREEN$user$RESET is not over quota. $quotacolor". sprintf("%.2f", $quotacheck)."%$RESET is free.\n";
+		}
+	}
+
+	#bandwidth check
+	my $bwlimit = $userinfo->{'bwlimit'};
+	my $bwused  = $userinfo->{'bwused'};
+	my $bwunit  = $userinfo->{'bwunit'};
+
+	if ($processowner != 1) {
+		if ($bwused >= $bwlimit and $bwlimit ne 'unlimited') {
+			print "[!] Bandwidth Quota: $RED$user$RESET is over bandwidth quota: $bwused/$bwlimit $bwunit.\n";
+			$retstatus += 3;
+		} else {
+			print "[+] Bandwidth Quota: $GREEN$user$RESET is not over bandwidth quota: $bwused/$bwlimit $bwunit.\n";
+		}
+	}
+
+	print "[+] Package for $GREEN$user$RESET is: $GREEN$plan$RESET\n";
+
+	#owner check.
+	if ($srvtype eq "reseller" || $srvtype eq "seo" ) {
+		if ($owner eq "root") {
+			print "\t[!] The owner of the account is 'root' on a Reseller server.\n";
+		}
+	} elsif ($srvtype eq "shared") {
+		if (!($owner eq "root")) {
+			print "\t[!] The owner of the account is NOT 'root' on a shared server.\n";
+		}
+		if ($plan !~ /^(special|aluminum|copper|silver|gold|diamond|((cloud )?(hatchling|baby( croc)?|business))(_unlimited)?|startup|pro|personal)$/i) {
+			print "$RED"."WARNING"."$RESET:\n";
+			print "\t[!] The Package plan assigned to the account is '$plan'. It should be Hatchling, Baby, Business, Startup, Pro, or Personal.\n";
+		}
+	}
+
+	if ($processowner && isreseller($owner)) {
+		print "\n[*] Reseller Quota Check:\n"; 
+		my @rquota = resellerquota($owner);
+		if (scalar(@rquota) != 4) {
+			print "\t[!] Failed to parse Reseller stats for '$owner'.\n"; print @rquota;
+		} else {
+			if ($rquota[1] > $rquota[0]) {
+				print "\t[!] The owner of '$user', '$RED$owner$RESET', is over disk usage quota.\n";
+			} elsif ($rquota[3] > $rquota[2]) {
+				print "\t[!] The owner of '$user', '$RED$owner$RESET', is over bandwidth usage quota.\n";
+			} else {
+				print "\t[+] '$GREEN$owner$RESET' is not over quota.\n";
+			}
+		}
+	} elsif ($processowner && !($owner eq "root")) {
+		print "\t[!] The current owner of the account, '$owner', does NOT have Reseller privileges assigned.\n";
+	}
+
+	return $retstatus;
+}
+
+sub accountsummary {
+
+	my $user = shift;
+	my $return;
+
+	my $response = $apic->whm_api('accountsummary', { 'user' => $user }, 'json');
+	my $output = from_json($response);
+
+		if (not ($output and $output->{'metadata'}->{'result'} == 1)) {
+		print "[!] cPanel API call failed to fetch account details for '$RED$user$RESET'\n";
+		return undef;
+	}
+
+	$return->{'disklimit'} = $output->{'data'}->{'acct'}[0]{'disklimit'};
+	$return->{'diskused'}  = $output->{'data'}->{'acct'}[0]{'diskused'};
+	$return->{'owner'}     = $output->{'data'}->{'acct'}[0]{'owner'};
+	$return->{'plan'}      = $output->{'data'}->{'acct'}[0]{'plan'};
+	$return->{'maxaddon'}  = $output->{'data'}->{'acct'}[0]{'maxaddons'};
+	$return->{'maxsql'}    = $output->{'data'}->{'acct'}[0]{'maxsql'};
+	$return->{'maxpop'}    = $output->{'data'}->{'acct'}[0]{'maxpop'};
+	$return->{'shell'}     = $output->{'data'}->{'acct'}[0]{'shell'};
+	$return->{'suspended'} = $output->{'data'}->{'acct'}[0]{'suspended'};
+	$return->{'suspres'}   = $output->{'data'}->{'acct'}[0]{'suspres'};
+	$return->{'domain'}    = $output->{'data'}->{'acct'}[0]{'domain'};
+	$return->{'ip'}        = $output->{'data'}->{'acct'}[0]{'ip'};
+	
+	
+	#bandwidth check
+	$response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'StatsBar', 'func' => 'stat', 'user' => $user, }, { 'display' => 'bandwidthusage'}, 'json');
+	$output = from_json($response);
+
+	$return->{'bwlimit'} = $output->{'cpanelresult'}->{'data'}->[0]->{'_max'};
+	$return->{'bwused'}  = $output->{'cpanelresult'}->{'data'}->[0]->{'_count'};
+	$return->{'bwunit'}  = $output->{'cpanelresult'}->{'data'}->[0]->{'units'};
+
+	return $return;
+}
+
+sub resellerquota {
+
+	my $reseller = shift;
+	my @output;
+
+	my $response = $apic->whm_api('resellerstats', { 'user' => $reseller }, 'json');
+	my $output = from_json($response);
+
+	my $totaldquota = $output->{'data'}->{'reseller'}->{'diskquota'};
+	my $totaldusage = $output->{'data'}->{'reseller'}->{'totaldiskalloc'};
+	my $totalbquota = $output->{'data'}->{'reseller'}->{'bandwidthlimit'};
+	my $totalbusage = $output->{'data'}->{'reseller'}->{'totalbwalloc'};
+
+	push (@output, $totaldquota);
+	push (@output, $totaldusage);
+	push (@output, $totalbquota);
+	push (@output, $totalbusage);
+
+	return @output;
+}
+
+sub setowner {
+
+	my $owner = shift;
+
+	if (($owner !~ m/^root$/i) and !isreseller($owner)){
+		print "[!] $RED$owner$RESET is not listed as a Reseller account on the server.\n";
+		return;
+	}
+
+	if (check_owners(\@usernames)) {
+		foreach my $user (@usernames) {
+			ownerset($owner, $user);
+			quotachecker($user, 0);
+		}
+	} else {
+		return;
+	}
+
+	quotachecker($owner, 1);
+}
+
+sub check_owners {
+
+	my $users = shift;
+	my $check_users;
+	foreach my $user (@{$users}) {
+		my $response = $apic->whm_api('accountsummary', { 'user' => $user }, 'json');
+		my $output = from_json($response);
+		my $cowner = $output->{'data'}->{'acct'}[0]{'owner'};
+
+		if (!($cowner eq "root") && !($cowner eq $owner) && isreseller($cowner)) {
+			$check_users->{$user} = $cowner;
+		}
+	}
+
+	if (keys %{$check_users}) {
+		print "[!] Ownership conflicts found (username : current owner)\n";
+		grep {print "\t".$RED.$_.$RESET.' : '.$check_users->{$_}."\n" } (keys %{$check_users});
+		print "[*] Proceed anyway? y/n - ";
+		chomp (my $answer = <STDIN>);
+		if ($answer eq 'y') {
+			return 1;
+		}
+		return;
+	} else {
+		return 1;
+	}
+}
+
+sub ownerset {
+
+	my $owner = shift;
+	my $user  = shift;
+
+	my $response = $apic->whm_api('modifyacct', { 'user' => $user, 'owner' => $owner, 'HG' => 1 }, 'json');
+	if (not $response) {
+		print "[!] cPanel's API call failed. Please perform this action manually.\n";
+		return 0;
+	}
+	my $output = from_json($response);
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		print "[+] Ownership of '$GREEN$user$RESET' successfully changed to '$owner'\n";
+		return 1;
+	} else {
+		print "[!] Ownership change failed for '$RED$user$RESET'. cPanel said:\n";
+		print $output->{'metadata'}->{'reason'}."\n";
+		return 0;
+	}
+}
+
+sub renameuser {
+
+	my $newuser = shift;
+	if (scalar(@usernames) > 1) {
+		print "[!] --renameuser can only be run on a single user. Using it against a list is not allowed.\n";
+		return 1;
+	}
+
+	my $curuser = $usernames[0];
+	my $response = $apic->whm_api('modifyacct', { 'user' => $curuser, 'newuser' => $newuser, 'HG' => 1 }, 'json');
+	if (not $response) {
+		print "[!] cPanel's API call failed. Please perform this action manually.\n";
+		return 0;
+	}
+	my $output = from_json($response);
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		print "[+] '$GREEN$curuser$RESET' successfully renamd to '$newuser'\n";
+		return 1;
+	} else {
+		print "[!] '$RED$curuser$RESET' - failed to rename the account. cPanel said:\n";
+		print $output->{'metadata'}->{'reason'}."\n";
+		return 0;
+	}
+}
+
+sub jailshell {
+
+	foreach my $user (@usernames) {
+		#this will never happen cause, this stuff is already checked for in the username parser code in main(), but just in case of fun:
+		if ($user eq "root") {
+			print "[!] You can not change root's shell access. This is not allowed.\n";
+			return 0;
+		}
+
+		my $response = $apic->whm_api('modifyacct', { 'user' => $user, 'shell' => 'jailshell', 'HG' => 1 }, 'json');
+		if (not $response) {
+			print "[!] cPanel's API call failed. Please perform this action manually.\n";
+			return 0;
+		}
+
+		my $output = from_json($response);
+
+		if ($output->{'metadata'}->{'result'} == 1) {
+			print "[+] Successfully enabled jailshell on '$GREEN$user$RESET'.\n";
+		} else {
+			print "[!] Failed to enable jailshell on '$RED$user$RESET'. cPanel said:\n";
+			print $output->{'metadata'}->{'reason'}."\n";
+		}
+	}
+}
+
+sub disableshell {
+
+	foreach my $user (@usernames) {
+		#this will never happen cause, this stuff is already checked for in the username parser code in main(), but just in case of fun:
+		if ($user eq "root") {
+			print "[!] You can not change root's shell access. This is not allowed.\n";
+			return 0;
+		}
+
+		my $response = $apic->whm_api('modifyacct', { 'user' => $user, 'shell' => 'noshell', 'HG' => 1 }, 'json');
+		if (not $response) {
+			print "[!] cPanel's API call failed. Please perform this action manually.\n";
+			return 0;
+		}
+
+		my $output = from_json($response);
+
+		if ($output->{'metadata'}->{'result'} == 1) {
+			print "[+] Successfully disabled shell on '$GREEN$user$RESET'.\n";
+		} else {
+			print "[!] Failed to disable shell on '$RED$user$RESET'. cPanel said:\n";
+			print $output->{'metadata'}->{'reason'}."\n";
+		}
+	}
+}
+
+sub changedomain {
+
+	my $newdomain = shift;
+	if (scalar(@usernames) > 1) {
+		print "[!] --changedomain can only be run on a single user. Using it against a list is not allowed.\n";
+		return 1;
+	}
+
+	my $user = $usernames[0];
+	my $response = $apic->whm_api('modifyacct', { 'user' => $user, 'domain' => $newdomain, 'HG' => 1 }, 'json');
+	if (not $response) {
+		print "[!] cPanel's API call failed. Please perform this action manually.\n";
+		return 0;
+	}
+
+	my $output = from_json($response);
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		print "[+] Successfully changed primary domain on '$GREEN$user$RESET' to '$newdomain'\n";
+		return 1;
+	} else {
+		print "[!] Failed to change primary domain on '$RED$user$RESET'. cPanel said:\n";
+		print "$output->{'metadata'}->{'reason'} :\n";
+		if (ref ($output->{'metadata'}->{'output'}->{'messages'}) eq 'ARRAY') {
+			foreach my $line (@{$output->{'metadata'}->{'output'}->{'messages'}}) {
+				print "\t".$line."\n";
+			}
+		} else {
+			print $output->{'metadata'}->{'output'}->{'messages'}."\n";
+		}
+		return;
+	}
+}
+
+sub setseopkg {
+
+	my $numips = shift;
+	my $srvtype = servertype();
+
+	if (!($srvtype eq "seo")) {
+		print "[!] SEO package type passed, but the server type is $RED$srvtype$RESET\n";
+		return;
+	}
+
+	#checks on valid seo plans...
+	if ($numips > 1 && $numips <=50) {
+		if ($numips % 5 != 0) {
+			print "[!] Invalid SEO IP package.\n";
+			return;
+		}
+	} elsif ($numips >= 51 && $numips <=120) {
+		if ($numips % 10 != 0) {
+			print "[!] Invalid SEO IP package.\n";
+			return;
+		}
+	} elsif ($numips != 125) {
+		print "[!] Invalid SE0 IP package.\n";
+		return;
+	}
+
+	my $disklimit = ($numips/5) * 20 * 1024;
+	my $bwlimit   = ($numips/5) * 200 * 1024;
+
+	foreach my $user (@usernames) {
+		my $check = 1;
+		if (!isreseller($user)){
+			$check = setreseller($user);
+		}
+		if ($check) {
+			$check = setrlimits ($user, $disklimit, $bwlimit, $numips);
+		}
+		if ($check) {
+			$check = updateacl ($user, 'seo');
+		}
+		my $pkgname = $user."_default";
+		if (!-s "/var/cpanel/packages/$pkgname") {
+			if ($check) {
+				$check = definepkg("name=$pkgname,quota=4000,bwlimit=10000");
+			}
+		}
+
+		if ($check) {
+			$check = ownerset($user, $user)
+		}
+		if ($check) {
+			$check = setppkg($pkgname, $user);
+		}
+
+		if ($check) {
+			print "[+] SEO Reseller access and limits for '$GREEN$user$RESET' set successfully.\n";
+		} else {
+			print "[!] SEO Reseller access was not successfully updated for '$RED$user$RESET'. Please review the information above.\n";
+		}
+	}
+}
+
+sub setquota {
+
+	my ($disklimit, $bwlimit) = @_;
+
+	foreach my $user (@usernames) {
+		if (isreseller($user)) {
+			print "[*] '$user' is a reseller. Did you want to set the quotas for all of the subaccounts under this Reseller to what is specified? y/n - ";
+			chomp (my $answer = <STDIN>);
+			if ($answer eq 'y') {
+				my @subaccounts = process_reseller($user);
+				# add the subaccounts to the usernames array,
+				# while checking to make sure we aren't adding a user that is already there.
+				foreach my $sub (@subaccounts) {
+					if (not grep {$_ eq $sub} @usernames) {
+						push @usernames, $sub;
+					}
+				}
+			}
+		}
+
+		my $check = 0;
+		if ( setdiskquota($user, $disklimit) ) {
+			$check = 1;
+		}
+
+		if ($check and setbwquota($user, $bwlimit) ) {
+			$check = 1;
+		} else {
+			$check = 0;
+		}
+
+		if ($check) {
+			print "\n[+] '$GREEN$user$RESET':\n";
+			print "\t\tDiskspace quota: $disklimit MB (" . sprintf("%.2f", $disklimit/1024) . " GB)\n";
+			print "\t\tBandwidth quota: $bwlimit MB (" . sprintf("%.2f", $bwlimit/1024) ." GB)\n";
+		} else {
+			print "[!] '$RED$user$RESET' - failed to set quotas.\n"; 
+		}
+		quotachecker($user, 1);
+	}
+}
+
+sub setdiskquota {
+
+	my $user = shift;
+	my $disklimit = shift;
+
+	my $response = $apic->whm_api('editquota', { 'user' => $user, 'quota' => $disklimit }, 'json');
+	my $output = from_json($response);
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		return 1;
+	} else {
+		print "[!] '$RED$user$RESET' - Failed to set disk quotas! cPanel said:\n";
+		print "[!] ".$output->{'metadata'}->{'reason'}."\n";
+		return;
+	}
+}
+
+sub setbwquota {
+
+	my $user = shift;
+	my $bwlimit = shift;
+
+	my $response = $apic->whm_api('limitbw', { 'user' => $user, 'bwlimit' => $bwlimit }, 'json');
+	my $output = from_json($response);
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		return 1;
+	} else {
+		print "[!] '$RED$user$RESET' - Failed to set bandwidth quotas! cPanel said:\n";
+		print "[!] ".$output->{'metadata'}->{'reason'}."\n";
+		return;
+	}
+}
+
+sub setresellercustom {
+
+	my ($disklimit, $bwlimit) = @_;
+	
+	foreach my $user (@usernames) {
+		my $check = 1;
+		if (!isreseller($user)) {
+			$check = setreseller($user);
+		}
+		if ($check) {
+			$check = setrlimits($user, $disklimit, $bwlimit, 0);
+		}
+		if ($check) {
+			$check = updateacl($user, 'reseller');
+		}
+
+		if ($check) {
+			$check = ownerset($user, $user);
+		}
+
+		if ($check) {
+			print "[+] Reseller access and limits for '$GREEN$user$RESET' set successfully. Please be sure to setup the proper Packages for this reseller, etc.\n";
+			return 1;
+		} else {
+			print "[!] Reseller access was not successfully updated for '$RED$user$RESET'. Please review the information above.\n";
+			return;
+		}
+	}
+}
+
+sub sethgpkg {
+
+	my $pkg     = lc shift;
+	my $srvtype = servertype();
+
+	if ($pkg =~ /^((cloud_)?(hatchling|baby|business))(_Unlimited)?|startup|pro|personal$/) {
+		if ($srvtype eq "shared") {
+			if ($pkg eq 'cloud_hatchling') { setpkg("Cloud Hatchling"); }
+			elsif ($pkg eq 'cloud_baby') { setpkg("Cloud Baby"); }
+			elsif ($pkg eq 'cloud_business') { setpkg("Cloud Business"); }
+			else {
+				$pkg = ucfirst($pkg);
+				$pkg =~ s/Baby/Baby Croc/g;
+				$pkg =~ s/unlimited/Unlimited/g;
+				setpkg($pkg); 
+			}
+
+
+			#if ($pkg eq "baby") {
+			#	setpkg("Baby Croc");
+			#} else {
+			#	setpkg(ucfirst($pkg));
+			#}
+			setowner("root");
+			sethgbrand();
+			remres();
+		} else {
+			print "[!] Shared package type passed, but the server type is $RED$srvtype$RESET\n";
+			return;
+		}
+	} elsif ($pkg =~ /^(special|aluminum|copper|silver|gold|diamond)$/) {
+		if ($srvtype eq "reseller") {
+			setrpkg($pkg);
+		} else {
+			print "[!] Reseller package type passed, but the server type is $RED$srvtype$RESET\n";
+			return;
+		}
+	} else {
+		print "[$RED!$RESET] Unknown HostGator package type passed. It has to be one of the following: special, aluminum, copper, silver, gold, diamond, [cloud_]hatchling, [cloud_]baby, [cloud_]business, startup, pro, personal\n";
+		return;
+	}
+}
+
+# Set the cPanel branding to 'HG' for all users.
+# Return: 1=Success, 0=Failure
+sub sethgbrand {
+	my $result = 1;
+	my $theme = 'HG';
+
+	if ($hostname =~ /(ehosts?|ideahost|hostclear)\.com/) { $theme = 'FlatPanel'; }
+
+	foreach my $user (@usernames) {
+		my $response = $apic->cpanel_api1_request('whostmgr', 
+							{ 
+								'module' => 'Branding',
+								'func'   => 'setbrandingpkg',
+								'user'   => $user, 
+							}, 
+							[$theme], 'json');
+		my $output = from_json($response);
+		if ($output->{event}->{result} eq "1") {
+			print "[+] Branding of '$GREEN$user$RESET' successfully changed to $theme\n";
+		}else{
+			print "Failed to update branding of '$RED$user$RESET' to $theme\n";
+			$result = 0;
+		}
+	}
+	return $result;
+}
+
+sub setpkg {
+	
+	my $pkg = shift;
+	if (!-e "/var/cpanel/packages/$pkg") {
+		print "[!] '$pkg' package does not appear to be setup on this server. Please consult a higher level administrator to see what is going on...\n";
+		return;
+	}
+
+	foreach my $user (@usernames) {
+		setppkg($pkg, $user);
+	}
+
+	my $srvtype = servertype();
+	if ($srvtype eq "shared") {
+		remres();
+	}
+}
+
+sub setppkg {
+
+	my $pkg  = shift;
+	my $user = shift;
+
+	my $response = $apic->whm_api('changepackage', { 'user' => $user, 'pkg' => $pkg }, 'json');
+	my $output   = from_json($response);
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		print "[+] Successfully changed the package on '$user' to '$GREEN$pkg$RESET'.\n";
+		if (!quotachecker($user, 1)) {
+			return 1;
+		} else {
+			return;
+		}
+	} else {
+		print "[!] Failed to change package on '$user' to '$RED$pkg$RESET'. cPanel said:\n";
+		print $output->{'metadata'}->{'reason'}."\n";
+		return;
+	}
+}
+
+sub setrpkg {
+
+	my $pkg = shift;
+
+	foreach my $user (@usernames) {
+		my $check = 1;
+		if (!isreseller($user)) {
+			$check = setreseller($user);
+		}
+		if ($check) {
+			$check = setrhglimits($user, $pkg);
+		}
+		if ($check) {
+			$check = updateacl($user, 'reseller');
+		}
+		my $pkgname = $user."_default";
+		if (!-s "/var/cpanel/packages/$pkgname") {
+			if ($check) {
+				$check = definepkg("name=$pkgname,quota=5000,bwlimit=10000");
+			}
+		}
+
+		if ($check) {
+			$check = ownerset($user, $user);
+		}
+		if ($check) {
+			$check = setppkg($pkgname, $user);
+		}
+
+		if ($check) {
+			print "[+] Reseller access and limits for '$GREEN$user$RESET' set to '$pkg' successfully.\n";
+			if ($pkg eq "special") {
+				print "$YELLOW****NOTE**** The limits have been set to 25GB of disk and 250GB of bandwidth.\n";
+				print "Disk and bandwidth limits can vary for special reseller plans depending on what was\n";
+				print "agreed upon with the customer.  Please verify that the limits are correct.$RESET\n";
+			}
+			return 1;
+		} else {
+			print "[!] Reseller access was not successfully updated for '$RED$user$RESET'. Please review the information above.\n";
+			return;
+		}
+	}
+}
+
+sub updateacl {
+
+	my $user = shift;
+	my $type = shift;
+
+	my $output;
+	if ($type eq 'reseller') {
+		my $response = $apic->whm_api('setacls',
+			{
+				'reseller' => $user,
+				'acllist'  => 'default'
+			}, "json");
+		$output = from_json($response);
+	} elsif ($type eq 'seo') {
+		my $response = $apic->whm_api('setacls',
+			{
+				'reseller' => $user,
+								'acllist'  => 'seo'
+			}, "json");
+		$output = from_json($response);
+	}
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		print "[+] Reseller ACLs on '$GREEN$user$RESET' updated to our generic '$type' settings.\n";
+		return 1;
+	} else {
+		print "[!] Failed to update ACL settings for '$RED$user$RESET' to the '$type' settings.\n";
+		return 0;
+	}
+}
+
+sub setrhglimits {
+
+	my $user = shift;
+	my $pkg  = shift;
+
+	my %pkgs  = (
+		'special'  => [25600  , 256000],
+		'aluminum' => [61440  , 614400],
+		'copper'   => [92160  , 921600],
+		'silver'   => [143360 , 1433600],
+		'gold'     => [184320 , 1843200],
+		'diamond'  => [256000 , 2560000]
+	);
+
+	my ($disklimit, $bwlimit) = @{ $pkgs{$pkg} };
+	
+	my $check = setrlimits($user, $disklimit, $bwlimit, 0);
+	return $check;
+}
+
+sub setrlimits {
+
+	my ($user, $disklimit, $bwlimit, $acctlimit) = @_;
+	my $enablebit = ($acctlimit) ? 1: 0;
+
+	my %opts = (
+		'user'                         => $user,
+		'enable_account_limit'         => $enablebit,
+		'account_limit'                => $acctlimit,
+		'enable_resource_limits'       => '1',
+		'bandwidth_limit'              => $bwlimit,
+		'diskspace_limit'              => $disklimit,
+		'enable_overselling'           => '0',
+		'enable_overselling_bandwidth' => '0',
+		'enable_overselling_diskspace' => '0',
+		'enable_package_limits'        => '0',
+		'enable_package_limit_numbers' => '0'
+	);
+
+	my $response = $apic->whm_api('setresellerlimits', \%opts, 'json');
+	my $output = from_json($response);
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		print "[+] Reseller limits properly set. Disk quota: $disklimit MB (" . sprintf("%.2f", $disklimit/1024) . " GB), Bandwidth quota: $bwlimit MB (" . sprintf("%.2f", $bwlimit/1024) ." GB).";
+		if ($enablebit) {
+			print " Sub account limit: $acctlimit\n";
+		} else {
+			print "\n";
+		}
+		return 1;
+	} else {
+		print "[!] Reseller limits could not be set up properly. cPanel said:\n";
+		print $output->{'metadata'}->{'reason'}."\n";
+		return;
+	}
+}
+
+sub setreseller {
+
+	my $user = shift;
+
+	my $response = $apic->whm_api('setupreseller', { 'user' => $user, 'makeowner' => '1' }, 'json');
+	my $output = from_json($response);
+	if ($output->{'metadata'}->{'result'} == 1) {
+		print "[+] Reseller privileges successfully assigned to '$GREEN$user$RESET'\n";
+		return 1;
+	} else {
+		print "[!] Reseller privileges could not be assigned to '$RED$user$RESET'\n";
+		return;
+	}
+}
+
+sub isdedicatedip {
+
+	my $ip = shift;
+	my $ipdata = fetch_ipdata();
+	if ($ipdata->{$ip}->{'dedicated'}) {
+		return 1;
+	}
+	return;
+}
+
+sub isreseller {
+
+	my $user = shift;
+	my %resellers = ();
+
+	#Populate %resellers
+	my $response = $apic->whm_api('listresellers', { }, 'json');
+	my $output = from_json($response);
+	if (ref($output->{'data'}->{'reseller'}) eq 'ARRAY') {
+		foreach my $reseller (@{$output->{'data'}->{'reseller'}}) {
+			$resellers{$reseller} = 1;
+		}
+	} else {
+		$resellers{$output->{'data'}->{'reseller'}} = 1;
+	}
+
+	if ($resellers{$user}){
+		return 1;
+	} else {
+		return;
+	}
+}
+
+sub servertype {
+
+	my $srvtype;
+
+	if ($hostname =~ /\.(hostgator\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear)\.com)$/) {
+		$srvtype = "shared";
+	} elsif ($hostname =~ /\.((websitewelcome|webhostsunucusu|prepgator)\.com|websitedns\.in|prodns\.com\.br)/) {
+		open (my $wwwacct, "<", "/etc/wwwacct.conf");
+		my $ns = (grep(/NS/, <$wwwacct>))[0];
+		$ns = (split(' ', $ns))[1];
+		if ($ns =~ m/^sns/i) {
+			$srvtype = "seo";
+		} else {
+			$srvtype = "reseller";
+		}
+	} else {
+		$srvtype = "unknown";
+	}
+
+	return $srvtype;
+}
+
+sub assignrandomips {
+
+	if (servertype() ne "seo") {
+		print "[!] This is limited to only ${RED}SEO${RESET} servers!\n";
+		return undef;
+	}
+
+	if (not -x "/root/bin/chgacctip") {
+		print "[!] chgacctip is not present on the server, or has the wrong permissions! Aborting...\n";
+		return undef;
+	}
+
+	if (not keys %rips) {
+		checkips();
+		print "\n\n";
+	}
+
+	foreach my $user (@usernames) {
+		if (not isreseller($user)) {
+			print "[!] '$RED$user$RESET' does not have reseller priviliges assigned.\n";
+			next;
+		}
+
+		my @subaccounts = process_reseller($user);
+		push @subaccounts, $user;
+
+		print "[+] Assigning Random SEO IPs to the accounts under '$GREEN$user$RESET' now... :\n";
+
+		my $counter = 0;
+		foreach my $sub (@subaccounts) {
+			if ($counter < $#shared_ips) {
+				print "\tProcessing '$sub' with 'chgacctip $sub $shared_ips[$counter]'\n";
+				my $output = `/root/bin/chgacctip $sub $shared_ips[$counter] 2>&1`;
+				if (($? >> 8) > 0) {
+					print "\t[!] chgacctip call failed for '$sub'!\n";
+				}
+				$counter++;
+			} else {
+				$counter = 0;
+				redo;
+			}
+		}
+	}
+	print "[+] Accounts have been assigned to different C-Class IPs at this time. Rebuilding caches now...";
+	system ("/scripts/updateuserdatacache");
+	system ("/scripts/updateuserdomains");
+	print " Done!\n";
+}
+
+sub checkips {
+
+	my $srvtype = servertype();
+	print "[+] ${GREEN}Checking${RESET} the reserved IPs on the server now...\n\n";
+
+	if ($srvtype eq 'seo') {
+		buildreservedips_seo();
+	} else {
+		buildreservedips_general();
+	}
+	my @ips;
+	my @ipc = grep (/inet addr:/, `/sbin/ifconfig`);
+	foreach my $t (@ipc) {
+		my $ip = (split(/:/, $t))[1];
+		$ip = (split(/ /, $ip))[0];
+		if ($ip !~ m/^127\.|^10\./) {
+			push @ips, $ip;
+		}
+	}
+	my $rescount = 0;
+	my $shared_count = 0;
+	foreach my $ip (@ips) {
+		if (built_dedicatedip($ip)) {
+			$rescount++;
+			my $user = $rips{$ip};
+			if (not -s "/var/cpanel/users/$user") {
+				print "[!] '$ip' is reserved for '$RED$user$RESET' - user does not exist!\n";
+				next;
+			}
+			my $userinfo = accountsummary($user);
+			if ($userinfo->{'suspended'}) {
+				my $timestamp;
+				if (not -e "/var/cpanel/suspended/$user") {
+					print "[!] '$RED$ip$RESET' is reserved for suspended user: '$RED$user$RESET' - Unable to determine the suspension time!\n";
+				} else {
+					$timestamp = stat("/var/cpanel/suspended/$user")->mtime;
+					my $diff   = time() - $timestamp;
+					if ($diff >= 2592000) {
+						print "[!] '$RED$ip$RESET' is reserved for suspended user: '$RED$user$RESET' - more than 30 days since suspension!\n";
+					} else {
+						print "[!] '$RED$ip$RESET' is reserved for suspended user: '$RED$user$RESET' - less than 30 days since suspension!\n";
+					}
+				}
+			} else {
+				my $ssls = find_ssls($ip);
+				if (not keys %{$ssls}) {
+					print "[!] '$RED$ip$RESET' is reserved for '$user' - user does not have any SSLs configured\n";
+					next;
+				}
+				foreach my $ssl (keys %{$ssls}) {
+					$ssls->{$ssl} = valid_crt($ssl);
+					if ($ssls->{$ssl} != 0) {
+						print "[!] '${RED}$ip${RESET}' is reserved for '$user':\n";
+						if ($ssls->{$ssl} == 1) { print "\t\t${RED}$ssl${RESET} - Self-signed or Not valid yet.\n"; }
+						elsif ($ssls->{$ssl} == 2) { print "\t\t${RED}$ssl${RESET} - Expired SSL.\n"; }
+						else { print "\t\t${RED}$ssl${RESET} - ERROR parsing SSL info.\n"; }
+					}
+				}
+			}
+		} else {
+			$shared_count++;
+			push @shared_ips, $ip;
+		}
+	}
+
+	print "\n[*] Server has '".scalar(@ips)."' IP(s), of these '$RED".$rescount."$RESET' IP(s) are reserved, and '$GREEN".$shared_count."$RESET' IP(s) are shared.\n";
+	if (scalar(@free_ips)) {
+		print "[+] Free IPs on the server:\n";
+		print "\t".$GREEN.$_.$RESET."\n" for @free_ips;
+	}
+}
+
+sub buildreservedips_seo {
+
+	my $dir = "/etc/hgseo/resellerips/";
+	opendir(my $dh, $dir) or die "Can't read '$dir' - ";
+	my @files = grep { -f "$dir/$_" } readdir($dh);
+	closedir $dh;
+
+	foreach my $file (@files) {
+		open (my $fh, "$dir/$file") or die "Can't read '$file' - ";
+		while (my $ip = <$fh>) {
+			chomp $ip;
+			if ($ip =~ m/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/) {
+				$rips{$ip} = $file;
+			}
+		}
+		close $fh;
+	}
+}
+
+sub buildreservedips_general {
+
+	my $ipdata = fetch_ipdata();
+	foreach my $ip (keys %{$ipdata}) {
+		next if $ip =~ m/^(192\.168|10|172\.16)\./;
+		if (not $ipdata->{$ip}) {
+			push @free_ips, $ip;
+		} elsif (my $domain = $ipdata->{$ip}->{'dedicated'}) {
+			$rips{$ip} = findowner($domain);
+		}
+	}
+}
+
+sub built_dedicatedip {
+
+	my $ip = shift;
+	if ($ip =~ m/^10\./ || $ip =~ m/^127\./) {
+		return 0;
+	}
+
+	if (exists $rips{$ip}) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub fetch_ipdata {
+
+	my $jsondata = `whmapi1 listips --output=json`;
+	my $ipdata = from_json($jsondata);
+	return $ipdata;
+}
+
+sub findowner {
+	my $domain = shift;
+	my $owner;
+
+	#this is what whoowns does
+	open(my $USERDOMAINS, "/etc/userdomains" );
+	while (<$USERDOMAINS>) {
+		if (/^$domain: (\S+)/i) {
+			$owner = $1;
+		}
+	}
+	close($USERDOMAINS);
+
+	if ($owner eq ""){
+		open (my $httpconf, "<", "/usr/local/apache/conf/httpd.conf") or die "Can't read apache config - /usr/local/apache/conf/httpd.conf -";
+		my $grep;
+		while (<$httpconf>) {
+			if (/\b$domain\b/i) {
+				while (<$httpconf>){
+					$grep = $_;
+					last if (/documentroot/i);
+				}
+			}
+		}
+		close ($httpconf);
+		
+		if ($grep) {
+			$grep =~ s|documentroot||gi;
+			$grep =~ s/^\s+//;
+			$grep =~ s/\s+$//;
+			$owner = (split(/\//, $grep))[2];
+		}
+	}
+	return $owner;
+}
+
+sub find_ssls {
+
+	my $ip   = shift;
+	my $ssls = {};
+	open (my $httpconf, "<", "/usr/local/apache/conf/httpd.conf") or die "Can't read apache config - /usr/local/apache/conf/httpd.conf -";
+	my $grep;
+	while (<$httpconf>) {
+		if (m{<VirtualHost $ip:443>}i) {
+			while (<$httpconf>) {
+				if (m{\s*SSLCertificateFile\s*}i) {
+					$grep .= $_;
+					last;
+				}
+				last if m{</Virtualhost>}i;
+			}
+		}
+	}
+	close ($httpconf);
+	if ($grep) {
+		my @lines = split /\n/, $grep;
+		foreach my $crtline (@lines) {
+			$crtline = trimspace($crtline);
+			my $crt = (split /\s+/, $crtline, 2)[1];
+			if (-e $crt) {
+				$ssls->{$crt} = 1;
+			}
+		}
+	}
+	return $ssls;
+}
+
+#Output: 0 = OK - Appears to be valid.
+#        1 = Not valid yet (i.e. today is before the start date)
+#        2 = Expired       (i.e. today is after the end data)
+#        3 = Error
+
+sub valid_crt {
+
+	my $crt = shift;
+	my @sslmembers;
+
+	my $start_date;
+	my $start_year;
+	my $start_month;
+	my $start_day;
+	my $end_date;
+	my $end_year;
+	my $end_month;
+	my $end_day;
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	my $now = sprintf("%04d%02d%02d", $year+1900, $mon+1, $mday);
+	my %months = ("Jan", 1, "Feb", 2, "Mar", 3, "Apr", 4, "May", 5, "Jun", 6, "Jul", 7, "Aug", 8, "Sep", 9, "Oct", 10, "Nov", 11, "Dec", 12);
+
+	if (lookup_cert_info($crt, \@sslmembers)) {
+		return 3;
+	}
+	if ($sslmembers[0] =~ /Self Signed/) {
+		return 1;
+	}
+
+	my $start = $sslmembers[1];
+	$start =~ s/Not Before: //;
+	($start_month, $start_day, undef, $start_year, undef) = split (/\s+/, $start);
+	$start_date = sprintf("%04d%02d%02d", $start_year, $months{$start_month}, $start_day);
+
+	my $end = $sslmembers[2];
+	$end =~ s/Not After : //;
+	($end_month, $end_day, undef, $end_year, undef) = split(/\s+/, $end);
+	$end_date = sprintf("%04d%02d%02d", $end_year, $months{$end_month}, $end_day);
+
+	if ($now < $start_date) {
+		return 1;
+	}
+	if ($now > $end_date) {
+		return 2;
+	}
+	return 0;
+}
+
+sub lookup_cert_info {
+
+	my $crt = shift;
+	my $out = shift;
+
+	my @sslinfo = `openssl x509 -text -in \"$crt\"`;
+	my $sslissuer = (grep(/\s*Issuer:/, @sslinfo))[0];
+	$sslissuer = trimspace($sslissuer);
+	my $sslsubject = (grep(/\s*Subject:/, @sslinfo))[0];
+	$sslsubject = trimspace($sslsubject);
+	my $sslstart = (grep(/\s*Not Before:/, @sslinfo))[0];
+	$sslstart = trimspace($sslstart);
+	my $sslend = (grep(/\s*Not After/, @sslinfo))[0];
+	$sslend = trimspace($sslend);
+
+	if (length($sslsubject) == 0 or length($sslstart) == 0 or length($sslend) == 0) {
+		return 1;
+	}
+
+	if ($sslissuer eq $sslsubject) {
+		$sslissuer = "Self Signed";
+	}
+
+	push (@{$out}, $sslissuer);
+	push (@{$out}, $sslstart);
+	push (@{$out}, $sslend);
+	return 0;
+}
+
+sub trimspace {
+
+	my $string = shift;
+	chomp $string;
+	$string =~ s/^\s+//;
+	$string =~ s/\s+$//;
+
+	return $string;
+}
+
+sub convert_quota {
+
+	my $quota = shift;
+	if ($quota =~ m/([0-9]+)([MG]?)$/i) {
+		my $number = $1;
+		my $type   = $2;
+		if ($type eq "G" or $type eq "g") {
+			$number *= 1024;
+		}
+		return $number;
+	}
+	return;
+}
+
+=pod
+
+=head1 NAME
+
+cppc - Assign/Create Packages, set ownership for accounts, etc on cPanel servers
+
+=head1 Usage
+
+Usage: cppc [with a combination of the switches below]:
+
+	HG options:
+
+	--sethgpkg          Set the account(s) to a Hostgator package. Required Args:
+						[special|aluminum|copper|silver|gold|diamond|(cloud_)hatchling|(cloud_)baby|(cloud_)business] <username or filename> (file should contain a list of users) 
+						Note: Using this with hatching/baby/business packages will automatically update the ownership to root.
+
+	--setseopkg         Set the account(s) to a SEOhosting package. Required Args:
+						[X] <username or filename> (file should contain a list of users) 
+						X is the number of C-Class IPs they have.
+
+	Custom/non-hg options:
+
+	--customreseller    Assign the account(s) reseller privileges with the specified limits. Required Args:
+						[Disk space limit]M/G [Bandwidth limit]M/G <username to assign reseller privileges to>.
+						Note: There is no 'unlimited' option on this. 
+
+	--setpkg            Assign the account(s) to the specified package. Required Args:
+						[Package on the server. Can be any valid package within /var/cpanel/packages/] <username or filename> (file should contain a list of users) 
+
+	Other options:
+
+	--setowner          Assign the account(s) to the specified owner. Required Args:
+						[Username of the new owner of the account] <username or filename> (file should contain a list of users) 
+
+	--perfomqc          Perform a Quota-check on the account(s).
+						<username or filename> (file should contain a list of users) 
+	--resdetails        Displays details about all of the accounts under a reseller account. Required Args:
+						[Reseller username or filename] (file should contain a list of reseller username)
+
+	Advanced:
+
+	--definepkg         Define a package with the limits specified. The arguments must be passed in a single quote enclosed string.
+						"name=<package name>,bwlimit=<number>,quota=<number>,[various other package options]" (They must be comma seperated)
+						The bwlimit and quota are specified in MB.
+						PLEASE be sure to read over the full documentation for this switch if you are not sure of the options.
+
+	--dereseller        Remove the reseller privileges from the specified account(s).
+						<username or filename> (file should contain a list of users) 
+
+	--renameuser        Change the username on an account to the new username given. This switch is limited to work on single usernames - if a list is passed, it will error out. Required Args:
+						[New username] <current username>
+
+	--changedomain      Change the primary domain on an account to the domain given. This switch is limited to work on single usernames - if a list is passed, it will error out. Required Args:
+						[New domain] <username being changed>
+
+	--jailshell         Enables jailshell on the accounts. Note: Unlike the chatshell command, this does not toggle the access (i.e., it won't disable jailshell on an account that has it enabled already, etc). Required Args:
+						<username or filename> (file should contain a list of users)
+
+	--disableshell      Disables shell access on the accounts. Required Args:
+						<username or filename> (file should contain a list of users)
+	SEO options:
+
+	--checkips          Checks the "reserved" ips on the servers and reports any IPs are that are assigned to accounts that are suspended, or don't exist, or have expired SSLs.
+						[No Arguments]
+	--seoify            Assigns random IPs to accounts under the specified reseller account(s). It tries to not assign accounts to the same IPs, 
+						but this is not always possible due to the number of IPs available on the server. Required Args:
+						[Reseller username or filename] (file should contain a list of reseller username)
+						NOTE: This will process all users under an account, so if you are trying only update a specific subset of the users, then make the changes manually.
+
+=head1 Details
+
+=head2 --sethgpkg
+
+Sets the Reseller package of the account to one of the following HG packages types:
+
+	Special   =  25 GB Disk Space,  250 GB Bandwidth
+	Aluminum  =  60 GB Disk Space,  600 GB Bandwidth
+	Copper    =  90 GB Disk Space,  900 GB Bandwidth
+	Silver    = 140 GB Disk Space, 1400 GB Bandwidth
+	Gold      = 180 GB Disk Space, 1800 GB Bandwidth
+	Diamond   = 250 GB Disk Space, 2500 GB Bandwidth
+	Hatchling = Unlimited Disk/BW, 0 addon, 0 parked.
+	Baby      = Unlimited
+	Business  = Unlimited
+
+=head3 Example:
+
+	# cppc --sethgpkg baby hgxfers
+	[*] Added 'hgxfers' to be processed...
+
+	[+] Successfully changed the package on 'hgxfers' to 'Baby Croc'.
+	[+] Ownership of 'hgxfers' successfully changed to 'root'
+	[+] Quota: hgxfers is not over quota. 100.00% is free.
+	[+] Root does not have quotas.
+
+=head2 --setseopkg 
+
+Sets the reseller limits to the appropriate SEO C-Class plan.
+
+	The diskspace limit is ((Number of C-Class IPs)/5) * 20  GB
+	The bandwidth limit is ((Number of C-Class IPs)/5) * 200 GB
+
+	So for a 125 C-Class plan, these are:
+		(125/5) * 20  = 500  GB
+		(125/5) * 200 = 5000 GB
+
+	and so on. This will also limit the number of accounts the WHM user can make to the number of C-Class IPs. The valid plans are determined as such:
+
+	1-50 C-Class IPs   = Package has to be a multiple of 5  [(Number of C-Class IPs) % 5)  == 0]
+	51-120 C-Class IPs = Package has to be a multiple of 10 [(Number of C-Class IPs) % 10) == 0]
+	Special Case: 125 C-Class IPs.
+	Those are the plans we have. Review them here: http://www.seohosting.com/hosting-plans.php
+
+=head3 Example:
+
+	root@yonkers [~]# perl cppc --setseopkg 50 tstatsex
+	[*] Added 'cppcex' to be processed...
+
+	[+] Reseller privileges successfully assigned to 'cppcex'
+	[+] Reseller limits properly set. Disk quota: 204800 MB (200.00 GB), Bandwidth quota: 2048000 MB (2000.00 GB). Sub account limit: 50
+	[+] Reseller ACLs on 'cppcex' updated to our generic 'seo' settings.
+	[+] Package successfully created: 'cppcex_default'
+	[+] Successfully changed the package on 'cppcex' to 'tstatsex_default'.
+
+	[*] Reseller Quota Check:
+			[+] 'cppcex' is not over quota.
+	[+] SEO Reseller access and limits for 'cppcex' set successfully.
+
+=head2 --customreseller
+
+Sets custom reseller limits for an account and assigns proper reseller privileges. You specify the disk quota and bandwidth quotas for the reseller for the account.
+
+=head3 Example:
+
+	root@centos [~]# perl cppc --customreseller 20g 1000m wrny
+	[*] Added 'wrny' to be processed...
+
+	[+] Reseller privileges successfully assigned to 'wrny'
+	[+] Reseller limits properly set. Disk quota: 20480 MB (20.00 GB), Bandwidth quota: 1000 MB (0.98 GB).
+	[+] Reseller ACLs on 'wrny' updated to our generic 'reseller' settings.
+	[+] Package successfully created: 'wrny_default'
+	[+] Successfully changed the package on 'wrny' to 'wrny_default'.
+
+	[*] Reseller Quota Check:
+		[+] 'wrny' is not over quota.
+	[+] Reseller access and limits for 'wrny' set successfully.
+
+
+=head2 --setpkg
+
+	Sets the package of an account to what is provided. This will perform the following checks:
+	- Checks to make sure that the package is setup on the server.
+	- Checiks to see if the new package limits will fit the account's current usage.
+
+=head3 Example:
+
+	root@centos [~]# ls /var/cpanel/packages/
+	./  ../  wrny_Awesome  wrny_Awesome1
+	root@centos [~]# perl cppc --setpkg wrny_Awesome wrny
+	[*] Added 'wrny' to be processed...
+
+	[+] Successfully changed the package on 'wrny' to 'wrny_Awesome'.
+
+=head2 --setowner
+
+	Sets the ownership of the account to whatever username is passed. This will perform the following checks:
+	- Checks to see if the new owner exists.
+	- If running on a reseller server, and the current owner of the account is not 'root', then issues a warning on the change of ownership.
+
+=head3 Example:
+
+	root@centos [~]# perl cppc --setowner wrny hgmove
+	[*] Added 'hgmove' to be processed...
+
+	[+] Ownership of 'hgmove' successfully changed to 'wrny'
+	[+] Quota: hgmove is not over quota. 100.00% is free.
+
+	[*] Reseller Quota Check:
+		[!] The owner of 'wrny', 'wrny', is over bandwidth usage quota.
+
+	root@centos [~]# perl cppc --setowner wrny list
+	[*] Added 'hgmove' to be processed...
+	[!] 'transf' was not added, as it does not exist on the server.
+	[*] Added 'wrny' to be processed...
+
+	[+] Ownership of 'hgmove' successfully changed to 'wrny'
+	[+] Quota: hgmove is not over quota. 100.00% is free.
+	[+] Ownership of 'wrny' successfully changed to 'wrny'
+	[+] Quota: wrny is not over quota. 97.60% is free.
+
+	[*] Reseller Quota Check:
+		[!] The owner of 'wrny', 'wrny', is over bandwidth usage quota.
+
+=head2 --perfomqc
+
+Performs a quota check on the given username/list. Will display if the account is within limits and has enough room to grow (Essentially if it has 10%+ more allocated than what it is currently using).
+
+=head3 Example:
+
+	root@centos [~]# perl cppc --performqc hgmove
+	[*] Added 'hgmove' to be processed...
+
+	[+] Quota: hgmove is not over quota. 100.00% is free.
+
+	[*] Reseller Quota Check:
+		[!] The owner of 'hgmove', 'wrny', is over bandwidth usage quota.
+
+=head2 Advanced option: --dereseller
+
+This allows you to remove the reseller privileges from the users. Like the rest of the options, it takes a username or filename with a list of usernames.
+
+=head3 Example:
+
+	root@centos [/home]# perl cppc --dereseller wrny
+	[*] Added 'wrny' to be processed...
+
+	[+] Reseller priviliges successfully removed from wrny.
+	[!] 'wrny' owned the followed the accounts:
+		brendan
+		hgmove
+		rmetc
+		rmrfetc
+		transf
+
+=head2 Advanced option: --renameuser
+
+This allows you to change the username on an account to the new username given. This switch is limited to work on single usernames - if a list is passed, it will error out.
+
+=head3 Example:
+
+	root@centos [~]# cppc --renameuser hgxfers12 hgxfers
+	[*] Added 'hgxfers' to be processed...
+
+	[!] 'hgxfers' - failed to rename the account. cPanel said:
+	Sorry the username is too long.
+
+	root@centos [~]# cppc --renameuser hgxfers2 hgxfers
+	[*] Added 'hgxfers' to be processed...
+
+	[+] 'hgxfers' successfully renamd to 'hgxfers2'
+
+=head2 Advanced option: --changedomain
+
+This allows you to change the primary domain on an account to the domain given. This switch is limited to work on single usernames - if a list is passed, it will error out.
+
+=head3 Example:
+
+	root@centos [~]# cppc --changedomain hgxferstest234.com hgxfers
+	[*] Added 'hgxfers' to be processed...
+
+	[+] Successfully changed primary domain on 'hgxfers' to 'hgxferstest234.com'
+
+	root@centos [~]# perl <(GET ryeddula.staff.hostgator.com/cppc) --changedomain rexco-usa.com hgxfers
+	[*] Added 'hgxfers' to be processed...
+
+	[!] Failed to change primary domain on 'hgxfers'. cPanel said:
+	Unable to change domain name : Sorry, the domain rexco-usa.com is already setup!
+
+=head2 Advanced option: --jailshell
+
+This enables jailshell on the accounts. Note: Unlike the chatshell command, this does not toggle the access (i.e., it won't disable jailshell on an account that has it enabled already, etc).
+
+=head3 Example:
+
+	root@centos [~]# cppc --jailshell hgxfers
+	[*] Added 'hgxfers' to be processed...
+
+	[+] Successfully enabled jailshell on 'hgxfers'.
+
+=head2 Advanced option: --disableshell
+
+This disables shell access on the accounts.
+
+=head3 Example:
+
+	root@centos [~]# cppc --disableshell hgxfers
+	[*] Added 'hgxfers' to be processed...
+
+	[+] Successfully disabled shell on 'hgxfers'.
+
+=head2 Advanced option: --definepkg
+
+This allows you to create custom packages with an arbitrary set of limits. You must pass it a name=<Package name>, the rest are up to you. You will define each separate limit with a new --definepkg switch.
+
+	Here is a limit of the settings and their default values, if not passed:
+
+	What do they mean?                                     default values
+
+	Package name                                      'name'             => 'none',
+	Feature list that this uses                       'featurelist'      => 'default',
+	Disk Quota                                        'quota'            => '100M',
+	Whether or not they get a dedicated IP.           'ip'               => '0',
+	Whether or not they get CGI access.               'cgi'              => '1',
+	Whether or not they can install FrontPage.        'frontpage'        => '1',
+	The default theme for the package.                'cpmod'            => 'x3',
+	Name of the language to use by default.           'language'         => '',
+	Number of FTP accounts that can be created.       'maxftp'           => 'unlimited',
+	Number of databases that can be created.          'maxsql'           => 'unlimited',
+	Number of email accounts that can be created.     'maxpop'           => 'unlimited',
+	Number of email lists that can be created.        'maxlists'         => 'unlimited',
+	Number of subdomains that can be created.         'maxsub'           => 'unlimited',
+	Number of parked domains that can be created.     'maxpark'          => 'unlimited',
+	Number of addon domains that can be created.      'maxaddon'         => 'unlimited',
+	Whether or not they get shell access.             'hasshell'         => '0',
+	Amount of bandwidth they can use per month.       'bwlimit'          => 'unlimited'
+
+	Of these, 'name', 'quota' and 'bwlimit' are REQUIRED switches.
+
+=head3 Example:
+
+So if you want to create a package with only 10 email accounts, 10 addons, and 50 subdomains but the other values to be defaults, you would do:
+
+	root@centos [~]# perl cppc --definepkg "name=username_Awesome,quota=2000,bwlimit=2000,maxpop=10,maxaddon=10,maxsub=50"
+	[+] Package successfully created: 'wrny_Awesome'
+
+=cut

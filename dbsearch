@@ -1,0 +1,442 @@
+#!/usr/bin/perl -w
+#################################################################
+# dbsearch.pl - Michael Karr
+# Searches an entire database for specified term.
+#
+# Git: http://git.toolbox.hostgator.com/dbsearch
+# Wiki: https://gatorwiki.hostgator.com/Security/DBSearch
+# 
+# Please submit all bug reports at http://bugs.hostgator.com
+#
+# (c) 2012 - HostGator.com, LLC.
+#################################################################
+
+{ # start main package
+package main;
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+# start main routine
+
+my %args;
+
+GetOptions (
+    'database|db|d=s' => \$args{database},
+    'search|string|s=s' => \$args{search},
+    'usage|help|z|?' => \$args{usage},
+    'table|t=s' => \$args{table},
+    'user|u=s' => \$args{user},
+    'password|p=s' => \$args{pass},
+    'host|h=s' => \$args{host},
+    'names-only|n' => \$args{namesonly},
+    'force|f' => \$args{force},
+);
+
+my $searchp = $args{search} ? $args{search} : $ARGV[0];
+
+if ($args{database} && $searchp) {
+    my $dbinfo = MK::DBSearch::DatabaseInfo->new(
+        db => $args{database},
+        host => $args{host} ? $args{host} : 'localhost',
+        user => $args{user},
+        password => $args{pass},
+    );
+    
+    if (!($args{user} && $args{pass})) {
+        $dbinfo->get_root();
+    }
+    
+    $dbinfo->print_info();
+    
+    print "\n";
+
+    if($args{force}) {
+        print "IGNORING ANY SIZE LIMITS WHEN SEARCHING!\n";
+        print "THIS MAY CAUSE SEVERE PERFORMACE ISSUES FOR THE SERVER!\n";
+        print "MAKE SURE YOU KNOW WHAT YOU ARE DOING! OR ELSE!\n\n";
+    }
+
+    my $searcher = MK::DBSearch::DatabaseSearcher->new(info => $dbinfo);
+    my $results = $searcher->search($searchp, $args{table}, $args{force});
+    $results->display_results(!($args{namesonly}));
+} elsif ($args{usage}) {
+    usage();
+} else {
+    if (!$args{database}) {
+        print STDERR "No database specified!\n";
+    }
+    
+    if (!$searchp) {
+        print STDERR "No search term specified!\n";
+    }
+
+    usage();
+}
+
+exit;
+
+# end main routine 
+
+sub usage {
+    print "Usage:\n\n";
+    print "$0 [options] <search term>\n\n";
+    print "Options:\n\n";
+    print "-d <database> : Specifies database to search within. (REQUIRED)\n";
+    print "-t <table> : Search only within a specified table.\n";
+    print "-h <host> : Specify host to connect to. ('localhost' is used if omitted)\n";
+    print "-u <user> : Specify database username. ('root' is used if ommited)\n";
+    print "-p <pass> : Specify database password. (obtained from ~/.my.cnf if omitted)\n";
+    print "-n : Display only table and column names of matches. Do not display actual matched data.\n\n"
+}
+
+} # end main package
+
+
+BEGIN { # start package MK::Utility
+package MK::Utility;
+
+use strict;
+use warnings;
+
+use Carp;
+
+use FileHandle;
+
+sub regex_file_match {
+    my ($file, $rex) = @_;
+    my $fh;
+    
+    if ($file =~ /^.*?\.gz$/) {
+        open($fh, "-|", "zcat " . $file); # total hack, but super fast
+    } else {
+        $fh = FileHandle->new("<$file");
+    }
+    
+    if ($fh) {
+        my @matches;
+        
+        while(my $line = <$fh>) {
+            if ($line =~ /$rex/) {
+                push (@matches, $1);
+                
+                unless (wantarray()) {
+                    last;
+                }
+            }       
+        }
+        
+        $fh->close();
+        
+        if (wantarray()) {
+            return @matches;
+        } else {
+            return shift @matches;
+        }
+    } else {
+        return undef;
+    }
+}
+
+sub get_term_size {
+    if (-t STDOUT) {
+        if (eval { require Term::ReadKey }) {
+            return _get_term_size_readkey();
+        } else {
+            return _get_term_size_ioctl();
+        }   
+    } else {
+        return (undef, undef, undef, undef);
+    }
+}
+
+sub _get_term_size_ioctl {
+    {
+        local ($^W) = 0;
+        eval "require 'sys/ioctl.ph';" or eval "require 'asm/ioctls.ph';";
+    }
+    
+    # if TIOCGWINSZ is not defined in our ioctl headers, go ahead and assume we are using linux
+    unless(defined(&TIOCGWINSZ)) {
+        eval 'sub TIOCGWINSZ () {0x5413;}';
+    }
+    
+    open(TTY, "+</dev/tty") or croak "No tty: $!";
+    
+    my $winsize = '';
+    unless (ioctl(TTY, &TIOCGWINSZ, $winsize)) {
+        croak sprintf "$0: ioctl TIOCGWINSZ (%08x: $!)\n", &TIOCGWINSZ;
+    }
+    
+    my ($hchar, $wchar, $wpixels, $hpixels) = unpack('S4', $winsize);
+    return ($wchar, $hchar, $wpixels, $hpixels);
+}
+
+sub _get_term_size_readkey {
+    my ($wchar, $hchar, $wpixels, $hpixels) = Term::ReadKey::GetTerminalSize();
+    return ($wchar, $hchar, $wpixels, $hpixels);
+}
+
+sub trim_text {
+    my ($text, $col) = @_;
+    
+    if ($col && ((length($text)) > $col)) {
+        return substr($text,0,(($col-3)/2))."...".substr($text,-(($col-3)/2));
+    } else {
+        return $text;
+    }
+}
+
+1;    
+} # end package MK::Utility
+
+
+BEGIN { # start class MK::DBSearch::DatabaseInfo
+package MK::DBSearch::DatabaseInfo;
+
+use strict;
+use warnings;
+
+use Carp;
+
+# constructor
+
+sub new {
+    my($class, %params) = @_;
+    
+    my $self = {
+        db => $params{db},
+        host => $params{host},
+        user => $params{user},
+        password => $params{password},
+    };
+    
+    bless($self, $class);
+    return $self;
+}
+
+# generate accessors
+
+no strict;
+
+for my $i (qw(db host user password)) {
+    *{"$i"} = sub {
+        my $self = shift;
+        if (@_) {
+            $self->{$i} = $_[0];
+        }
+        return $self->{$i};
+    };
+}
+
+use strict;
+
+# public methods
+
+sub print_info {
+    my $self = shift;
+    my ($display_pass) = @_;
+    
+    print "Database: ".$self->db."\n";
+    print "Host: ".$self->host."\n";
+    print "User: ".$self->user."\n";
+    
+    if ($display_pass) {
+        print "Password: ".$self->password."\n";
+    } else {
+        print "Password: ************\n";
+    }
+}
+
+sub get_root {
+    my $self = shift;
+    
+    if (-e '/root/.my.cnf') {
+        $self->user(MK::Utility::regex_file_match("/root/.my.cnf", '^user(?:name)?\s*?=\s*?[\'"]?([^\"\'\r\n]*)[\'"]?$'));
+        $self->password(MK::Utility::regex_file_match("/root/.my.cnf", '^pass(?:word)?\s*?=\s*?[\'"]?([^\"\'\r\n]*)[\'"]?$'));
+    } elsif (-e '/etc/psa/.psa.shadow') {
+        $self->user('admin');
+        $self->password(MK::Utility::regex_file_match("/etc/psa/.psa.shadow", '^(.*?)$'));
+    } else {
+        croak "No root MySQL password detected.\n";
+    }
+}
+
+1;
+} # end class MK::DBSearch::DatabaseInfo
+
+
+BEGIN { # start class MK::DBSearch::SearchResults
+package MK::DBSearch::SearchResults;
+
+use strict;
+use warnings;
+
+use Carp;
+
+# global all-objects variables
+
+my ($wchar, $hchar, $wpixels, $hpixels) = MK::Utility::get_term_size();
+
+# constructor
+
+sub new {
+    my($class) = @_;
+    
+    my $self = {
+        tables => {},
+    };
+    
+    bless($self, $class);
+    return $self;
+}
+# public methods
+
+sub add_result {
+    my $self = shift;
+    my ($table, $column, $result) = @_;    
+    
+    push @{$self->{tables}->{$table}->{$column}}, $result;
+}
+
+sub display_results {
+    my $self = shift;
+    my ($longresults) = @_;
+    
+    for my $table (keys %{$self->{tables}}) {
+        print "Table: $table\n";
+        
+        for my $column (keys %{$self->{tables}->{$table}}) {
+            print " " x 4 . "Column: $column\n";
+            
+            if ($longresults) {
+                for my $result (@{$self->{tables}->{$table}->{$column}}) {
+                    $result =~ s/[^[:punct:]a-zA-Z0-9 ]//g; # remove unprintable stuff
+                    print MK::Utility::trim_text(" " x 8 .$result."\n", $wchar);
+                }
+            }
+        }
+        
+        print "\n";
+    }
+
+}
+
+1;    
+} # end class MK::DBSearch::SearchResults
+
+
+BEGIN { # start class MK::DBSearch::DatabaseSearcher
+package MK::DBSearch::DatabaseSearcher;
+
+use strict;
+use warnings;
+
+use Carp;
+use DBI;
+
+# constructor
+
+sub new {
+    my($class, %params) = @_;
+    
+    for my $i (qw(info)) {
+        $params{$i} or croak "Attribute '$i' not passed to constructor.";
+    }
+    
+    my $self = {
+        info => $params{info},
+    };
+    
+    bless($self, $class);
+    return $self;
+}
+
+# public methods
+
+sub search {
+    my $self = shift;
+    my ($search, $table, $force) = @_;
+    
+    my $dbh = DBI->connect(
+        "dbi:mysql:database=".$self->{info}->db.
+        ";host=".$self->{info}->host,
+        $self->{info}->user,
+        $self->{info}->password,
+        {PrintError => 0},
+    ) or croak "Failed to connect to database: ".$DBI::errstr;
+    
+    my $tables;
+
+    if (defined($table)) {
+        $tables = $dbh->selectall_arrayref(
+            "SELECT table_name, ".
+            "data_length + index_length `table_size` ". 
+            "FROM information_schema.tables ".
+            "WHERE table_schema=? AND table_name=?",
+            { Slice => {'table_name' => 1, 'table_size' => 1}},
+            $self->{info}->db, $table
+        ) or croak "Database query failed: ".$DBI::errstr;
+    } else {
+        $tables = $dbh->selectall_arrayref(
+            "SELECT table_name, ".
+            "data_length + index_length `table_size` ". 
+            "FROM information_schema.tables ".
+            "WHERE table_schema=?",
+            { Slice => {'table_name' => 1, 'table_size' => 1}},
+            $self->{info}->db,
+        ) or croak "Database query failed: ".$DBI::errstr;
+    }
+
+    my @pairs;
+
+    for my $table (@{$tables}) {
+        my ($table_name, $table_size) = ($table->{table_name}, $table->{table_size});
+        
+        if ($table_size > 1073741824 ) { # 1GB
+            print "Table '$table_name' exceeds 1GB in size. ";
+            
+            if ($force) {
+                print "Forcing search anyways.\n";
+            } else {
+                print "Skipping.\n";
+                next;
+            }
+        }
+
+        my $rows = $dbh->selectall_arrayref(
+            "SELECT table_name, column_name ".
+            "FROM information_schema.columns ".
+            "WHERE table_schema=? AND table_name=?",
+            { Slice => {'table_name' => 1, 'column_name' => 1}},
+            $self->{info}->db, $table_name
+        ) or croak "Database query failed: ".$DBI::errstr;
+
+        push(@pairs, @{$rows});
+    }
+    
+    my $results = MK::DBSearch::SearchResults->new();
+    
+    for my $pair (@pairs) {
+        my ($table, $column) = ($pair->{table_name}, $pair->{column_name});
+        
+        my $rows = $dbh->selectall_arrayref(
+            "SELECT `$column` ".
+            "FROM `$table` ".
+            "WHERE `$column` LIKE ?",
+            { Slice => {"$column" => 1} },
+            "%$search%"
+        ) or croak "Database query failed: ".$DBI::errstr;
+        
+        for my $row (@{$rows}) {
+            $results->add_result($table, $column, $row->{$column})
+        }
+    }
+    
+    return $results;
+}
+
+1;
+} # end class MK::DBSearch::DatabaseSearcher

@@ -1,0 +1,1255 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+###########
+# cPanel utilities
+#
+# https://confluence.endurance.com/display/HGS/Script%3A+cputils
+# Please submit all bug reports to jira.endurance.com
+#
+# (C) 2012 - HostGator.com, LLC
+###########
+#
+# Rishwanth Y
+#
+
+use strict;
+use LWP::UserAgent;
+use XML::Simple;
+use Getopt::Long qw (:config pass_through);
+use Term::ANSIColor;
+use JSON;
+use Cpanel::Version;
+use Sys::Hostname;
+
+use lib "/usr/local/cpanel/";
+use Cpanel::PasswdStrength::Generate;
+use Cpanel::PasswdStrength::Check;
+
+#the switches
+my $cpanel;
+my @addon;
+my @parked;
+my @forwarder;
+my @delforward;
+my $listfwds;
+my $addftp;
+my $subdomain;
+my $deladdon;
+my $delsub;
+my $delftpuser;
+my $delemail;
+my $delparked;
+my $chepass;
+my $repass;
+
+#the optional stuff
+my $user;
+my $pass;
+my $path;
+my $help;
+my $setowner;
+
+#other stuff
+my $RED = color("red");
+my $GREEN = color("green");
+my $RESET = color("reset");
+
+#Token Support
+my $apic;
+my $token_name;
+my $token;
+my $json;
+my $currversion = Cpanel::Version::getversionnumber();
+my $hostname = Sys::Hostname::hostname;
+
+GetOptions ( 'addon=s{2}'      => \@addon,
+             'parked=s{2}'     => \@parked,
+             'cpanel=s'        => \$cpanel,
+             'addftp=s'        => \$addftp,
+             'subdomain=s'     => \$subdomain,
+             'user=s'          => \$user,
+             'password=s'      => \$pass,
+             'path=s'          => \$path,
+             'setowner=s'      => \$setowner,
+             'deladdon=s'      => \$deladdon,
+             'delsub=s'        => \$delsub,
+             'delftpuser=s'    => \$delftpuser,
+             'delemail=s'      => \$delemail,
+             'delparked=s'     => \$delparked,
+             'repass=s'        => \$repass,
+             'chepass=s'       => \$chepass,
+             'forwarder=s{2}'  => \@forwarder,
+             'delforward=s{2}' => \@delforward,
+             'listfwds=s'      => \$listfwds,
+             'help'            => \$help
+           );
+
+if ($help){
+    help();
+}
+
+sub help {
+	print "cputils version 1.3\n";
+
+	print "Creation Options:\n\n";
+	print <<END;
+            --cpanel       create a cPanel account. Required Args:
+                           [domain-name]
+            --addon        create an addon domain. Required Args:
+                           [domain-name] [cpanel-user-to-add-the-domain-to]
+            --addftp       create an ftp account. Required Args:
+                           [ftpuser\@primarydomainofcpaneltoaddto.com]
+            --parked       create a parked domain. Required Args:
+                           [domain-name] [cpanel-user-to-add-the-domain-to]
+            --subdomain    create a subdomain. Required Args:
+                           [sub.domain.name]
+            --forwarder    create an email forwarder/pipe. Required Args:
+                           [email-being-forwarded] [destination]
+                           Destination can be:
+                               An email address - "user\@example.com".
+                               A system account - "root", "cpuser".
+                               A script path - "/home/username/myawesomeemailscript.php".
+                               A fail with message - "fail: this is my message, i hope it reaches you".
+                               A "blackhole" - to discard all emails to the address.
+
+    Optional switches that go along with the above:
+
+            --user         Only valid for the --cpanel and --addon options; sets the username on the new account with --cpanel, and the FTP account/subdomain with --addon.
+            --path         Valid for --addon, --addftp, --subdomain; sets the path those domains are pointed.
+            --password     Valid for --cpanel, --addon, --addftp; sets the passwords for the accounts.
+            --setowner     Only valid for the --cpanel option; Assigns the newly created cPanel account to the given Reseller.
+
+END
+	print "Destruction Options:\n\n";
+	print <<END;
+            --deladdon     removes an addon domain from the server. Required Args:
+                           [addon domain name to be removed]
+            --delparked    removes a parked domain from the server. Required Args:
+                           [parked domain name to be removed]
+            --delftpuser   removes an FTP user from the server. Required Args:
+                           [ftpuser\@primarydomain.com to remove]
+                           Note: this will not remove the datadir associated with the account
+            --delsub       removes a subdomain from the server. Required Args:
+                           [subdomain domain name to be removed]
+            --delemail     removes an email account from the server. Required Args:
+                           [email address to remove]
+            --delforward   Removes an email forwarder from the server.
+                           Currently can only remove forwarders that are mapped to email addresses. Required Args:
+                           [local email address] [destination address]
+END
+
+	print "Other options:\n\n";
+	print <<END;
+            --chepass      changes the password for the given email address. Required Args:
+                           [email address that needs to be updated]
+                           Note: You can specify a password by using the --pass switch. If no password is provided, a random password will be used.
+            --repass       resets all of the email account passwords under an account. Required Args:
+                           [cPanel username under which the email accounts are setup]
+                           Outputs a list of email addresses along with the new passwords for each.
+                           Note: You can specify a password by using the --pass switch. If no password is provided, a random password will be used.
+            --listfwds     Lists the email forwarders currently configured for a domain. Required Args:
+                           [domain name] 
+END
+	print "Please refer to the full documentation here: https://gatorwiki.hostgator.com/Migrations/Cputils\n";
+
+	exit 1;
+}
+
+if (@ARGV){
+	print "Unknown option passed. Please see --help for more information.\n";
+	exit 1;
+}
+
+if ($currversion >= 11.70 || $hostname =~ /\.((hostgator|websitewelcome)\.(com(\.(tr|br))?|in)|(ehost(s)?|ideahost|hostclear|bluehost|justhost|accountservergroup|arvixe|webserversystems|asmallorange|rhostjh|rhostbh)\.com)$/){
+	require cPanel::PublicAPI;
+} elsif (eval {require '/usr/local/share/perl5/cPanel/PublicAPI.pm';}) {
+	require '/usr/local/share/perl5/cPanel/PublicAPI.pm';
+	if ( $currversion > 11.64 && $cPanel::PublicAPI::VERSION < 2.2 ) {
+		die "[!] cPanel::PublicAPI out of date, please ensure 2.2 or greater for API Token support";
+	}
+} else {
+	print "[!] Failed to load the necessary modules for this script to function properly. Please install cPanel::PublicAPI via '/scripts/perlinstaller cPanel::PublicAPI'\n";
+	exit 1;
+}
+
+#Generate Token if cPanel version supports it; Clean up any stale plugins; Remove the token before done.
+if ( $currversion >= 11.64 ){
+	$token_name = "cputils_".time();
+	$json = `whmapi1 api_token_create token_name=$token_name --output=json`;
+	$token = JSON::from_json($json)->{'data'}{'token'};
+	$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' , api_token => $token);
+	#Clean up the API Token before exit
+	END{
+		if($token_name){
+			`whmapi1 api_token_revoke token_name=$token_name`
+		}
+	}
+	my $token_list = `whmapi1 api_token_list --output=json`;
+	my $listjson = from_json($token_list);
+	my $current_time = time();
+	#Remove stale tokens
+	stale_tokens();
+	#Capture interrupts and remove the token
+	{
+		my $revoked;
+		$SIG{INT} = sub { 
+			unless ($revoked) {
+				$revoked = 1;
+					fork or exec('whmapi1', 'api_token_revoke', "token_name=$token_name");
+			}
+		die "Interrupted"
+		};
+	}
+			
+} elsif ( !-s "/root/.accesshash" && !defined($token) ) {
+	$ENV{'REMOTE_USER'} = 'root';
+	system('/usr/local/cpanel/bin/realmkaccesshash');
+	$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+} else {
+	$apic = cPanel::PublicAPI->new( ssl_verify_mode => '0' );
+}
+
+main();
+
+sub main {
+
+	#creation
+	if (scalar(@addon) == 2) {
+		addon(lc $addon[0], lc $addon[1] );
+	}
+	if (scalar(@parked) == 2) {
+		parked(lc $parked[0], lc $parked[1] );
+	}
+	if (scalar(@forwarder) == 2) {
+		forwarder(lc $forwarder[0], lc $forwarder[1] );
+	}
+	if ($cpanel) {
+		cpanel(lc $cpanel );
+	}
+	if ($addftp) {
+		addftp(lc $addftp );
+	}
+	if ($subdomain) {
+		addsub(lc $subdomain );
+	}
+
+	#destruction
+	if ($deladdon) {
+		deladdon(lc $deladdon );
+	}
+	if ($delparked) {
+		delparked(lc $delparked );
+	}
+	if (scalar(@delforward) == 2) {
+		delforward(lc $delforward[0], lc $delforward[1] );
+	}
+	if ($delsub) {
+		delsub(lc $delsub );
+	}
+	if ($delftpuser) {
+		delftpu(lc $delftpuser );
+	}
+	if ($delemail) {
+		delemail(lc $delemail );
+	}
+
+	if ($repass) {
+		emailcp($repass);
+	}
+
+	if ($chepass) {
+		emailchg($chepass);
+	}
+	
+	if ($listfwds) {
+		listfwds($listfwds);
+	}
+
+	if ( not (scalar(@addon) == 2) and not (scalar(@parked) == 2) and
+         not $cpanel and not $addftp and not $subdomain and not $deladdon and
+         not $delsub and not $delftpuser and not $delparked and not $delemail and
+         not (scalar(@forwarder) == 2) and not (scalar(@delforward) == 2) and not $listfwds and
+         not $repass and not $chepass) {
+		help();
+	}
+}
+
+sub cpanel {
+
+	my $dom = shift;
+	my $check = whoowns($dom);
+	if ($check) {
+		print "[!] $RED$dom$RESET already exists under the user '$RED$check$RESET' on the server.\n";
+		return 0;
+	}
+
+	print "[*] Creating cPanel account...\n";
+	if (!$user){
+		$user = substr($dom, 0, 7);
+		$user =~ s/[\W]//g;
+		while ($user !~ /^[a-z]/){
+			$user =~ s/^./a/;
+		}
+
+		my $i = length($user) - 1;
+		my $possible = 'abcdefghijkmnpqrstuvwxyz23456789';
+		while (-e "/var/cpanel/users/$user") {
+			if ($i > 0) {
+				my $x = substr ($possible, ( int ( rand ( length($possible) ) ) ), 1);
+				substr($user, $i, 1, $x);
+				$i--;
+				next;
+			} else {
+				$i = length($user) - 1;
+				next;
+			}
+		}
+	} elsif (-e "/var/cpanel/users/$user") {
+		print "[!] $RED$user$RESET already exists on the server. Choose a different username.\n";
+		return 0;
+	} elsif (length($user) > 16 || $user !~ /^[a-z]/ || $user !~ /[^a-zA-Z0-9]*/) {
+		print "[!] $RED$user$RESET is too long. Make sure it is only 16 characters long, does not start with a number, and does not have any special characters.\n";
+		return 0;
+	}
+
+	if (!$pass) {
+		do {
+			$pass = Cpanel::PasswdStrength::Generate::generate_password(12);
+		} while (!Cpanel::PasswdStrength::Check::check_password_strength('pw' => $pass, 'app' => "passwd"));
+	}
+
+	my $response = $apic->whm_api('createacct', { 'username' => $user, 'domain' => $dom, 'password' => $pass, 'ip' => 'n', 'cpmod' => 'paper_lantern', 'useregns' => '0', 'reseller' => '0', 'forcedns' => '1', 'quota' => '1500', 'bwlimit' => '15000', 'maxftp' => 'unlimited', 'maxsql' => 'unlimited', 'maxpop' => 'unlimited', 'maxsub' => 'unlimited', 'maxpark' => 'unlimited', 'maxaddon' => 'unlimited', 'maxlst' => '25' }, 'json');
+	my $output = from_json($response);
+
+	if ($output->{'metadata'}->{'result'} == 1) {
+		if (-e "/var/cpanel/users/$user") {
+			my $ip = $output->{'data'}->{'ip'};
+			print "$GREEN\[\+\]$RESET cPanel Account successfully created.\n";
+			print "$GREEN | $RESET Domain: $dom\n";
+			print "$GREEN | $RESET Username: $user\n";
+			print "$GREEN | $RESET Password: $pass\n";
+			print "$GREEN | $RESET IP addr: $ip\n";
+			print "$GREEN `---------------------------------[+]$RESET\n";
+			if ($setowner) {
+				if (($setowner !~ m/^root$/i) and !isreseller($setowner)){
+					print "[!] $RED$setowner$RESET is not listed as a Reseller account on the server - Not setting ownership.\n";
+				} else {
+					ownerset($setowner, $user);
+				}
+			}
+		} else {
+			print "$RED\[\!\]$RESET Error: WHM returned 'success' when creating the account, but the user does not exist... cPanel shenanigans!";
+		}
+	} else {
+		print "$RED\[\!\]$RESET cPanel creation failed.\n";
+		print "$RED\[\!\] $RESET WHM said:\n";
+		print "$RED\[\!\] $RESET $output->{'result'}->{'statusmsg'}\n";
+	}
+}
+
+sub addon {
+
+	my ($adom, $cpuser) = @_;
+	my $check = whoowns($adom);
+	if ($check) {
+		print "[!] $RED$adom$RESET already exists under the user '$RED$check$RESET' on the server.\n";
+		return 0;
+	}
+
+	if (!-e "/var/cpanel/users/$cpuser") {
+		print "[!] User: $RED$cpuser$RESET does not exist on this server.\n";
+		return 0;
+	}
+
+	print "[*] Creating addon domain...\n";
+	my $homedir = homedir($cpuser);
+	my $primdom = primdom($cpuser);
+
+	if($path){
+		if ($path !~ /^$homedir/){
+			print "[!] Path provided: $RED$path$RESET is not within the homedir of the user: $homedir\n";
+			return 0;
+		}
+	} else {
+		$path = $homedir."public_html/$adom";
+	}
+
+	if (!$pass){
+		do {
+			$pass = Cpanel::PasswdStrength::Generate::generate_password(12);
+		} while (!Cpanel::PasswdStrength::Check::check_password_strength('pw' => $pass, 'app' => "ftp"));
+	}
+
+	if ($user) {
+		my $realsub = "$user.$primdom";
+		if (whoowns($realsub)) {
+			print "[!] Subdomain/Username specified: $RED$user$RESET.$primdom is taken on the server.\n";
+			return 0;
+		}
+	} else {
+		$user = substr($adom, 0, 7);
+		$user =~ s/[\W]//g;
+		if ($user !~ /^[a-z]/ ) { $user =~ s/^./a/; }
+
+		my $realsub = "$user.$primdom";
+		my $i = length($user) - 1;
+		while (!(whoowns($realsub) eq '')) {
+			if ($i > 0){
+				my $x = randoms(1);
+				substr($user, $i, 1, $x);
+				$realsub = "$user.$primdom";
+				$i--;
+				next;
+			} else {
+				$i = length($user) - 1;
+				next;
+			}
+		}
+	}
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'AddonDomain', 'func' => 'addaddondomain', 'user' => $cpuser,}, { 'newdomain' => $adom, 'dir' => $path, 'pass' => $pass, 'subdomain' => $user }, 'json');
+	my $output = from_json($response);
+
+	if ($output->{'cpanelresult'}{'data'}[0]{'result'} == 1) {
+		if (whoowns($adom) eq '') {
+			print "$RED\[\!\]$RESET cPanel said the addon domain was created, but it does not exist on the server. cPanel shenanigans! Please check this manually.\n";
+		} else {
+			print "$GREEN\[\+\]$RESET Addon Domain successfully created.\n";
+			print "$GREEN | $RESET Addon domain: $adom\n";
+			print "$GREEN | $RESET FTP Username: $user\n";
+			print "$GREEN | $RESET FTP Password: $pass\n";
+			print "$GREEN | $RESET Parent cPanel: $cpuser - $primdom\n";
+			print "$GREEN | $RESET Subdomain: $user.$primdom\n";
+			print "$GREEN | $RESET DocumentRoot: $path\n";
+			print "$GREEN `---------------------------------[+]$RESET\n";
+		}
+	} else {
+		print "$RED\[\!\]$RESET Addon Domain creation failed.\n";
+		print "$RED\[\!\] $RESET cPanel said:\n";
+		print "$RED\[\!\] $RESET $output->{'cpanelresult'}{'data'}[0]{'reason'}\n";
+	}
+}
+
+sub parked {
+
+	my ($pdom, $cpuser) = @_;
+
+	my $check = whoowns($pdom);
+	if ($check) {
+		print "[!] $RED$pdom$RESET already exists under the user '$RED$check$RESET' on the server.\n";
+		return 0;
+	}
+
+	if (!-e "/var/cpanel/users/$cpuser") {
+		print "[!] User: $RED$cpuser$RESET does not exist on this server.\n";
+		return 0;
+	}
+
+	print "[*] Creating parked domain...\n";
+	my $primdom = primdom($cpuser);
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Park', 'func' => 'park', 'user' => $cpuser,}, { 'domain' => $pdom }, 'json');
+	my $output = from_json($response);
+
+	if ($output->{'cpanelresult'}{'data'}[0]{'result'} == 1) {
+		print "$GREEN\[\+\]$RESET Parked Domain successfully created.\n";
+		print "$GREEN | $RESET Parked domain: $pdom\n";
+		print "$GREEN | $RESET Parent domain: $primdom\n";
+		print "$GREEN | $RESET Parent cPanel: $cpuser\n";
+		print "$GREEN `---------------------------------[+]$RESET\n";
+	} else {
+		print "$RED\[\!\]$RESET Parked Domain creation failed.\n";
+		print "$RED\[\!\]$RESET cPanel said:\n";
+		print "$RED\[\!\]$RESET $output->{'cpanelresult'}{'data'}[0]{'reason'}\n";
+	}
+}
+
+sub addftp {
+
+	my $fulluser = shift;
+	my ($ftpuser, $primdom) = split('@', $fulluser);
+	my $cpuser = whoowns ($primdom);
+	if (!$cpuser) {
+		print "[!] $RED$primdom$RESET does not appear to exist on this server.\n";
+		return 0;
+	}
+
+	my $homedir = homedir($cpuser);
+
+	if ($path) {
+		if ($path !~ /^$homedir/){
+			print "[!] Path provided: $RED$path$RESET is not within the homedir of the user: $homedir\n";
+			return 0;
+		}
+	} else {
+		$path = $homedir."public_html/";
+	}
+
+	if (!$pass) {
+		do {
+			$pass = Cpanel::PasswdStrength::Generate::generate_password(12);
+		} while (!Cpanel::PasswdStrength::Check::check_password_strength('pw' => $pass, 'app' => "passwd")); 
+	}
+
+	print "[*] Creating FTP account...\n";
+	my $path2 = $path;
+	$path2 =~ s/^$homedir//;
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Ftp', 'func' => 'addftp', 'user' => $cpuser,}, { 'user' => $ftpuser, 'homedir' => $path2, 'pass' => $pass, 'quota' => '0' }, 'json');
+	my $output = from_json($response);
+	
+	if ($output->{'cpanelresult'}{'data'}[0]{'result'} == 1) {
+		print "$GREEN\[\+\]$RESET FTP account successfully created.\n";
+		print "$GREEN | $RESET FTP Username: $fulluser\n";
+		print "$GREEN | $RESET FTP Password: $pass\n";
+		print "$GREEN | $RESET FTP Jaildir: $path\n";
+		print "$GREEN `---------------------------------[+]$RESET\n";
+	} else {
+		print "$RED\[\!\]$RESET FTP account creation failed.\n";
+		print "$RED\[\!\]$RESET cPanel said:\n";
+		print "$RED\[\!\]$RESET $output->{'cpanelresult'}{'data'}[0]{'reason'}\n";
+	}
+}
+
+sub addsub {
+
+	my $subdom = shift;
+	my @parts = split(/\./, $subdom);
+	my @sub;
+	push(@sub, shift(@parts));
+	my $parent = join(".", @parts);
+	my $cpuser = whoowns($parent);
+
+	while (!$cpuser && scalar(@parts)) {
+		push (@sub, shift(@parts));
+		$parent = join(".", @parts);
+		$cpuser = whoowns($parent);
+	}
+
+	if (!$cpuser) {
+		print "[!] $RED$parent$RESET does not appear to setup on the server.\n";
+		return 0;
+	}
+
+	my $homedir = homedir($cpuser);
+	my $sub = join(".", @sub);
+
+	if ($path) {
+		if ($path !~ /^$homedir/){
+			print "[!] Path provided: $RED$path$RESET is not within the homedir of the user: $homedir\n";
+			return 0;
+		}
+	} else {
+		if ($sub eq "*") {
+			print "[*] Wildcard subdomain passed without a path. Using ".$homedir."public_html/ for the path.\n";
+			$path = $homedir."public_html/";
+		} else {
+			$path = $homedir."public_html/$subdom";
+		}
+	}
+
+	print "[*] Creating Subdomain...\n";
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'SubDomain', 'func' => 'addsubdomain', 'user' => $cpuser,}, { 'domain' => $sub, 'dir' => $path, 'rootdomain' => $parent }, 'json');
+	my $output = from_json($response);
+
+	if ($output->{'cpanelresult'}{'data'}[0]{'result'} == 1) {
+		print "$GREEN\[\+\]$RESET Subdomain successfully created.\n";
+		print "$GREEN | $RESET Subdomain: $subdom\n";
+		print "$GREEN | $RESET Documentroot: $path\n";
+		print "$GREEN | $RESET Parent account: $cpuser\n";
+		print "$GREEN `---------------------------------[+]$RESET\n";
+	} else {
+		print "$RED\[\!\]$RESET Subdomain creation failed.\n";
+		print "$RED\[\!\]$RESET cPanel said:\n";
+		print "$RED\[\!\]$RESET $output->{'cpanelresult'}{'data'}[0]{'reason'}\n";
+	}
+}
+
+sub forwarder {
+
+	my $source = shift;
+	my $dest   = shift;
+	my ($euser, $domain) = split ('@', $source);
+	my $user = whoowns ($domain);
+	my $opts = {};
+
+	if (not $user) {
+		print "${RED}[!]${RESET} '$source' does not appear to be a valid email account on the server.\n";
+		return 0;
+	}
+
+	$opts->{domain} = $domain;
+	$opts->{email}  = $euser;
+	
+	if ($dest =~ m/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,4}\b/) {
+		$opts->{fwdopt}    = "fwd";
+		$opts->{fwdemail}  = $dest;
+	} elsif ($dest eq 'blackhole') {
+		$opts->{fwdopt}    = "blackhole";
+	} elsif (-f $dest) {
+		my $homedir = homedir($user);
+		if ($dest =~ m/^$homedir/) {
+			$opts->{fwdopt}    = "pipe";
+			$opts->{pipefwd}   = "$dest";
+		} else {
+			print "${RED}[!]${RESET} The 'pipe to' script is not located under the user's homedir: '$homedir' -> '$dest'. Not adding such pipes.\n";
+			return 0;
+		}
+	} elsif (userexists($dest)) {
+		$opts->{fwdopt}    = "system";
+		$opts->{fwdsystem} = $dest;
+	} elsif ($dest =~ m/^fail:\s*/i) {
+		my (undef, $failmsg) = split (/fail:\s*/, $dest);
+		$opts->{fwdopt}    = "fail";
+		$opts->{failmsgs}  = $failmsg;
+	} else {
+		print "${RED}[!]${RESET} Unknown Input - See help."
+	}
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'addforward', 'user' => $user}, $opts, 'json');
+	my $output = from_json($response);
+	if ( $output->{'cpanelresult'}{'event'}{'result'} and 
+		 (ref($output->{'cpanelresult'}{'data'}[0]) eq 'HASH' and $output->{'cpanelresult'}{'data'}[0]{'forward'} and $output->{'cpanelresult'}{'data'}[0]{'email'}) ) {
+		print "[+] Successfully added email forwarder:\n";
+		printf "\t${GREEN}%35s${RESET} -> '$output->{'cpanelresult'}{'data'}[0]{'forward'}'\n", "'$output->{'cpanelresult'}{'data'}[0]{'email'}'"; 
+	} else {
+		print "${RED}[!]${RESET} Failed to add forwarder - please process this manually.\n";
+	} 
+}
+
+sub delforward {
+
+	my $source = shift;
+	my $dest   = shift;
+	my (undef, $domain) = split ('@', $source);
+	my $user = whoowns ($domain);
+
+	if (not $user) {
+		print "${RED}[!]${RESET} '$source' does not appear to be a valid email account on the server.\n";
+		return 0;
+	}
+
+	if ($dest !~ m/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,4}\b/) {
+		print "${RED}[!]${RESET} Unfortunately, this can only be used to remove fowarders that mapped to email adddresses at this time.\n".
+		      "    Please update the '/etc/valiases/$domain' file manually to remove this forwarded.\n";
+		return 0;
+	}
+	
+	my $fwder = "$source=$dest";
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'delforward', 'user' => $user}, { 'email' => $source, 'emaildest' => $dest,}, 'json');
+	my $output = from_json($response);
+	if ($output->{'cpanelresult'}{'data'}[0]{'status'} == 1){
+		print "${GREEN}[+]${RESET} Forwarder: '$source' -> '$dest' has been removed.\n";
+	}else{
+		print "Failed to delete forwarder: ". $output->{'cpanelresult'}{'error'}."\n";
+	}
+	print "${GREEN}[+]${RESET} Forwarder: '$source' -> '$dest' has been removed.\n";
+}
+
+sub listfwds {
+	
+	my $domain = shift;
+	my $user = whoowns ($domain);
+	if (not $user) {
+		print "[!] '$domain' is not configured on the server.\n";
+		return 0;
+	}
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'listdefaultaddresses', 'user' => $user,}, {'domain' => $domain}, 'json');
+	my $output = from_json ($response);
+	if ($output->{'cpanelresult'}{'data'}[0]{'defaultaddress'}) {
+		my $defaultfwd = $output->{'cpanelresult'}{'data'}[0]{'defaultaddress'};
+		print "[+] The ${GREEN}default${RESET} forwarder for '$domain' is configured as: '${RED}$defaultfwd${RESET}'\n\n";
+	}
+	
+	$response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'listforwards', 'user' => $user,}, {'domain' => $domain}, 'json');
+	$output = from_json($response);
+	if (ref($output->{'cpanelresult'}{'data'}[0]) eq 'HASH') {
+		my $forwarders = $output->{'cpanelresult'}{'data'};
+		print "[+] The following forwarders are configured for '$domain':\n";
+		if (ref ($forwarders) eq 'ARRAY') {
+			foreach my $fwd (@{$forwarders}) {
+				my $source = $fwd->{dest};
+				my $dest   = $fwd->{forward};
+				printf "\t${GREEN}%35s${RESET} -> '$dest'\n", "'$source'";
+			}
+		} else {
+			print "\t${GREEN}'$forwarders->{dest}'${RESET} -> '$forwarders->{forward}'\n";
+		}
+	} else {
+		print "${RED}[!]${RESET} No email forwarders configured for '$domain' on the server.\n";
+	}
+}
+
+sub emailchg {
+
+	my $fullemail = shift;
+	my $passtouse;
+	if (!$pass) {
+		do {
+			$passtouse = Cpanel::PasswdStrength::Generate::generate_password(12);
+		} while (!Cpanel::PasswdStrength::Check::check_password_strength('pw' => $passtouse, 'app' => "email"));
+	} else {
+		$passtouse = $pass;
+	}
+
+	my ($email, $domain) = split ('@', $fullemail, 2);
+	my $user = whoowns($domain);
+	my $response1 = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'passwdpop', 'user' => $user,}, { 'domain' => $domain, 'email' => $email, 'password' => $passtouse }, 'json');
+	my $output1 = from_json($response1);
+	if ($output1->{'cpanelresult'}{'data'}[0]{'result'} == 1){
+		print "[+] Password for '$fullemail' Reset: '$passtouse'\n";
+		return $passtouse;
+	} else {
+		print "${RED}[!]${RESET} $fullemail\'s password was not updated:\n";
+		print $output1->{'cpanelresult'}{'data'}[0]{'reason'}."\n";
+	}
+}
+
+sub emailcp {
+
+	my $user = shift;
+
+	if ( not userexists($user) ) {
+		print "[!] '$user' does not exist on this server!\n";
+		return 0;
+	}
+
+	print "[*] Resetting Emails passwords for all accounts under '$user'...\n";
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'listpopssingle', 'user' => $user,}, { }, 'json');
+	my $output = from_json($response);
+
+	if ( $output->{'cpanelresult'}{'event'}{'result'} == 1 and exists ($output->{'cpanelresult'}{'data'}) ) { 
+
+		my @emails;
+		if (ref($output->{'cpanelresult'}{'data'}) eq 'ARRAY') {
+			foreach my $obj (@{$output->{'cpanelresult'}{'data'}}){
+				my $tempu = $obj->{'login'};
+				push (@emails, $tempu);
+			}
+		} else {
+			push @emails, $output->{'cpanelresult'}{'data'}{'login'};
+		}
+		
+		@emails = sort (@emails);
+		print "[*] Total number of email addresses found under this account: ".scalar(@emails)."\n";
+
+		my @output;
+		foreach my $euser (@emails) {
+			my $newpass = emailchg($euser);
+			if ($newpass) {
+				push @output, "$euser - $newpass";
+			} else {
+				print "[!] Failed to reset password for '$euser' - do this manually.\n";
+			}
+		}
+
+		print "$GREEN\[\+\]$RESET Email passwords reset:\n";
+		foreach (@output) {
+			print "$GREEN | $RESET $_\n";
+		}
+		print "$GREEN `---------------------------------[+]$RESET\n";
+		return 1;
+	} else {
+		print "[!] Unable to get list of emails via API call. Are there any email accounts setup on this account? Please process this manually.\n";
+		return 0;
+	}
+}
+
+sub ownerset {
+
+	my $owner = shift;
+	my $user  = shift;
+
+	my $response = $apic->whm_api('accountsummary', { 'user' => $user }, 'json');
+	my $output = from_json($response);
+	my $cowner = $output->{'data'}{'acct'}[0]{'owner'};
+
+	if (!($cowner eq "root") && !($cowner eq $owner) && isreseller($cowner)) {
+		print "[*] '$user' is currently owned by '$GREEN$cowner$RESET'. Please note that we are changing this...\n";
+	}
+
+	my $response = $apic->whm_api('modifyacct', { 'user' => $user, 'owner' => $owner, 'HG' => 1 }, 'json');
+	my $output = from_json($response);
+
+	if ($output->{'metadata'}{'result'} == 1) {
+		print "[+] Ownership of '$GREEN$user$RESET' successfully changed to '$owner'\n";
+		return 1;
+	} else {
+		print "[!] Ownership change failed for '$RED$user$RESET'. cPanel said:\n";
+		print $output->{'metadata'}{'output'}{'messages'}[0]."\n";
+		return 0;
+	}
+}
+
+sub isreseller {
+
+	my $user = shift;
+	my %resellers = ();
+
+	#Populate %resellers
+	my $response = $apic->whm_api('listresellers', { }, 'json');
+	my $output = from_json($response);
+	if (ref($output->{'data'}{'reseller'}) eq 'ARRAY') {
+		foreach my $reseller (@{$output->{'data'}{'reseller'}}) {
+			$resellers{$reseller} = 1;
+		}
+	} else {
+		$resellers{$output->{'data'}{'reseller'}} = 1;
+	}
+
+	if ($resellers{$user}){
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+sub primdom {
+
+	my $user = shift;
+	open (my $userfile, "<", "/var/cpanel/users/$user");
+	my $primdom = (split(/=/, (grep(/^DNS=/, <$userfile>))[0]))[1];
+	chomp $primdom;
+	close ($userfile);
+
+	return $primdom;
+}
+
+sub homedir {
+
+	my $user = shift;
+
+	open (my $passwd, "/etc/passwd");
+	my @grep = grep(/^$user:/, <$passwd>);
+	if (scalar(@grep) > 1) {
+		die ("[!] Failed to parse /etc/passwd properly. Aborting.\n");
+	}
+	close($passwd);
+	my $homedir = (split(/:/, $grep[0]))[5]."/";
+
+	return $homedir;
+}
+
+sub whoowns {
+	my $domain = shift;
+	my $owner;
+
+	#this is what whoowns does
+	open(my $USERDOMAINS, "/etc/userdomains" );
+	while (<$USERDOMAINS>) {
+		if (/^$domain: (\S+)/i) {
+			$owner = $1;
+		}
+	}
+	close($USERDOMAINS);
+
+	if ($owner eq ""){
+		open (my $httpconf, "<", "/etc/httpd/conf/httpd.conf");
+		my $grep;
+		while (<$httpconf>) {
+			if (/\s$domain\s/i) {
+				while (<$httpconf>){
+					$grep = $_;
+					last if (/documentroot/i);
+				}
+			}
+		}
+		close ($httpconf);
+
+		if ($grep) {
+			$grep =~ s|documentroot||gi;
+			$grep =~ s/^\s+//;
+			$grep =~ s/\s+$//;
+			$owner = (split(/\//, $grep))[2];
+		}
+	}
+
+	return $owner;
+}
+
+sub randoms {
+
+	my $limit = shift;
+	my $possible = 'abcdefghijkmnpqrstuvwxyz';
+	my $string;
+	while (length($string) < $limit) {
+		$string .= substr( $possible, ( int( rand( length($possible) ) ) ), 1 );
+	}
+
+	return $string;
+}
+
+sub deladdon {
+
+	my $addon = shift;
+	my $owner = whoowns($addon);
+	if ($owner){
+		print "[*] '$GREEN$addon$RESET' appears to be a domain name under '$owner'. Attempting to remove the domain...\n";
+
+		my $domkey = getdomkey($addon, $owner);
+		my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'AddonDomain', 'func' => 'deladdondomain', 'user' => $owner,}, { 'domain' => $addon, 'subdomain' => $domkey }, 'json');
+		my $output = from_json($response);
+
+		if ( $output->{'cpanelresult'}{'event'}{'result'} == 1 ){
+			print "[+] Addon domain successfully removed from $owner. cPanel's output:\n\n";
+			print $output->{'cpanelresult'}{'data'}[0]{'reason'}."\n\n";
+		} else {
+			print "[!] cPanel says Addon domain removal failed. Please check why, here is the raw reason cPanel gave:\n\n";
+			print $output->{'cpanelresult'}{'data'}[0]{'reason'}."\n\n";
+		}
+	} else {
+		print "[!] $RED$addon$RESET NOT found on the server, so it appears that this is not needed after all...\n";
+	}
+}
+
+sub delparked {
+
+	my $parked = shift;
+	my $owner = whoowns($parked);
+	if ($owner) {
+		print "[*] '$GREEN$parked$RESET' appears to be a domain name under '$owner'. Attempting to remove the domain...\n";
+
+		my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Park', 'func' => 'unpark', 'user' => $owner,}, { 'domain' => $parked }, 'json');
+		my $output = from_json($response);
+
+		if ( $output->{'cpanelresult'}{'event'}{'result'} == 1 ){
+			print "[+] Parked domain successfully removed from $owner. cPanel's output:\n\n";
+			print $output->{'cpanelresult'}{'data'}[0]{'reason'}."\n\n";
+		} else {
+			print "[!] cPanel says Parked domain removal failed. Please check why, here is the raw reason cPanel gave:\n\n";
+			print $output->{'cpanelresult'}{'data'}[0]{'reason'}."\n\n";
+		}
+	} else {
+		print "[!] $RED$parked$RESET NOT found on the server, so it appears that this is not needed after all...\n";
+	}
+}
+
+sub delsub {
+
+	my $subdomain = shift;
+	my $owner  = whoowns($subdomain);
+	if ($owner){
+		print "[*] '$GREEN$subdomain$RESET' appears to be a subdomain under $owner. Attempting to remove this subdomain...\n";
+		my $underscoresub = $subdomain;
+		$underscoresub =~ s/\.(?=.*?\.)/_/g;
+
+		my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'SubDomain', 'func' => 'delsubdomain', 'user' => $owner,}, { 'domain' => $underscoresub }, 'json');
+		my $output = from_json($response);
+
+		if ( $output->{'cpanelresult'}{'event'}{'result'} == 1 ){
+			print "[+] Subdomain successfully removed from $owner. cPanel's output:\n\n";
+			print $output->{'cpanelresult'}{'data'}[0]{'reason'}."\n\n";
+		} else {
+			print "[!] cPanel says subdomain removal failed. Please check why, here is the raw reason cPanel gave:\n\n";
+			print $output->{'cpanelresult'}{'data'}[0]{'reason'}."\n\n";
+		}
+	}else {
+		print "[!] $RED$subdomain$RESET NOT found on the server, so it appears that this is not needed after all...\n";
+	}
+}
+
+sub delftpu {
+
+	my $ftpu = lc shift;
+
+	my ($ftpuser, $pridom) = split('@', $ftpu);
+	my $cpuser = whoowns($pridom);
+
+	if (-s "/var/cpanel/users/$cpuser"){
+		print "[*] '$GREEN$ftpu$RESET' appears to be setup under $cpuser. Attempting to remove this FTP account...\n";
+
+		my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Ftp', 'func' => 'delftp', 'user' => $cpuser,}, { 'user' => $ftpu, 'destroy' => '0' }, 'json');
+		my $output = from_json($response);
+
+		if ($output->{'cpanelresult'}{'data'}[0]{'result'} == 1 ){
+			print "[+] FTP account successfully removed: $ftpu from cPanel user: $cpuser.\n";
+		} else{
+			print "[!] Failed to remove FTP account: $ftpu. Here is the raw reason cPanel gave:\n\n";
+			print $output->{'cpanelresult'}{'data'}[0]{'reason'}."\n\n";
+		}
+	} else {
+		print "[!] $pridom does not exist on this server.\n";
+	}
+}
+
+sub delemail {
+
+	my $email = shift;
+	my ($username, $domain) = split('@', $email);
+
+	my $owner = whoowns($domain);
+
+	if ($owner) {
+		print "[*] ".color("green").$email.color("reset")." appears to be setup under $owner.\n";
+		print "[*] Please note that this will remove ALL content stored in this account's mailbox. Proceed - y/n - ";
+		my $answer = <STDIN>;
+		chop $answer;
+		if ($answer eq 'y'){
+			my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'Email', 'func' => 'delpop', 'user' => $owner,}, { 'domain' => $domain, 'email' => $username }, 'json');
+			my $output = from_json($response);
+
+			if ($output->{'cpanelresult'}{'data'}[0]{'result'} == 1){
+				print "[+] ".color("green").$email.color("reset")." has been successfully removed from the server.\n";
+			} else {
+				print "[!] ".color("green").$email.color("reset")." removal failed. cPanel said:\n";
+				print $output->{'cpanelresult'}{'data'}[0]{'reason'}."\n\n";
+			}
+		}
+	} else {
+		print "[!] Unable to determine the cPanel account that ".color("red").$email.color("reset")."belongs to...\n";
+	}
+}
+
+sub getdomkey {
+	my $domain = shift;
+	my $owner  = shift;
+
+	my $response = $apic->cpanel_api2_request('whostmgr', { 'module' => 'AddonDomain', 'func' => 'listaddondomains', 'user' => $owner,}, { 'regex' => $domain }, 'json');
+	my $output = from_json($response);
+
+	my $domkey = $output->{'cpanelresult'}{'data'}[0]{'domainkey'};
+	return $domkey;
+}
+
+sub userexists {
+
+	my $user = shift;
+	if (-e "/var/cpanel/users/$user"){
+		return 1;
+	}
+	return 0;
+}
+
+##Remove stale tokens
+sub stale_tokens {
+	my $token_list = `whmapi1 api_token_list --output=json`;
+	my $listjson = from_json($token_list);
+	my $current_time = time();
+	if ($currversion >= 11.68){
+		foreach my $token_name (%{$listjson->{'data'}{'tokens'}}){
+			if( $token_name =~ /cputils_/ ){
+				my $token_time = $token_name;
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					print "Revoking token";
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_name`;
+				}
+			}
+		}
+	} else {
+		foreach my $token_data (@{$listjson->{'data'}{'tokens'}}){
+			if( $token_data->{'name'} =~ /cputils_/ ){
+				my $token_time = $token_data->{'name'};
+				$token_time =~ s/\D//g;
+				if ( ($token_time + 432000) < $current_time ){
+					#Token is 5 days older than now, removing.
+					`whmapi1 api_token_revoke token_name=$token_data->{'name'}`;
+				}
+			}
+		}
+	}
+}
+
+=pod
+
+=head1 NAME
+
+cputils - Allows administrators to perform common actions via the command line using cPanel's API.
+
+=head1 Usage
+
+Creation options:
+
+	--cpanel       create a cPanel account. Required Args:
+	               [domain-name]
+	--addon        create an addon domain. Required Args:
+	               [domain-name] [cpanel-user-to-add-the-domain-to]
+	--addftp       create an ftp account. Required Args:
+	               [ftpuser@primarydomainofcpaneltoaddto.com]
+	--parked       create a parked domain. Required Args:
+	               [domain-name] [cpanel-user-to-add-the-domain-to]
+	--subdomain    create a subdomain. Required Args:
+	               [sub.domain.name]
+
+Optional switches that go along with the creation options:
+
+	--user         Only valid for the --cpanel and --addon options; sets the username on the new account with --cpanel, and the FTP account/subdomain with --addon.
+	--path         Valid for --addon, --addftp, --subdomain; sets the path those domains are pointed.
+	--password     Valid for --cpanel, --addon, --addftp; sets the passwords for the accounts.
+	--setowner     Only valid for the --cpanel option; Assigns the newly created cPanel account to the given Reseller.
+
+Destruction options:
+
+	--deladdon     removes an addon domain from the server. Required Args:
+		       [addon domain name to be removed]
+	--delparked    removes a parked domain from the server. Required Args:
+	               [parked domain name to be removed]
+	--delftpuser   removes an FTP user from the server. Required Args:
+	               [ftpuser@primarydomain.com to remove]
+	               Note: this will not remove the datadir associated with the account
+	--delsub       removes a subdomain from the server. Required Args:
+	               [subdomain domain name to be removed]
+	--delemail     removes an email account from the server. Required Args:
+	               [email address to remove]
+
+Other options:
+
+	--chepass      changes the password for the given email address. Required Args:
+	               [email address that needs to be updated]
+	               Note: You can specify a password by using the --pass switch. If no password is provided, a random password will be used.
+	--repass       resets all of the email account passwords under an account. Required Args:
+	               [cPanel username under which the email accounts are setup]
+	               Outputs a list of email addresses along with the new passwords for each.
+	               Note: You can specify a password by using the --pass switch. If no password is provided, a random password will be used.
+
+=head1 Examples
+
+=head2 cpanel
+
+=over 4
+
+=item * Creating a full cPanel account:
+
+	cputils --cpanel <domain> [--user=<user> --password=<password>]
+	cputils --cpanel hostgator.com
+	cputils --cpanel hostgator.com --user=hostgato --password='b4n4n4s'
+
+The above would create a hostgator.com cPanel account, the first example using a 8 character long username based on the domain name, the second example using 'hostgato' as the username and the password 'b4n4n4s'.
+
+=back
+
+=head2 addon
+
+=over 4
+
+=item * Creating an Addon Domain under a cPanel account:
+
+	cputils --addon <domain> <parent cPanel> [--path=<path to directory> --user=<ftpuser/subdomain> --password=<password>]
+	cputils --addon stuffandthings.com hostgato
+	cputils --addon stuffandthings.com hostgato --path='/home/hostgato/public_html/sataddon' --user=notsat --password='p4ssw0rd'
+
+The above would create an addon domain under the 'hostgato' cPanel account, the first example using a default path for the addon domain based on the domain name itself, the second example using 'sataddon' (public_html/sataddon) as the
+path for the addon domain and the FTP password 'p4ssw0rd'.
+
+=back
+
+=head2 addftp
+
+=over 4
+
+=item * Creating an FTP account under a cPanel account:
+
+	cputils --addftp <ftpuser@primarydomain.com> --path=<path> --password=<password>
+	cputils --addftp lolftp1@workrightsny.org --path=/home/wrny/lolol/ --password=lolol
+
+The path and password arguments are optional. The example creates and an ftp account jailed to the '/home/wrny/lolol/' folder with the password 'lolol'
+
+=back
+
+=head2 parked
+
+=over 4
+
+=item * Creating a Parked domain under a cPanel account:
+
+	cputils --parked <domain to park> <username>
+	cputils --parked stuffandthings.com hostgato
+
+The above would create a parked domain under the 'hostgato' cPanel account. This will essentially map the domains to /home/hostgato/public_html/. If you are trying to create Parked domains for addon domains, then just use the addon option with the path properly specified.
+
+=back
+
+=head2 subdomain
+
+=over 4
+
+=item * Creating a Subdomain under a cPanel account:
+
+	cputils --subdomain <subdomain> [--path=<path to directory>]
+	cputils --subdomain woot.hostgator.com
+	cputils --subdomain woot.hostgator.com --path='/home/hostgato/public_html/notwoot'
+
+The above would create a subdomain under whichever cPanel account that owns 'hostgator.com' and map it to public_html/woot.hostgator.com by default (first example) or to what is otherwise specified.
+
+Special note: 
+Wildcard Subdomains MUST be in quotes, or bash will eat the star and this will cause issues. Additionally, if a wildcard subdomain is given without a path, then it will simply default to /home/user/public_html/ - therefore you BETTER give it a path to work with... or the setup will not make sense.
+
+=back
+
+=head2 deladdon
+
+=over 4
+
+=item * Removing an addon domain from the server:
+
+	cputils --deladdon <addon domain name>
+	cputils --deladdon hgxferstest.com
+
+=back
+
+=head2 delparked
+
+=over 4
+
+=item * Removing a parked domain from the server:
+
+	cputils --delparked <parked domain name>
+	cputils --delparked hgxferstest.com
+
+=back
+
+=head2 delftpuser
+
+=over 4
+
+=item * Removing an FTP account from the server:
+
+	cputils --delftpuser <ftp accounts to remove>
+	cputils --delftpuser ftpuser1@hgxferstest.com
+
+=back
+
+=head2 delsub
+
+=over 4
+
+=item * Removing a Subdomain from the server:
+
+	cputils --delsub <subdomain to remove>
+	cputils --delsub woot.hgxferstest.com
+
+=back
+
+=head2 delemail
+
+=over 4
+
+=item * Removing an Email account from the server:
+
+	cputils --delemail <email address to remove>
+	cputils --delemail brendan@hereallycares.com
+
+=back
+
+=head2 chepass
+
+=over 4
+
+=item * Resetting the password for a single email account:
+
+	cputils --chepass <email@address>
+	cputils --chepass testing1@hgxferstest.com
+
+=back
+
+=head2 repass
+
+=over 4
+
+=item * Resetting the email passwords under an account:
+
+	cputils --repass <cpanel username>
+	cputils --repass hgxfers
+
+=back
+
+=cut

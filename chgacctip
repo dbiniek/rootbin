@@ -1,0 +1,367 @@
+#!/usr/bin/perl
+# chgacctip
+# changes an account to specified IP
+# https://gatorwiki.hostgator.com/Admin/ChgAcctIP
+# http://git.toolbox.hostgator.com/chgacctip
+# Please submit all bug reports at bugs.hostgator.com
+#
+# (C) 2012 - HostGator.com, LLC
+
+if ( (!defined($ARGV[0])) || (!defined($ARGV[1])) ) {
+  die "Usage: username IP [y|n to reload/rebuild/restart]\n";
+  #Example: perl myfile.pl username IP
+}
+
+my $users = $ARGV[0];
+my $resips = $ARGV[1];
+my $rebuild = $ARGV[2];
+chomp($resips);
+if ( $resips !~ /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/ ) {
+	die "Not a valid IP address. Exiting.\n";
+}
+my $oldip = resuserip($users);
+chomp($oldip);
+if ( $oldip !~ /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/ ) {
+	die "Cannot determine old IP address. Exiting.\n";
+}
+print "Changing IP in named. \n";
+changeuseripnamed($users,$resips,$oldip);
+print "Changing IP in the apache config. \n";
+changeuseriphttp($users,$resips,$oldip);
+print "Changing IP in the apache data file. \n";
+changeuserfileip($users,$resips,$oldip);
+changeuserdatafileip($users,$resips,$oldip);
+if ( $rebuild eq 'y' ) { rebuild($users); }
+
+sub resuserip {
+        my $resuser = shift;
+        open (USERIP, "/var/cpanel/users/$resuser") || die ("Could not open file <br> $!");
+        while ($line = <USERIP>) {
+                if ( $line =~ /^IP=/ ) {
+                        @line = split("=", $line);
+                        return $line[1];
+
+                }
+        }
+        close(USERIP);
+}
+
+sub getuserdomains {  # Username -- @rh_domains|Errorcode
+#  undef $lasterror;
+	my $rh_user=$_[0];
+	my @rh_domains;
+	open USERFILE, "/var/cpanel/users/$_[0]" or die "getuserdomains($rh_user): Couldn't open /var/cpanel/users/$_[0]: $!\n";
+	while(<USERFILE>) {
+		push @rh_domains, (m,^X?DNS\d*=(\S+),);
+	}
+	close USERFILE;
+	return @rh_domains;
+}
+
+sub changeuseripnamed {  # Username, newip, oldip -- Errorcode
+	my $rh_user=$_[0];
+	my $rh_newip=$_[1];
+	my $rh_oldip=$_[2];
+	my $rh_prefix="changeuseripnamed($rh_user, $rh_newip, $rh_oldip)";
+	my @rh_domains=getuserdomains $rh_user;
+	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	$rh_timestamp=$year+1900 . substr(0 . ($mon+1) ,-2,2) . substr(0 . $mday ,-2,2) . substr(0 . $hour ,-2,2);
+	my $rh_count;
+	my @rh_list;
+	foreach(@rh_domains) {
+		my $rh_domain=$_;
+		my $changed=0;
+		my @rh_output;
+		if ( -T "/var/named/$rh_domain.db" ) {
+			if (open ZONEFILE, "</var/named/$rh_domain.db") {
+				while(<ZONEFILE>) {
+					if (m,\s+\d{10}\s+,) {
+						$rh_serial=$_;
+						chomp $rh_serial;
+						$rh_serial =~ s,.*\s+(\d{10}).*,$1,;
+						if (length($rh_serial) == 10) { $_ =~ s,$rh_serial,$rh_timestamp,; }
+
+					} elsif (m,\d+\.\d+\.\d+\.\d+,) {
+						if ($_ !~ m,127\.0\.\0\.1, ) { $changed=1 if (s,$rh_oldip$,$rh_newip,g); }
+					}
+					push @rh_output, $_;
+				}
+				close ZONEFILE;
+			if ($changed) {
+				print "Modifying /var/named/$rh_domain.db\n" if ($RH_VERBOSE);
+				push @rh_list, $rh_domain;
+				if (open ZONEFILE, ">/var/named/$rh_domain.db") {
+						foreach(@rh_output) {
+							print ZONEFILE $_;
+						}
+						close ZONEFILE;
+						$rh_count++;
+                } else {
+					print "Couldn't open /var/named/$rh_domain.db: $!\n" if ($RH_VERBOSE);
+				}
+			}
+			} else {
+				print "Couldn't open /var/named/$_.db: $!\n" if ($RH_VERBOSE);
+			}
+		}
+	}
+		foreach(@rh_domains) {
+		my $rh_domain=$_;
+		my $changed=0;
+		my @rh_output;
+		if ( -T "/var/named/chroot/var/named/$rh_domain.db" ) {
+			if (open ZONEFILE, "</var/named/chroot/var/named/$rh_domain.db") {
+				while(<ZONEFILE>) {
+					if (m,\s+\d{10}\s+,) {
+						$rh_serial=$_;
+						chomp $rh_serial;
+						$rh_serial =~ s,.*\s+(\d{10}).*,$1,;
+						if (length($rh_serial) == 10) { $_ =~ s,$rh_serial,$rh_timestamp,; }
+
+					} elsif (m,\d+\.\d+\.\d+\.\d+,) {
+						if ($_ !~ m,127\.0\.\0\.1, ) { $changed=1 if (s,$rh_oldip$,$rh_newip\n,g); }
+					}
+					push @rh_output, $_;
+				}
+				close ZONEFILE;
+			if ($changed) {
+				print "Modifying /var/named/chroot/var/named/$rh_domain.db\n" if ($RH_VERBOSE);
+				push @rh_list, $rh_domain;
+				if (open ZONEFILE, ">/var/named/chroot/var/named/$rh_domain.db") {
+						foreach(@rh_output) {
+							print ZONEFILE $_;
+						}
+						close ZONEFILE;
+						$rh_count++;
+                } else {
+					print "Couldn't open /var/named/chroot/var/named/$rh_domain.db: $!\n" if ($RH_VERBOSE);
+				}
+			}
+			} else {
+				print "Couldn't open /var/named/chroot/var/named/$_.db: $!\n" if ($RH_VERBOSE);
+			}
+		}
+	}
+	if ($rh_count){
+		print "DNS: $rh_count domain(s) modified: @rh_list\n"; # if ($RH_VERBOSE);
+        return 0;
+	} else {
+		print "$rh_prefix: No domains contain $rh_oldip.\n";# if ($RH_VERBOSE);
+		return 1;
+	}
+}
+
+sub changeuseriphttp { # USERNAME, NEWIP, OLDIP   -- Errorcode
+	undef $lasterror;
+	my $rh_user=$_[0];
+	my $rh_newip=$_[1];
+	my $rh_oldip=$_[2];
+	my $rh_prefix="changeuseriphttp($rh_user, $rh_newip, $rh_oldip)";
+	print STDERR "\nSEO CHANGE: $rh_prefix\n";
+	my ($rh_invh,$rh_line,@rh_outvhost,@rh_out,$rh_httpuser,$rh_count,@rh_in,$rh_servername,@rh_list);
+#  return perror 1, "$rh_prefix: $rh_newip is not a valid ip address.\n"
+#    if ($rh_newip !~ m/^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/);
+#  return perror 1, "$rh_prefix: $rh_oldip is not a valid ip address.\n"
+#    if ($rh_oldip !~ m/^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/);
+	open HTTPDCONF, "</usr/local/apache/conf/httpd.conf" or die "Can't open httpd.conf";
+	push @rh_in, $_ while(<HTTPDCONF>);
+	close HTTPDCONF;
+	foreach (@rh_in) {
+		$rh_line++;
+		if ($rh_invh) {
+			push @rh_outvhost, $_;
+			if (m,^\s*<VirtualHost,i) {
+#        return perror 1, "PANIC: $rh_prefix: /usr/local/apache/conf/httpd.conf line $rh_line: <VirtualHost in <VirtualHost\n";
+#      } elsif (m,^\s*User\s+$rh_user\s*$,i) {
+			} elsif (m,^\s*suPHP_UserGroup\s+$rh_user\s+$rh_user\s*$,i) {
+				$rh_isuser=1;
+			} elsif (m,^\s*ServerName\s+,i) {
+				$rh_servername=$_;
+				chomp $rh_servername;
+				$rh_servername =~ s,^\ServerName\s+(.*),$1,i;
+			} elsif (m,^\s*</VirtualHost,i) {
+				if ($rh_isuser) {
+					foreach (@rh_outvhost) {
+            #$rh_count++ if (s,^\s*<VirtualHost\s+$rh_oldip(|:\d+)>,<VirtualHost $rh_newip$1>,i);
+#            $rh_count++
+            #if (s,^\s*<VirtualHost\s+\d+\.\d+\.\d+\.\d+>,<VirtualHost $rh_newip$1>,i) {
+						if (s,^\s*<VirtualHost\s+\d+\.\d+\.\d+\.\d+(.*)>,<VirtualHost $rh_newip$1>,i) {
+							push @rh_list, $rh_servername;
+							$rh_count++;
+						}
+						push @rh_out, $_;
+					}
+				} else {
+					push @rh_out, $_ foreach (@rh_outvhost);
+				}
+				undef @rh_outvhost;
+				$rh_invh=0;
+				$rh_isuser=0;
+			}
+		} else {
+			if (m,^\s*<VirtualHost,i) {
+				push @rh_outvhost, $_;
+				$rh_invh=1;
+			} elsif (m,^\s*</VirtualHost,i) {
+#        return perror 1, "PANIC: $rh_prefix: /usr/local/apache/conf/httpd.conf line $rh_line: </VirtualHost before <VirtualHost\n";
+			} else {
+			push @rh_out, $_;
+			}
+		}
+	}
+#  return perror 1, "PANIC: $rh_prefix: /usr/local/apache/conf/httpd.conf ended without closing a <VirtualHost\n" if ($rh_invh);
+	if ($rh_count) {
+		print "$rh_prefix: $rh_count domain(s) modified.\n" if ($RH_VERBOSE);
+		if ( -e "/usr/local/apache/conf/httpd.conf.lock" ) {
+			$RH_WAITFORUNLOCK=10;
+			my ($rh_loop,$rh_lockpid,$rh_proc);
+			print "$rh_prefix: /usr/local/apache/conf/httpd.conf.lock found...\n" if ($RH_VERBOSE);
+			open LOCK, "/usr/local/apache/conf/httpd.conf.lock" or die; #return perror 1, "$rh_prefix: Couldn't open /usr/local/apache/conf/httpd.conf.lock: $!\n";
+				while(<LOCK>) {
+					chomp;
+					$rh_lockpid=$rh_lockpid . $_;
+				}
+			close LOCK;
+			while ( $rh_loop < $RH_WAITFORUNLOCK && -e "/proc/$rh_lockpid/exe" ) {
+				$rh_loop++;
+				print "  waiting for file to unlock ($rh_loop/$RH_WAITFORUNLOCK)...\n" if ($RH_VERBOSE);
+				sleep 1;
+			}
+			if ( $rh_loop == $RH_WAITFORUNLOCK && -e  "/proc/$rh_lockpid/exe" ) {
+				open PROC, "/proc/$rh_lockpid/cmdline";
+					while (<PROC>) {
+						$rh_proc=$rh_proc . $_;
+						$rh_proc =~ s,\0, ,g;
+					}
+				close PROC;
+#        return perror 1, "$rh_prefix: Giving up, /usr/local/apache/conf/httpd.conf is locked by process $rh_lockpid ($rh_proc)\n";
+			}
+    		}
+		open LOCK, ">/usr/local/apache/conf/httpd.conf.lock";
+			print LOCK "$$\n";
+		close LOCK;
+		open HTTPDCONF, ">/usr/local/apache/conf/httpd.conf" or die ; #return perror 1, "$rh_prefix: Couldn't open /usr/local/apache/conf/httpd.conf: $!\n";
+			print "$rh_prefix: Writing to /usr/local/apache/conf/httpd.conf.\n" if ($RH_VERBOSE);
+			foreach (@rh_out) {
+				print HTTPDCONF;
+			}
+		close HTTPDCONF;
+		unlink "/usr/local/apache/conf/httpd.conf.lock";
+		print "HTTPD: $rh_count domain(s) modified: @rh_list\n";
+#    system("/etc/init.d/httpd graceful");
+		return 0;
+	}
+}
+
+#exit;
+#changeuseripnamed "systek", "127.0.0.1", "74.52.183.34";
+#if (changeuseriphttp "systek", "127.0.0.1", "74.52.183.34") {
+#  print "ERROR, ABORTING: $lasterror\n";exit 1;
+#}
+
+sub changeuserfileip {
+        my ($dcuser,$dcnewip,$dcoldip) = @_;
+        my $data_file = "/var/cpanel/users/$dcuser";
+        my @rh_domains=getuserdomains $dcuser;
+        # Open the file for reading.
+        open DATA, "$data_file" or die "can't open $data_file $!";
+        my @array_of_data = <DATA>;
+        close (DATA);
+
+        # Open the file for writing.
+        open DATAOUT, ">$data_file" or die "can't open $data_file $!";
+
+        # Start a foreach loop assigning
+        # each line to $line, in turn.
+        foreach my $line (@array_of_data) {
+                # Print each line in turn to the new filehandle DATAOUT
+                if ( $line =~ /^IP=\d+\.\d+\.\d+\.\d+$/ ) {
+                        print DATAOUT "IP=$dcnewip\n";
+                        print "IP found\n";
+                } else {
+                        print DATAOUT "$line";
+                }
+        }
+        # Close the new file.
+        close (DATAOUT);
+
+        foreach my $domain (@rh_domains) {
+                my $filename = "/var/cpanel/userdata/$dcuser/$domain";
+                open DATA, $filename or next;
+                my @array_of_data = <DATA>;
+                close (DATA);
+                print "\n Modifying userdata for domain $domain\n";
+                open DATA, ">$filename" or die "can't open $data file $!";
+                foreach my $line1 ( @array_of_data ) {
+                        # Print each line in turn to the new filehandle DATA
+                        if ( $line1 =~ /^ip:/ ) {
+                                print DATA "ip: $dcnewip\n";
+                        } else {
+                                print DATA "$line1";
+                        }
+                }
+                close (DATA);
+        }
+
+    foreach my $domain (@rh_domains) {
+                my $filename = "/var/cpanel/userdata/$dcuser/${domain}_SSL";
+                if ( !-T $filename ) { next };
+                open DATA, $filename or die "can't open $data file $!";
+                my @array_of_data = <DATA>;
+                close (DATA);
+                print "\n Modifying userdata for domain $domain\n";
+                open DATA, ">$filename" or die "can't open $data file $!";
+                foreach my $line1 ( @array_of_data ) {
+                        # Print each line in turn to the new filehandle DATA
+                        if ( $line1 =~ /^ip:/ ) {
+                                print DATA "ip: $dcnewip\n";
+                        } else {
+                                print DATA "$line1";
+                        }
+                }
+                close (DATA);
+        }
+
+
+}
+
+sub changeuserdatafileip {
+        my ($dcuser,$dcnewip,$dcoldip) = @_;
+	#system("/scripts/updateuserdatacache --force $dcuser");
+	return;
+
+        my $filename = "/etc/userdatadomains";
+        my $domain = `grep ": $dcuser" /etc/trueuserdomains | cut -d ':' -f 1`;
+        chomp($domain);
+        chomp($dcuser);
+        open FILE, "$filename";
+        my @file = <FILE>;
+        close(FILE);
+        my @new_file;
+        my $match = ": " . $dcuser ."==";
+        foreach (@file) {
+                if ( $_ =~  /$match/ ) {
+                        print "Found userdatadomains line\n";
+                        my $line1 = $_;
+                        $line1 =~ s/\d+\.\d+\.\d+\.\d+/$dcnewip/g;
+                        push(@new_file, $line1);
+        }       else { push(@new_file, $_); }
+        }
+        open FILE, ">$filename";
+        print FILE (@new_file);
+        close(FILE);
+}
+
+sub rebuild {
+	my $dcuser = shift;
+	system("/scripts/updateuserdatacache --force $dcuser");
+	print "Reloading named configuration.\n";
+	system("rndc reload");
+	print "Updating userdomains.\n";
+	system("/scripts/updateuserdomains");
+	print "Rebuilding httpd.conf\n";
+	system("/scripts/rebuildhttpdconf");
+	print "Restarting apache.\n";
+	system("/etc/init.d/httpd graceful");
+}
+
